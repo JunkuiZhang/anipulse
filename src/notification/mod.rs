@@ -1,3 +1,6 @@
+mod feishu;
+mod feishu_app;
+
 use std::{env, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -10,6 +13,9 @@ use crate::{
     error::{AppError, Result},
     repository::Repository,
 };
+
+use feishu::FeishuWebhookNotifier;
+use feishu_app::FeishuAppNotifier;
 
 #[async_trait]
 trait Notifier: Send + Sync {
@@ -68,7 +74,16 @@ impl ServerChanNotifier {
             .form(&[("title", title), ("desp", body)])
             .send()
             .await
-            .map_err(|e| AppError::Notification(e.to_string()))?;
+            .map_err(|error| {
+                let message = if error.is_timeout() {
+                    "ServerChan request timed out"
+                } else if error.is_connect() {
+                    "cannot connect to ServerChan"
+                } else {
+                    "ServerChan request failed"
+                };
+                AppError::Notification(message.into())
+            })?;
         if !response.status().is_success() {
             return Err(AppError::Notification(format!(
                 "ServerChan returned HTTP {}",
@@ -136,6 +151,12 @@ impl NotificationDispatcher {
         let notifier: Arc<dyn Notifier> = match config.provider.to_ascii_lowercase().as_str() {
             "none" => Arc::new(NoopNotifier),
             "serverchan" => Arc::new(ServerChanNotifier::from_env(config.request_timeout_secs)?),
+            "feishu" | "feishu_app" => {
+                Arc::new(FeishuAppNotifier::from_env(config.request_timeout_secs)?)
+            }
+            "feishu_webhook" => Arc::new(FeishuWebhookNotifier::from_env(
+                config.request_timeout_secs,
+            )?),
             provider => {
                 return Err(AppError::Config(format!(
                     "unsupported notification provider: {provider}"
@@ -167,6 +188,8 @@ impl NotificationDispatcher {
     }
 
     pub async fn test(&self) -> Result<()> {
-        self.notifier.test().await
+        self.notifier.test().await?;
+        info!("notification test sent successfully");
+        Ok(())
     }
 }

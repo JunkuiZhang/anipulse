@@ -30,10 +30,13 @@ three_day_interval_secs = 7200
 jitter_ratio = 0.1
 
 [notification]
-# none 会记录通知成功并推进下一集，但不发送外部消息。
-# 改成 serverchan 后，从 SERVERCHAN_SEND_KEY 环境变量读取 SendKey。
-provider = "none"
-channel = "default"
+# 飞书自建应用凭证和私聊收件人只从环境变量读取：
+# FEISHU_APP_ID=cli_...
+# FEISHU_APP_SECRET=...
+# FEISHU_RECEIVE_ID_TYPE=email（也支持 open_id、user_id、union_id）
+# FEISHU_RECEIVE_ID=你的飞书账号邮箱
+provider = "feishu"
+channel = "feishu-private-anime"
 notify_pending = false
 request_timeout_secs = 15
 

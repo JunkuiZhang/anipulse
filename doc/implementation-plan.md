@@ -28,13 +28,13 @@
 
 ## 阶段 5：通知与无人值守调度
 
-交付：ServerChan 通知、通知幂等与重试、动态 `next_check_at`、jitter、下一集推进、`run` 常驻循环、systemd unit。
+交付：飞书自建应用机器人私聊卡片（群 Webhook 兼容）、访问令牌缓存、通知幂等与重试、动态 `next_check_at`、jitter、下一集推进、`run` 常驻循环、systemd unit。
 
 验收：每 Episode/Channel 最多一条通知记录；发送失败保持 pending；重启可恢复 due Episode、pending Candidate、pending Notification 和 Provider backoff。
 
 ## 阶段 6：部署与质量门槛
 
-交付：示例配置、Linux 安装说明、结构化日志、单元/SQLite 集成测试。
+交付：示例配置、飞书应用配置与 Linux 安装说明、结构化日志、单元/SQLite/通知 HTTP 集成测试。
 
 验收：`cargo fmt --check`、`cargo test`、`cargo clippy -- -D warnings` 通过；可通过 SSH + CLI 完成添加、检查、纠错和信任管理。
 

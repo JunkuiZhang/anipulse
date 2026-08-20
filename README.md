@@ -11,7 +11,7 @@ AniPulse 是一个面向个人 Linux 服务器的番剧更新监控器。它低�
 - Candidate 按 Episode + BV 去重，同一 MID 永远只算一个 Consensus vote；
 - Trusted Uploader、Independent Consensus、Manual Confirmation 三条确认路径；
 - WBI 搜索和视频详情 Provider 隔离；全局串行限流、每日预算、429/412/临时失败退避；
-- ServerChan 通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
+- 飞书消息卡片通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
 - CLI 人工 accept/reject 与 per-Anime UP trust/block。
 
 V1 不下载视频、不使用登录 Cookie、不绕过风控，也不处理 `EP12.5`、SP、OVA、连播或分 P 的自动推进。此类标题只进入人工复核。
@@ -69,22 +69,27 @@ anipulse run
 
 ## 通知
 
-默认 `provider = "none"`，适合先观察判定日志。启用 ServerChan：
+生产配置推荐使用飞书自建应用机器人，直接私聊你的飞书账号：
 
 ```toml
 [notification]
-provider = "serverchan"
-channel = "serverchan-main"
+provider = "feishu"
+channel = "feishu-private-anime"
 ```
 
-SendKey 只通过环境变量提供：
+应用凭证和收件人只通过环境变量提供。收件人使用飞书账号邮箱最省事：
 
 ```bash
-export SERVERCHAN_SEND_KEY='your-send-key'
+export FEISHU_APP_ID='cli_xxxxxxxxx'
+export FEISHU_APP_SECRET='应用的 App Secret'
+export FEISHU_RECEIVE_ID_TYPE='email'
+export FEISHU_RECEIVE_ID='你的飞书账号邮箱'
 anipulse notification test
 ```
 
-不要把 SendKey、Cookie 或其他 secret 写入仓库。日志也不会打印这些值。
+更新确认后，应用机器人会直接向你发送包含确认依据、UP、时长、BV 号和“立即观看”按钮的消息卡片。程序缓存 `tenant_access_token` 并在过期前刷新；无需事件订阅、回调地址或服务器入站端口。不要把 App Secret、Cookie 或其他 secret 写入仓库，日志也不会打印这些值。
+
+原有飞书群自定义机器人仍可作为兼容选项：把 `provider` 设为 `feishu_webhook`，并提供 `FEISHU_WEBHOOK_URL` 以及可选的 `FEISHU_BOT_SECRET`。
 
 ## Linux + systemd 部署
 
@@ -98,10 +103,10 @@ sudo install -m 0644 config.example.toml /etc/anipulse/config.toml
 sudo install -m 0644 deploy/anipulse.service /etc/systemd/system/anipulse.service
 ```
 
-若启用 ServerChan，创建仅 root 可读的环境文件：
+创建仅 root 可读的飞书环境文件：
 
 ```bash
-sudo sh -c 'printf "%s\n" "SERVERCHAN_SEND_KEY=your-send-key" > /etc/anipulse/anipulse.env'
+sudoedit /etc/anipulse/anipulse.env
 sudo chmod 600 /etc/anipulse/anipulse.env
 ```
 
@@ -112,6 +117,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now anipulse
 journalctl -u anipulse -f
 ```
+
+环境文件内容为：
+
+```text
+FEISHU_APP_ID=cli_xxxxxxxxx
+FEISHU_APP_SECRET=应用的-App-Secret
+FEISHU_RECEIVE_ID_TYPE=email
+FEISHU_RECEIVE_ID=你的飞书账号邮箱
+RUST_LOG=info
+```
+
+从创建飞书自建应用、开通私聊权限、构建 Linux 二进制到备份升级的完整步骤见 [`doc/deployment.md`](doc/deployment.md)。
 
 ## 判定语义
 
