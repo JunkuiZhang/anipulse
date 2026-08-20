@@ -1,0 +1,42 @@
+[database]
+path = "/var/lib/anipulse/anipulse.db"
+
+[bilibili]
+# 这是项目自身的克制预算，不代表 Bilibili 官方安全线。
+base_url = "https://api.bilibili.com"
+min_request_interval_secs = 5
+max_requests_per_day = 500
+max_search_requests_per_check = 2
+max_detail_requests_per_check = 3
+request_timeout_secs = 15
+user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36 AniPulse/0.1"
+
+[confirmation]
+minimum_candidate_score = 60
+detail_threshold_score = 35
+consensus_uploaders = 2
+max_duration_delta_secs = 180
+max_publish_delta_secs = 7200
+candidate_expire_secs = 259200
+trusted_confirmed_count = 3
+
+[polling]
+far_interval_secs = 21600
+two_day_interval_secs = 7200
+half_day_interval_secs = 3600
+release_interval_secs = 900
+day_after_interval_secs = 1800
+three_day_interval_secs = 7200
+jitter_ratio = 0.1
+
+[notification]
+# none 会记录通知成功并推进下一集，但不发送外部消息。
+# 改成 serverchan 后，从 SERVERCHAN_SEND_KEY 环境变量读取 SendKey。
+provider = "none"
+channel = "default"
+notify_pending = false
+request_timeout_secs = 15
+
+[scheduler]
+tick_secs = 30
+due_batch_size = 20

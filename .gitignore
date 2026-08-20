@@ -1,1 +1,6 @@
 /target
+/.env
+/config.toml
+/*.db
+/*.db-shm
+/*.db-wal

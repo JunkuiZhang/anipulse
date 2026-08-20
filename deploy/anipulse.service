@@ -1,0 +1,24 @@
+[Unit]
+Description=AniPulse anime release watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=anipulse
+Group=anipulse
+WorkingDirectory=/var/lib/anipulse
+ExecStart=/usr/local/bin/anipulse --config /etc/anipulse/config.toml run
+EnvironmentFile=-/etc/anipulse/anipulse.env
+Restart=on-failure
+RestartSec=20s
+StateDirectory=anipulse
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/anipulse
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
