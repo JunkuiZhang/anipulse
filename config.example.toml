@@ -40,6 +40,18 @@ channel = "feishu-private-anime"
 notify_pending = false
 request_timeout_secs = 15
 
+[schedule]
+# 自动排期使用 bangumi-data 的精确 broadcast，并用 Bangumi 章节日期校准停播/调档。
+bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
+bangumi_api_base_url = "https://api.bgm.tv"
+preferred_site = "bilibili"
+sync_interval_secs = 86400
+failure_retry_secs = 900
+request_timeout_secs = 30
+sync_batch_size = 20
+# 按 Bangumi API 要求，把 your-bangumi-id 改为你的 Bangumi 用户名或稳定个人标识。
+user_agent = "your-bangumi-id/AniPulse/0.1 (personal self-hosted)"
+
 [scheduler]
 tick_secs = 30
 due_batch_size = 20

@@ -290,6 +290,7 @@ mod tests {
                 timezone: "Asia/Shanghai".into(),
                 duration_min_sec: 1_200,
                 duration_max_sec: 1_680,
+                auto_schedule: None,
             })
             .await
             .unwrap();

@@ -12,13 +12,16 @@ pub struct AppConfig {
     pub polling: PollingConfig,
     pub confirmation: ConfirmationConfig,
     pub notification: NotificationConfig,
+    pub schedule: ScheduleConfig,
     pub scheduler: SchedulerConfig,
 }
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            let config = Self::default();
+            config.validate()?;
+            return Ok(config);
         }
         let raw = fs::read_to_string(path)
             .map_err(|e| AppError::Config(format!("cannot read {}: {e}", path.display())))?;
@@ -43,6 +46,41 @@ impl AppConfig {
             return Err(AppError::Config(
                 "polling.jitter_ratio must be between 0 and 0.5".into(),
             ));
+        }
+        if !(3_600..=31_536_000).contains(&self.schedule.sync_interval_secs) {
+            return Err(AppError::Config(
+                "schedule.sync_interval_secs must be between 3600 and 31536000".into(),
+            ));
+        }
+        if self.schedule.failure_retry_secs < 60
+            || self.schedule.failure_retry_secs > self.schedule.sync_interval_secs
+        {
+            return Err(AppError::Config(
+                "schedule.failure_retry_secs must be between 60 and sync_interval_secs".into(),
+            ));
+        }
+        if self.schedule.request_timeout_secs == 0 {
+            return Err(AppError::Config(
+                "schedule.request_timeout_secs must be greater than zero".into(),
+            ));
+        }
+        if self.schedule.sync_batch_size <= 0 {
+            return Err(AppError::Config(
+                "schedule.sync_batch_size must be greater than zero".into(),
+            ));
+        }
+        for (name, value) in [
+            ("schedule.bangumi_data_url", &self.schedule.bangumi_data_url),
+            (
+                "schedule.bangumi_api_base_url",
+                &self.schedule.bangumi_api_base_url,
+            ),
+        ] {
+            let url = url::Url::parse(value)
+                .map_err(|_| AppError::Config(format!("{name} must be a valid URL")))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(AppError::Config(format!("{name} must use HTTP or HTTPS")));
+            }
         }
         Ok(())
     }
@@ -156,6 +194,34 @@ impl Default for NotificationConfig {
             channel: "default".into(),
             notify_pending: false,
             request_timeout_secs: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ScheduleConfig {
+    pub bangumi_data_url: String,
+    pub bangumi_api_base_url: String,
+    pub preferred_site: String,
+    pub sync_interval_secs: u64,
+    pub failure_retry_secs: u64,
+    pub request_timeout_secs: u64,
+    pub sync_batch_size: i64,
+    pub user_agent: String,
+}
+
+impl Default for ScheduleConfig {
+    fn default() -> Self {
+        Self {
+            bangumi_data_url: "https://unpkg.com/bangumi-data@0.3/dist/data.json".into(),
+            bangumi_api_base_url: "https://api.bgm.tv".into(),
+            preferred_site: "bilibili".into(),
+            sync_interval_secs: 86_400,
+            failure_retry_secs: 900,
+            request_timeout_secs: 30,
+            sync_batch_size: 20,
+            user_agent: "your-bangumi-id/AniPulse/0.1 (personal self-hosted)".into(),
         }
     }
 }

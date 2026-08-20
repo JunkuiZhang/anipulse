@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::AppConfig, detector::Detector, error::Result, notification::NotificationDispatcher,
-    repository::Repository,
+    repository::Repository, schedule::ScheduleSynchronizer,
 };
 
 pub async fn run(
@@ -15,8 +15,12 @@ pub async fn run(
     dispatcher: NotificationDispatcher,
     config: Arc<AppConfig>,
 ) -> Result<()> {
+    let schedule = ScheduleSynchronizer::new(repository.clone(), config.schedule.clone())?;
     info!(tick_secs = config.scheduler.tick_secs, "scheduler started");
     loop {
+        if let Err(error) = schedule.sync_due().await {
+            warn!(%error, "automatic schedule synchronization failed");
+        }
         let due = repository
             .due_anime_ids(config.scheduler.due_batch_size)
             .await?;

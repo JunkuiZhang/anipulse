@@ -10,6 +10,8 @@ pub enum AppError {
     Provider(#[from] crate::provider::ProviderError),
     #[error("notification error: {0}")]
     Notification(String),
+    #[error("schedule error: {0}")]
+    Schedule(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid input: {0}")]

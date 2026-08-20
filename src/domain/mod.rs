@@ -40,6 +40,11 @@ pub struct Anime {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub auto_schedule: bool,
+    pub broadcast_pattern: Option<String>,
+    pub schedule_sync_at: Option<DateTime<Utc>>,
+    pub schedule_next_sync_at: Option<DateTime<Utc>>,
+    pub schedule_sync_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +64,26 @@ pub struct NewAnime {
     pub timezone: String,
     pub duration_min_sec: i64,
     pub duration_max_sec: i64,
+    pub auto_schedule: Option<AutoScheduleMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoScheduleMetadata {
+    pub bangumi_subject_id: i64,
+    pub broadcast_pattern: String,
+    pub next_sync_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduleUpdate {
+    pub bangumi_subject_id: i64,
+    pub aliases: Vec<String>,
+    pub expected_at: DateTime<Utc>,
+    pub expected_weekday: i64,
+    pub expected_time: String,
+    pub timezone: String,
+    pub broadcast_pattern: String,
+    pub next_sync_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

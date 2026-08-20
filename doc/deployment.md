@@ -101,9 +101,21 @@ provider = "feishu"
 channel = "feishu-private-anime"
 notify_pending = false
 request_timeout_secs = 15
+
+[schedule]
+bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
+bangumi_api_base_url = "https://api.bgm.tv"
+preferred_site = "bilibili"
+sync_interval_secs = 86400
+failure_retry_secs = 900
+request_timeout_secs = 30
+sync_batch_size = 20
+user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 ```
 
 `provider = "feishu"` 和 `provider = "feishu_app"` 都代表应用机器人私聊。`channel` 是 AniPulse 用于通知幂等的稳定标识，部署后不要随意修改，否则同一 Episode 可能因新 channel 名称产生另一条通知记录。
+
+Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 
 ## 6. 保存飞书应用凭证
 
@@ -152,22 +164,40 @@ sudo sh -c 'set -a; . /etc/anipulse/anipulse.env; exec runuser -u anipulse --pre
 
 ## 8. 添加正在追的番剧
 
-管理类 CLI 不需要读取飞书 Secret。示例：
+管理类 CLI 不需要读取飞书 Secret。推荐让程序自动匹配条目、补全别名和更新时间：
 
 ```bash
 sudo -u anipulse /usr/local/bin/anipulse \
   --config /etc/anipulse/config.toml \
   anime add \
-  --title "Silent Witch" \
-  --alias "沉默魔女" \
-  --alias "サイレント・ウィッチ" \
+  --title "沉默的魔女" \
   --next-episode 8 \
-  --weekday friday \
-  --time 23:00 \
+  --auto-schedule \
   --timezone Asia/Shanghai \
   --duration-min 20m \
   --duration-max 28m
 ```
+
+自动匹配只接受标题的唯一精确匹配。同名作品、多季或重制版会返回候选 Bangumi ID，不会擅自选择；根据输出重新执行，例如：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  anime add \
+  --title "沉默的魔女" \
+  --next-episode 8 \
+  --auto-schedule \
+  --bangumi-id 506677
+```
+
+自动排期会每天同步一次；通知成功并创建下一集后会立即重新校准。也可以手动触发：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml anime sync 1
+```
+
+如果数据源中没有该作品，仍可按原方式手工提供多个 `--alias`、`--weekday` 和 `--time`，但不要同时使用 `--auto-schedule`。
 
 检查结果：
 
@@ -190,7 +220,7 @@ sudo systemctl status anipulse --no-pager
 sudo journalctl -u anipulse -f
 ```
 
-服务使用专用用户运行；`ProtectSystem=strict` 使系统目录只读，只允许写入 `/var/lib/anipulse`。它只需要通过 443 端口访问 Bilibili 和 `open.feishu.cn`，不需要在防火墙或路由器上开放入站端口。
+服务使用专用用户运行；`ProtectSystem=strict` 使系统目录只读，只允许写入 `/var/lib/anipulse`。它只需要通过 443 端口访问 Bilibili、`open.feishu.cn`、`unpkg.com` 和 `api.bgm.tv`，不需要在防火墙或路由器上开放入站端口。
 
 ## 10. 日常操作
 
@@ -255,6 +285,14 @@ sudo systemctl start anipulse
 - HTTP timeout/connect：检查服务器能否通过 443 端口访问 `open.feishu.cn`。
 
 程序会缓存飞书访问令牌，并在过期前自动刷新，不需要把 `tenant_access_token` 写入环境文件。
+
+### 自动排期匹配或同步失败
+
+- 多条同名记录：根据命令列出的候选选择正确季度，再传入 `--bangumi-id`。
+- 找不到精确标题：换用作品的正式中文名或日文原名；仍找不到时改用手工排期。
+- Bangumi 请求失败：检查服务器能否访问 `unpkg.com` 和 `api.bgm.tv`，以及 `schedule.user_agent` 是否已经修改。
+
+后台同步失败不会清空现有时间；程序会保留旧排期，默认 15 分钟后重试。可用 `anime show ID` 查看最近同步时间和错误。
 
 ### 通知一直是 pending
 

@@ -3,11 +3,12 @@ use std::{path::PathBuf, str::FromStr, sync::Arc};
 use anipulse::{
     config::AppConfig,
     detector::Detector,
-    domain::NewAnime,
+    domain::{AutoScheduleMetadata, NewAnime},
     error::{AppError, Result},
     notification::NotificationDispatcher,
     provider::BilibiliProvider,
     repository::Repository,
+    schedule::{ScheduleProvider, ScheduleSynchronizer},
     scheduler,
 };
 use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
@@ -60,11 +61,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AnimeCommand {
-    Add(AddAnimeArgs),
+    Add(Box<AddAnimeArgs>),
     List,
     Show { anime_id: i64 },
     Enable { anime_id: i64 },
     Disable { anime_id: i64 },
+    Sync { anime_id: i64 },
 }
 
 #[derive(Debug, Args)]
@@ -75,6 +77,14 @@ struct AddAnimeArgs {
     aliases: Vec<String>,
     #[arg(long, default_value_t = 1)]
     next_episode: i64,
+    #[arg(
+        long,
+        conflicts_with_all = ["expected_at", "weekday", "time"],
+        help = "fill aliases and broadcast time from bangumi-data"
+    )]
+    auto_schedule: bool,
+    #[arg(long, requires = "auto_schedule")]
+    bangumi_id: Option<i64>,
     #[arg(long, help = "RFC3339 timestamp; overrides --weekday/--time")]
     expected_at: Option<String>,
     #[arg(long, help = "monday..sunday")]
@@ -134,7 +144,7 @@ async fn execute(cli: Cli) -> Result<()> {
     let config = Arc::new(AppConfig::load(&cli.config)?);
     let repository = Repository::connect(&config.database.path).await?;
     match cli.command {
-        Command::Anime { command } => handle_anime(command, &repository).await,
+        Command::Anime { command } => handle_anime(command, &repository, &config).await,
         Command::Candidate { command } => handle_candidate(command, &repository, &config).await,
         Command::Uploader { command } => handle_uploader(command, &repository).await,
         Command::Notification {
@@ -175,59 +185,113 @@ fn build_runtime(
     Ok((detector, dispatcher))
 }
 
-async fn handle_anime(command: AnimeCommand, repository: &Repository) -> Result<()> {
+async fn handle_anime(
+    command: AnimeCommand,
+    repository: &Repository,
+    config: &AppConfig,
+) -> Result<()> {
     match command {
         AnimeCommand::Add(args) => {
             Tz::from_str(&args.timezone).map_err(|_| {
                 AppError::InvalidInput(format!("invalid timezone: {}", args.timezone))
             })?;
-            let expected_weekday = args.weekday.as_deref().map(parse_weekday).transpose()?;
-            let expected_time = args
-                .time
-                .as_deref()
-                .map(parse_time)
-                .transpose()?
-                .map(|time| time.format("%H:%M").to_string());
-            let expected_at = if let Some(value) = args.expected_at.as_deref() {
-                Some(
-                    chrono::DateTime::parse_from_rfc3339(value)
-                        .map_err(|e| AppError::InvalidInput(format!("invalid --expected-at: {e}")))?
-                        .with_timezone(&Utc),
-                )
-            } else if let (Some(weekday), Some(time)) = (expected_weekday, expected_time.as_deref())
+            let mut aliases = args.aliases;
+            let (expected_weekday, expected_time, expected_at, auto_schedule) = if args
+                .auto_schedule
             {
-                Some(next_weekly_occurrence(
-                    &args.timezone,
-                    weekday,
-                    parse_time(time)?,
-                )?)
+                let provider = ScheduleProvider::new(config.schedule.clone())?;
+                let catalog = provider.load_catalog().await?;
+                let resolved = provider
+                    .resolve(
+                        &catalog,
+                        &args.title,
+                        args.bangumi_id,
+                        args.next_episode,
+                        &args.timezone,
+                    )
+                    .await?;
+                aliases.extend(resolved.aliases.iter().cloned());
+                println!(
+                    "matched Bangumi subject #{}: {}; EP{} expected at {}",
+                    resolved.bangumi_subject_id,
+                    resolved.matched_title,
+                    args.next_episode,
+                    resolved.expected_at.to_rfc3339()
+                );
+                (
+                    Some(resolved.expected_weekday),
+                    Some(resolved.expected_time.clone()),
+                    Some(resolved.expected_at),
+                    Some(AutoScheduleMetadata {
+                        bangumi_subject_id: resolved.bangumi_subject_id,
+                        broadcast_pattern: resolved.broadcast_pattern,
+                        next_sync_at: Utc::now()
+                            + chrono::Duration::seconds(config.schedule.sync_interval_secs as i64),
+                    }),
+                )
             } else {
-                None
+                let expected_weekday = args.weekday.as_deref().map(parse_weekday).transpose()?;
+                let expected_time = args
+                    .time
+                    .as_deref()
+                    .map(parse_time)
+                    .transpose()?
+                    .map(|time| time.format("%H:%M").to_string());
+                let expected_at = if let Some(value) = args.expected_at.as_deref() {
+                    Some(
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            .map_err(|e| {
+                                AppError::InvalidInput(format!("invalid --expected-at: {e}"))
+                            })?
+                            .with_timezone(&Utc),
+                    )
+                } else if let (Some(weekday), Some(time)) =
+                    (expected_weekday, expected_time.as_deref())
+                {
+                    Some(next_weekly_occurrence(
+                        &args.timezone,
+                        weekday,
+                        parse_time(time)?,
+                    )?)
+                } else {
+                    None
+                };
+                (
+                    expected_weekday.map(|day| i64::from(day.num_days_from_monday())),
+                    expected_time,
+                    expected_at,
+                    None,
+                )
             };
             let id = repository
                 .add_anime(NewAnime {
                     title: args.title,
-                    aliases: args.aliases,
+                    aliases,
                     next_episode: args.next_episode,
                     expected_at,
-                    expected_weekday: expected_weekday
-                        .map(|day| i64::from(day.num_days_from_monday())),
+                    expected_weekday,
                     expected_time,
                     timezone: args.timezone,
                     duration_min_sec: parse_duration_arg(&args.duration_min)?,
                     duration_max_sec: parse_duration_arg(&args.duration_max)?,
+                    auto_schedule,
                 })
                 .await?;
             println!("added anime id={id}");
             Ok(())
         }
         AnimeCommand::List => {
-            println!("ID\tENABLED\tTITLE\tDURATION");
+            println!("ID\tENABLED\tAUTO\tBANGUMI\tTITLE\tDURATION");
             for anime in repository.list_anime().await? {
                 println!(
-                    "{}\t{}\t{}\t{}-{}m",
+                    "{}\t{}\t{}\t{}\t{}\t{}-{}m",
                     anime.id,
                     anime.enabled,
+                    anime.auto_schedule,
+                    anime
+                        .bangumi_subject_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".into()),
                     anime.title,
                     anime.duration_min_sec / 60,
                     anime.duration_max_sec / 60
@@ -243,6 +307,16 @@ async fn handle_anime(command: AnimeCommand, repository: &Repository) -> Result<
             println!("aliases: {}", anime.aliases.join(", "));
             println!("enabled: {}", anime.anime.enabled);
             println!("timezone: {}", anime.anime.timezone);
+            println!("auto schedule: {}", anime.anime.auto_schedule);
+            if let Some(subject_id) = anime.anime.bangumi_subject_id {
+                println!("Bangumi subject: {subject_id}");
+            }
+            if let Some(synced_at) = anime.anime.schedule_sync_at {
+                println!("schedule synced at: {}", synced_at.to_rfc3339());
+            }
+            if let Some(error) = &anime.anime.schedule_sync_error {
+                println!("schedule sync error: {error}");
+            }
             println!(
                 "duration: {}-{} seconds",
                 anime.anime.duration_min_sec, anime.anime.duration_max_sec
@@ -268,6 +342,13 @@ async fn handle_anime(command: AnimeCommand, repository: &Repository) -> Result<
         AnimeCommand::Disable { anime_id } => {
             repository.set_anime_enabled(anime_id, false).await?;
             println!("disabled anime {anime_id}");
+            Ok(())
+        }
+        AnimeCommand::Sync { anime_id } => {
+            ScheduleSynchronizer::new(repository.clone(), config.schedule.clone())?
+                .sync_now(anime_id)
+                .await?;
+            println!("synchronized schedule for anime {anime_id}");
             Ok(())
         }
     }

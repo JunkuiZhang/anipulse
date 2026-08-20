@@ -38,6 +38,12 @@
 
 验收：`cargo fmt --check`、`cargo test`、`cargo clippy -- -D warnings` 通过；可通过 SSH + CLI 完成添加、检查、纠错和信任管理。
 
+## 阶段 7：自动排期元数据
+
+交付：`anime add --auto-schedule`、Bangumi ID 消歧、bangumi-data 别名与 `broadcast` 导入、Bangumi 章节日期校准、每日后台同步和失败退避。
+
+验收：唯一精确标题可自动补全排期；同名季度必须显式指定 ID；同步失败保留旧排期；通知成功创建下一集后立即触发元数据校准。
+
 ## 后续阶段（不阻塞 V1）
 
-实际运行数周并收集误报/漏报后，再评估 Bangumi 元数据、异常 Episode、多渠道通知和 Web UI。不会提前加入下载、评论/弹幕分析、浏览器自动化、LLM 判定或复杂基础设施。
+实际运行数周并收集误报/漏报后，再评估异常 Episode、多渠道通知和 Web UI。不会提前加入下载、评论/弹幕分析、浏览器自动化、LLM 判定或复杂基础设施。

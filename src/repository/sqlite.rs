@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde_json::to_string;
@@ -7,7 +7,7 @@ use sqlx::{FromRow, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOption
 use crate::{
     domain::{
         Anime, AnimeWithAliases, CandidateState, Episode, EpisodeState, Evaluation, NewAnime,
-        PendingNotification, StoredCandidate, UploaderTrust, VideoCandidate,
+        PendingNotification, ScheduleUpdate, StoredCandidate, UploaderTrust, VideoCandidate,
     },
     error::{AppError, Result},
 };
@@ -87,14 +87,29 @@ impl Repository {
         }
 
         let now = Utc::now();
+        let (bangumi_subject_id, auto_schedule, broadcast_pattern, schedule_sync_at, next_sync_at) =
+            new.auto_schedule
+                .as_ref()
+                .map(|metadata| {
+                    (
+                        Some(metadata.bangumi_subject_id),
+                        true,
+                        Some(metadata.broadcast_pattern.as_str()),
+                        Some(now),
+                        Some(metadata.next_sync_at),
+                    )
+                })
+                .unwrap_or((None, false, None, None, None));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
-                title, expected_weekday, expected_time, timezone,
-                duration_min_sec, duration_max_sec, enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"#,
+                title, bangumi_subject_id, expected_weekday, expected_time, timezone,
+                duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
+                auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
+        .bind(bangumi_subject_id)
         .bind(new.expected_weekday)
         .bind(new.expected_time.as_deref())
         .bind(&new.timezone)
@@ -102,24 +117,26 @@ impl Repository {
         .bind(new.duration_max_sec)
         .bind(now)
         .bind(now)
+        .bind(auto_schedule)
+        .bind(broadcast_pattern)
+        .bind(schedule_sync_at)
+        .bind(next_sync_at)
         .execute(&mut *tx)
         .await?;
         let anime_id = result.last_insert_rowid();
 
-        let mut aliases = new.aliases;
-        aliases.push(new.title);
-        aliases.sort();
-        aliases.dedup();
-        for (priority, alias) in aliases
-            .into_iter()
-            .filter(|a| !a.trim().is_empty())
+        let mut seen_aliases = HashSet::new();
+        for (priority, alias) in std::iter::once(new.title)
+            .chain(new.aliases)
+            .map(|alias| alias.trim().to_string())
+            .filter(|alias| !alias.is_empty() && seen_aliases.insert(alias.clone()))
             .enumerate()
         {
             sqlx::query(
                 "INSERT OR IGNORE INTO anime_alias(anime_id, alias, priority) VALUES (?, ?, ?)",
             )
             .bind(anime_id)
-            .bind(alias.trim())
+            .bind(alias)
             .bind(priority as i64)
             .execute(&mut *tx)
             .await?;
@@ -218,6 +235,111 @@ impl Repository {
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn auto_schedule_due_ids(&self, limit: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            r#"SELECT id FROM anime
+               WHERE enabled = 1 AND auto_schedule = 1
+                 AND (schedule_next_sync_at IS NULL OR schedule_next_sync_at <= ?)
+               ORDER BY COALESCE(schedule_next_sync_at, created_at) LIMIT ?"#,
+        )
+        .bind(Utc::now())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn apply_schedule_update(
+        &self,
+        anime_id: i64,
+        update: &ScheduleUpdate,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"UPDATE anime SET
+                bangumi_subject_id = ?, expected_weekday = ?, expected_time = ?, timezone = ?,
+                broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
+                schedule_sync_error = NULL, updated_at = ?
+               WHERE id = ? AND auto_schedule = 1"#,
+        )
+        .bind(update.bangumi_subject_id)
+        .bind(update.expected_weekday)
+        .bind(&update.expected_time)
+        .bind(&update.timezone)
+        .bind(&update.broadcast_pattern)
+        .bind(now)
+        .bind(update.next_sync_at)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(format!(
+                "auto-scheduled anime {anime_id}"
+            )));
+        }
+
+        let mut priority = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(priority), -1) + 1 FROM anime_alias WHERE anime_id = ?",
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut seen_aliases = HashSet::new();
+        for alias in update
+            .aliases
+            .iter()
+            .map(|alias| alias.trim())
+            .filter(|alias| !alias.is_empty() && seen_aliases.insert((*alias).to_string()))
+        {
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO anime_alias(anime_id, alias, priority) VALUES (?, ?, ?)",
+            )
+            .bind(anime_id)
+            .bind(alias)
+            .bind(priority)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if inserted > 0 {
+                priority += 1;
+            }
+        }
+
+        sqlx::query(
+            r#"UPDATE episode SET expected_at = ?, next_check_at = ?
+               WHERE anime_id = ? AND state IN
+                   ('waiting','watching','candidate_found','needs_manual_review')"#,
+        )
+        .bind(update.expected_at)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_schedule_sync_failed(
+        &self,
+        anime_id: i64,
+        error: &str,
+        next_sync_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let safe_error: String = error.chars().take(500).collect();
+        sqlx::query(
+            r#"UPDATE anime SET schedule_sync_error = ?, schedule_next_sync_at = ?, updated_at = ?
+               WHERE id = ? AND auto_schedule = 1"#,
+        )
+        .bind(safe_error)
+        .bind(next_sync_at)
+        .bind(Utc::now())
+        .bind(anime_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn reschedule_episode(
@@ -595,6 +717,13 @@ impl Repository {
         .bind(next_check)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE anime SET schedule_next_sync_at = ? WHERE id = ? AND auto_schedule = 1",
+        )
+        .bind(now)
+        .bind(episode.anime_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -682,7 +811,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::domain::{AnimeMatch, DurationMatch, EpisodeMatch};
+    use crate::domain::{
+        AnimeMatch, AutoScheduleMetadata, DurationMatch, EpisodeMatch, ScheduleUpdate,
+    };
 
     async fn fixture() -> (TempDir, Repository, i64, Episode) {
         let directory = TempDir::new().unwrap();
@@ -699,6 +830,7 @@ mod tests {
                 timezone: "Asia/Shanghai".into(),
                 duration_min_sec: 1_200,
                 duration_max_sec: 1_680,
+                auto_schedule: None,
             })
             .await
             .unwrap();
@@ -784,5 +916,56 @@ mod tests {
         repository.clear_provider_failures().await.unwrap();
         repository.record_provider_failure(60, 60).await.unwrap();
         assert!(repository.reserve_provider_request(500).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_schedule_metadata_updates_active_episode() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("schedule.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let initial_expected = Utc::now() + chrono::Duration::days(1);
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "Silent Witch".into(),
+                aliases: vec![],
+                next_episode: 8,
+                expected_at: Some(initial_expected),
+                expected_weekday: Some(4),
+                expected_time: Some("23:00".into()),
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_680,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 506_677,
+                    broadcast_pattern: "R/2025-07-04T15:00:00Z/P7D".into(),
+                    next_sync_at: Utc::now() + chrono::Duration::days(1),
+                }),
+            })
+            .await
+            .unwrap();
+        let updated_expected = Utc::now() + chrono::Duration::days(2);
+        repository
+            .apply_schedule_update(
+                anime_id,
+                &ScheduleUpdate {
+                    bangumi_subject_id: 506_677,
+                    aliases: vec!["沉默魔女".into(), "サイレント・ウィッチ".into()],
+                    expected_at: updated_expected,
+                    expected_weekday: 5,
+                    expected_time: "00:00".into(),
+                    timezone: "Asia/Shanghai".into(),
+                    broadcast_pattern: "R/2025-07-05T16:00:00Z/P7D".into(),
+                    next_sync_at: Utc::now() + chrono::Duration::days(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        assert!(anime.anime.auto_schedule);
+        assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
+        assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(episode.expected_at, Some(updated_expected));
     }
 }

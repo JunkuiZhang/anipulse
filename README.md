@@ -35,26 +35,25 @@ cp config.example.toml config.toml
 
 ## CLI 快速开始
 
-添加一部番并创建正在等待的 EP8：
+推荐自动匹配 Bangumi 条目、补全别名和播出时间，然后创建正在等待的 EP8：
 
 ```bash
 anipulse anime add \
-  --title "Silent Witch" \
-  --alias "沉默魔女" \
-  --alias "サイレント・ウィッチ" \
+  --title "沉默的魔女" \
   --next-episode 8 \
-  --weekday friday \
-  --time 23:00 \
-  --timezone Asia/Shanghai \
+  --auto-schedule \
   --duration-min 20m \
   --duration-max 28m
 ```
+
+如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，并用 Bangumi 章节日期校准当前集；也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
 
 常用命令：
 
 ```bash
 anipulse anime list
 anipulse anime show 1
+anipulse anime sync 1
 anipulse check 1
 anipulse candidate list --state pending --explain
 anipulse candidate accept BVxxxxxxxxxx
@@ -143,3 +142,5 @@ RUST_LOG=info
 ## 外部接口边界
 
 Bilibili Web API 不是本项目可控制的稳定接口。所有 endpoint、WBI 签名、响应字段和错误码映射集中在 `src/provider/bilibili.rs`；如果接口变化，应只修改 Provider。遇到 HTTP 429、HTTP/Bilibili 412 或异常响应时，AniPulse 不会高频重试。
+
+自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知；同步失败时保留已有排期并退避重试。

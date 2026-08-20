@@ -5,4 +5,5 @@ pub mod error;
 pub mod notification;
 pub mod provider;
 pub mod repository;
+pub mod schedule;
 pub mod scheduler;
