@@ -163,6 +163,7 @@ path = "/var/lib/anipulse/anipulse.db"
 provider = "feishu"
 channel = "feishu-private-anime"
 notify_pending = false
+# 预留给鉴权网页候选审核通知；当前版本请保持 false。
 request_timeout_secs = 15
 
 [schedule]
@@ -269,6 +270,17 @@ sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anim
 sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime show 1
 ```
 
+已入库标题可以直接修改，不用删除重加。例如把缺少空格的“无职转生第三季”改为更适合 Bilibili 搜索的标题：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  anime edit 4 \
+  --title "无职转生 第三季"
+```
+
+旧标题会保留为别名，当前 Episode 会被安排为立即检查；常驻服务通常会在下一个 scheduler tick 开始搜索。可用 `anime show 4` 核对修改结果。
+
 ## 9. 启动 systemd 服务
 
 ```bash
@@ -314,7 +326,19 @@ sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml cand
 ```bash
 sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml candidate accept BVxxxxxxxxxx
 sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml candidate reject BVxxxxxxxxxx
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml candidate reject-all 4 --yes
 ```
+
+如果候选列表没有目标，但你已经知道 B 站视频地址，可以把规范链接直接作为当前集的人工确认：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  candidate accept-url 4 \
+  'https://www.bilibili.com/video/BV1Es8A6UEnr'
+```
+
+该命令先调用视频详情接口验证 BV 号并保存真实标题、UP 和时长，再创建待发送通知。它只接受 BV 号或 `www.bilibili.com` / `m.bilibili.com` 的 HTTPS `/video/BV...` 地址，不接受短链和第三方域名。
 
 `candidate accept` 会创建 pending notification；常驻服务会在下一次调度循环私聊发送飞书卡片。通知失败会保留 pending 状态并指数退避重试，不会丢失 Episode，也不会因为一次超时生成重复通知。
 

@@ -199,6 +199,60 @@ impl Repository {
         Ok(anime)
     }
 
+    pub async fn rename_anime(&self, anime_id: i64, title: &str) -> Result<Anime> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(AppError::InvalidInput("title cannot be empty".into()));
+        }
+
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+
+        sqlx::query("UPDATE anime SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(now)
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let next_priority = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(priority), -1) + 1 FROM anime_alias WHERE anime_id = ?",
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        for (offset, alias) in [previous.title.as_str(), title].into_iter().enumerate() {
+            sqlx::query(
+                r#"INSERT INTO anime_alias(anime_id, alias, priority, enabled)
+                   VALUES (?, ?, ?, 1)
+                   ON CONFLICT(anime_id, alias) DO UPDATE SET enabled = 1"#,
+            )
+            .bind(anime_id)
+            .bind(alias)
+            .bind(next_priority + offset as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"UPDATE episode SET next_check_at = ?
+               WHERE anime_id = ?
+                 AND state IN ('waiting','watching','candidate_found','needs_manual_review')"#,
+        )
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(previous)
+    }
+
     pub async fn set_anime_enabled(&self, anime_id: i64, enabled: bool) -> Result<()> {
         let result = sqlx::query("UPDATE anime SET enabled = ?, updated_at = ? WHERE id = ?")
             .bind(enabled)
@@ -611,6 +665,36 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn reject_all_candidates(&self, episode_id: i64, user_rejected: bool) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let candidate_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY id",
+        )
+        .bind(episode_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if user_rejected {
+            for candidate_id in &candidate_ids {
+                Self::increment_trust_tx(&mut tx, *candidate_id, false).await?;
+            }
+        }
+        let result = sqlx::query(
+            "UPDATE candidate SET state = 'rejected' WHERE episode_id = ? AND state = 'pending'",
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE episode SET state = 'watching'
+               WHERE id = ? AND state IN ('candidate_found','needs_manual_review')"#,
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     async fn increment_trust_tx(
         tx: &mut Transaction<'_, Sqlite>,
         candidate_id: i64,
@@ -926,6 +1010,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejecting_all_pending_candidates_records_feedback() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (candidate, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .reject_all_candidates(episode.id, true)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            repository
+                .active_candidates(episode.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository.episode(episode.id).await.unwrap().state,
+            "watching"
+        );
+        assert_eq!(
+            repository
+                .uploader_trust(anime_id, candidate.uploader_mid)
+                .await
+                .unwrap()
+                .rejected_count,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn provider_budget_and_backoff_are_global() {
         let (_directory, repository, _anime_id, _episode) = fixture().await;
         repository.reserve_provider_request(1).await.unwrap();
@@ -985,6 +1106,35 @@ mod tests {
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));
+    }
+
+    #[tokio::test]
+    async fn renaming_anime_keeps_old_title_and_schedules_check() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let future = Utc::now() + chrono::Duration::days(1);
+        repository
+            .reschedule_episode(episode.id, future)
+            .await
+            .unwrap();
+
+        let previous = repository
+            .rename_anime(anime_id, "  无职转生 第三季  ")
+            .await
+            .unwrap();
+        assert_eq!(previous.title, "Silent Witch");
+
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        assert_eq!(anime.anime.title, "无职转生 第三季");
+        assert!(anime.aliases.iter().any(|alias| alias == "Silent Witch"));
+        assert!(anime.aliases.iter().any(|alias| alias == "无职转生 第三季"));
+        assert!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .next_check_at
+                < future
+        );
     }
 
     #[tokio::test]

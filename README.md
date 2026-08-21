@@ -12,7 +12,7 @@ AniPulse 是一个面向个人 Linux 服务器的番剧更新监控器。它低�
 - Trusted Uploader、Independent Consensus、Manual Confirmation 三条确认路径；
 - 公共聚合搜索、WBI 回退和视频详情 Provider 隔离；识别 `v_voucher` 软风控响应，并执行全局串行限流、每日预算及 429/412/临时失败退避；
 - 飞书消息卡片通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
-- CLI 人工 accept/reject 与 per-Anime UP trust/block。
+- CLI 改名、按 B 站链接人工确认、候选 accept/reject 与 per-Anime UP trust/block。
 
 V1 不下载视频、不使用登录 Cookie、不绕过风控，也不处理 `EP12.5`、SP、OVA、连播或分 P 的自动推进。此类标题只进入人工复核。
 
@@ -53,13 +53,16 @@ anipulse anime add \
 ```bash
 anipulse anime list
 anipulse anime show 1
+anipulse anime edit 1 --title "无职转生 第三季"
 anipulse anime sync 1
 anipulse anime disable 4
 anipulse anime remove 4 --yes
 anipulse check 1
 anipulse candidate list --state pending --explain
 anipulse candidate accept BVxxxxxxxxxx
+anipulse candidate accept-url 1 https://www.bilibili.com/video/BVxxxxxxxxxx
 anipulse candidate reject BVxxxxxxxxxx
+anipulse candidate reject-all 1 --yes
 anipulse uploader trust 1 123456
 anipulse uploader block 1 123456
 anipulse notification test
@@ -68,7 +71,13 @@ anipulse run
 
 `anime remove ID` 是永久删除操作，会级联清除该番剧的别名、Episode、候选、通知和 UP 信任记录。命令默认拒绝执行；必须先用 `anime show ID` 核对目标，再显式添加 `--yes`。误添加时先 `anime disable ID` 可立即阻止后台继续调度。
 
+`anime edit ID --title "新标题"` 会修改首选搜索标题、保留旧标题作为别名，并把当前 Episode 调整为立即检查。空格会影响 Bilibili 的搜索召回；例如已入库的“无职转生第三季”可直接改成“无职转生 第三季”，不需要删除重加。
+
 `candidate accept` 只事务化确认状态并创建 pending notification；下一次 `run` 或 `check` 会发送它。这样即使通知服务暂时失败也不会丢失已确认更新。
+
+如果搜索没有发现目标视频，但你已经拿到规范的 Bilibili 视频地址，可执行 `candidate accept-url ANIME_ID URL`。AniPulse 会先通过 Bilibili 详情接口校验 BV 号并保存标题、UP、时长等元数据，再把它作为当前等待集数的人工确认候选；它不接受第三方域名或任意 URL。
+
+如果当前集的待确认候选全都不对，可在先查看列表后执行 `candidate reject-all ANIME_ID --yes`。它只拒绝该 Anime 当前 Episode 的 pending candidates，并逐个记录人工反馈，不影响之后新发现的候选。
 
 ## 通知
 
@@ -91,6 +100,8 @@ anipulse notification test
 ```
 
 更新确认后，应用机器人会直接向你发送包含确认依据、UP、时长、BV 号和“立即观看”按钮的消息卡片。程序缓存 `tenant_access_token` 并在过期前刷新；无需事件订阅、回调地址或服务器入站端口。不要把 App Secret、Cookie 或其他 secret 写入仓库，日志也不会打印这些值。
+
+当前飞书通道是单向通知：机器人可以私聊发卡片，但不能接收按钮选择或你回复的视频链接。候选不确定时的安全交互会与鉴权网页共用审核页：飞书卡片只打开登录后的审核页面，由页面执行“确认一个、全部拒绝、提交 B 站链接”。这样无需暴露一个可直接改数据库的匿名飞书回调；具体设计见网页计划。
 
 原有飞书群自定义机器人仍可作为兼容选项：把 `provider` 设为 `feishu_webhook`，并提供 `FEISHU_WEBHOOK_URL` 以及可选的 `FEISHU_BOT_SECRET`。
 

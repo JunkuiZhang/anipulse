@@ -3,10 +3,10 @@ use std::{path::PathBuf, str::FromStr, sync::Arc};
 use anipulse::{
     config::AppConfig,
     detector::Detector,
-    domain::{AutoScheduleMetadata, NewAnime},
+    domain::{AutoScheduleMetadata, CandidateState, NewAnime, VideoCandidate},
     error::{AppError, Result},
     notification::NotificationDispatcher,
-    provider::BilibiliProvider,
+    provider::{BilibiliProvider, VideoSearchProvider},
     repository::Repository,
     schedule::{ScheduleProvider, ScheduleSynchronizer},
     scheduler,
@@ -65,6 +65,14 @@ enum AnimeCommand {
     List,
     Show {
         anime_id: i64,
+    },
+    Edit {
+        anime_id: i64,
+        #[arg(
+            long,
+            help = "new primary title; the previous title is kept as an alias"
+        )]
+        title: String,
     },
     Enable {
         anime_id: i64,
@@ -126,8 +134,20 @@ enum CandidateCommand {
     Accept {
         bvid: String,
     },
+    AcceptUrl {
+        anime_id: i64,
+        url: String,
+    },
     Reject {
         bvid: String,
+    },
+    RejectAll {
+        anime_id: i64,
+        #[arg(
+            long,
+            help = "confirm rejection of every pending candidate for the active episode"
+        )]
+        yes: bool,
     },
 }
 
@@ -350,6 +370,15 @@ async fn handle_anime(
             }
             Ok(())
         }
+        AnimeCommand::Edit { anime_id, title } => {
+            let previous = repository.rename_anime(anime_id, &title).await?;
+            println!(
+                "renamed anime {anime_id} from {:?} to {:?}; the previous title remains an alias and an immediate check was scheduled",
+                previous.title,
+                title.trim()
+            );
+            Ok(())
+        }
         AnimeCommand::Enable { anime_id } => {
             repository.set_anime_enabled(anime_id, true).await?;
             println!("enabled anime {anime_id}");
@@ -432,9 +461,75 @@ async fn handle_candidate(
             println!("accepted {bvid}; notification is pending");
             Ok(())
         }
+        CandidateCommand::AcceptUrl { anime_id, url } => {
+            let bvid = parse_bilibili_bvid(&url)?;
+            let anime = repository.get_anime(anime_id).await?;
+            let episode = repository.active_episode(anime_id).await?;
+            let now = Utc::now();
+            let seed = VideoCandidate {
+                bvid: bvid.clone(),
+                title: bvid.clone(),
+                description: None,
+                uploader_mid: 0,
+                uploader_name: "unknown".into(),
+                duration_sec: 0,
+                published_at: now,
+                url: format!("https://www.bilibili.com/video/{bvid}"),
+                tags: Vec::new(),
+                page_count: None,
+                discovered_at: now,
+                enriched: false,
+            };
+            let provider = BilibiliProvider::new(config.bilibili.clone(), repository.clone())?;
+            let candidate = provider.enrich(&seed).await?;
+            let trust = repository
+                .uploader_trust(anime_id, candidate.uploader_mid)
+                .await?;
+            let evaluation = anipulse::detector::evaluator::evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &trust,
+                config.confirmation.trusted_confirmed_count,
+            );
+            repository
+                .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
+                .await?;
+            repository
+                .confirm_candidate(
+                    episode.id,
+                    &bvid,
+                    "manual_url_confirmation",
+                    &config.notification.channel,
+                    true,
+                )
+                .await?;
+            println!(
+                "accepted {bvid} for anime {anime_id} EP{} from Bilibili URL; notification is pending",
+                episode.episode_no
+            );
+            Ok(())
+        }
         CandidateCommand::Reject { bvid } => {
             repository.reject_candidate(&bvid, true).await?;
             println!("rejected {bvid}");
+            Ok(())
+        }
+        CandidateCommand::RejectAll { anime_id, yes } => {
+            let episode = repository.active_episode(anime_id).await?;
+            let candidates = repository.active_candidates(episode.id).await?;
+            if !yes {
+                return Err(AppError::InvalidInput(format!(
+                    "refusing to reject {} pending candidate(s) for anime {anime_id} EP{}; re-run with --yes",
+                    candidates.len(),
+                    episode.episode_no
+                )));
+            }
+            let rejected = repository.reject_all_candidates(episode.id, true).await?;
+            println!(
+                "rejected {rejected} pending candidate(s) for anime {anime_id} EP{}",
+                episode.episode_no
+            );
             Ok(())
         }
     }
@@ -483,6 +578,42 @@ fn parse_duration_arg(value: &str) -> Result<i64> {
     value
         .parse()
         .map_err(|_| AppError::InvalidInput(format!("invalid duration: {value}")))
+}
+
+fn parse_bilibili_bvid(value: &str) -> Result<String> {
+    let value = value.trim();
+    if valid_bvid(value) {
+        return Ok(value.to_string());
+    }
+
+    let url = url::Url::parse(value)
+        .map_err(|_| AppError::InvalidInput("expected a BV ID or Bilibili video URL".into()))?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("www.bilibili.com" | "m.bilibili.com"))
+    {
+        return Err(AppError::InvalidInput(
+            "only canonical HTTPS Bilibili video URLs are accepted".into(),
+        ));
+    }
+    let mut segments = url.path_segments().into_iter().flatten();
+    if segments.next() != Some("video") {
+        return Err(AppError::InvalidInput(
+            "Bilibili URL must use /video/BV...".into(),
+        ));
+    }
+    let bvid = segments.next().unwrap_or_default();
+    if !valid_bvid(bvid) {
+        return Err(AppError::InvalidInput(
+            "Bilibili URL contains an invalid BV ID".into(),
+        ));
+    }
+    Ok(bvid.to_string())
+}
+
+fn valid_bvid(value: &str) -> bool {
+    value.len() == 12
+        && value.starts_with("BV")
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn parse_weekday(value: &str) -> Result<Weekday> {
@@ -540,6 +671,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_canonical_bilibili_video_input() {
+        assert_eq!(
+            parse_bilibili_bvid("https://www.bilibili.com/video/BV1Es8A6UEnr?p=1").unwrap(),
+            "BV1Es8A6UEnr"
+        );
+        assert_eq!(parse_bilibili_bvid("BV1Es8A6UEnr").unwrap(), "BV1Es8A6UEnr");
+        assert!(parse_bilibili_bvid("https://example.com/video/BV1Es8A6UEnr").is_err());
+        assert!(parse_bilibili_bvid("https://www.bilibili.com/bangumi/BV1Es8A6UEnr").is_err());
+    }
+
+    #[test]
     fn anime_remove_requires_explicit_confirmation_flag() {
         let cli = Cli::try_parse_from(["anipulse", "anime", "remove", "4"]).unwrap();
         assert!(matches!(
@@ -559,6 +701,42 @@ mod tests {
                 command: AnimeCommand::Remove {
                     anime_id: 4,
                     yes: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_anime_edit_title() {
+        let cli = Cli::try_parse_from([
+            "anipulse",
+            "anime",
+            "edit",
+            "4",
+            "--title",
+            "无职转生 第三季",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::Edit {
+                    anime_id: 4,
+                    ref title
+                }
+            } if title == "无职转生 第三季"
+        ));
+    }
+
+    #[test]
+    fn candidate_reject_all_requires_confirmation_flag() {
+        let cli = Cli::try_parse_from(["anipulse", "candidate", "reject-all", "4"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Candidate {
+                command: CandidateCommand::RejectAll {
+                    anime_id: 4,
+                    yes: false
                 }
             }
         ));

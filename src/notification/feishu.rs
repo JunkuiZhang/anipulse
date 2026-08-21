@@ -255,6 +255,7 @@ fn readable_confirmation_reason(reason: Option<&str>) -> String {
     match reason.unwrap_or("manual_confirmation") {
         "trusted_uploader" => "可信 UP 主".into(),
         "manual_confirmation" => "人工确认".into(),
+        "manual_url_confirmation" => "人工提供 B 站链接".into(),
         value if value.starts_with("consensus:") => {
             let votes = value
                 .trim_start_matches("consensus:")

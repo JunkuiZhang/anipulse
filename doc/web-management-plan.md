@@ -297,6 +297,7 @@ CREATE TABLE management_job (
 | POST | `/anime/resolve` | 是 | 解析 Bangumi 候选，创建短期 draft |
 | POST | `/anime` | 是 | 用户确认 draft 后创建 Anime |
 | GET | `/anime/{id}` | 是 | 详情、别名、当前 Episode、同步状态 |
+| POST | `/anime/{id}/title` | 是 | 修改首选标题并保留旧标题为别名 |
 | POST | `/anime/{id}/enable` | 是 | 启用 |
 | POST | `/anime/{id}/disable` | 是 | 禁用 |
 | POST | `/anime/{id}/delete` | 是 | 永久删除，要求输入标题确认 |
@@ -305,6 +306,8 @@ CREATE TABLE management_job (
 | GET | `/candidates` | 是 | 候选分页、分数解释 |
 | POST | `/candidates/{bvid}/accept` | 是 | 人工确认 |
 | POST | `/candidates/{bvid}/reject` | 是 | 人工拒绝 |
+| POST | `/episodes/{id}/candidates/reject-all` | 是 | 拒绝本集当前全部候选 |
+| POST | `/episodes/{id}/candidates/from-url` | 是 | 校验 B 站链接并创建人工候选任务 |
 | POST | `/anime/{id}/uploaders/{mid}/trust` | 是 | 信任 UP |
 | POST | `/anime/{id}/uploaders/{mid}/block` | 是 | 屏蔽 UP |
 | GET | `/jobs` | 是 | 后台任务状态 |
@@ -338,6 +341,22 @@ V1 页面使用 POST/Redirect/GET，刷新结果页不会重复执行写操作�
 ### 8.4 JSON API
 
 V1 不对第三方开放 API。页面需要少量异步交互时，可在同源 `/api/v1` 下提供内部 JSON endpoint，并与 HTML 路由复用相同 Session、CSRF、授权和 ApplicationService。默认关闭 CORS，错误结构不返回内部 SQL、路径或外部 Secret。
+
+### 8.5 飞书“不确定候选”审核入口
+
+当检查产生 pending candidate、但可信 UP 和独立共识均不成立时，scheduler 可在候选集合发生变化后发送一次飞书私聊审核卡片。另一种实际情况是搜索 API 返回了原始结果、但全部被番名/集数/时长硬规则排除；如果已经超过预计更新时间和可配置的 grace period，也发送一次“未找到可用候选”卡片，让用户直接提交链接。Provider 超时、风控或全局 backoff 不算“未找到”，不得据此打扰用户。
+
+有候选的卡片显示 Anime、Episode、候选摘要和 B 站观看链接；无候选的卡片显示最后检查时间与排除统计。卡片按钮本身不修改状态；唯一的“处理候选”按钮打开 `${web.public_url}/review/episodes/{id}`，未登录时先进入正常登录流程。
+
+审核页支持三类操作：
+
+1. 选择一个已有候选，复用现有人工 `accept` 事务并创建 release notification；
+2. “都不选”，在一个事务中拒绝页面展示时对应的候选集合，使用 action nonce 和候选集合版本防止误伤后来出现的新候选；
+3. 粘贴规范的 `https://www.bilibili.com/video/BV...` 地址。网页只解析和校验 host/BV 号并创建后台任务，scheduler 读取 Bilibili 详情后保存完整候选；页面展示详情并要求最终确认，不能由浏览器直接伪造 UP、时长或标题。
+
+审核提醒需要独立于“更新已确认”通知的幂等记录，不能复用当前 `UNIQUE(episode_id, channel)` 的 release notification。建议新增 `review_notification(episode_id, channel, candidate_fingerprint, status, ...)`；有候选时 fingerprint 由排序后的候选 ID 集合生成，无候选时使用 Episode、标题修订号和 grace stage 生成哨兵 fingerprint。相同集合/阶段只提醒一次，新候选出现或用户改名后可以再提醒。失败沿用指数退避，发送审核卡片绝不推进下一集。
+
+V1 不接收飞书卡片 action callback，也不订阅私聊文本消息。直接在飞书内完成按钮写操作需要额外的公网回调、飞书事件验签/解密、操作者 open_id allowlist、时间戳与重放保护、一次性 action token 和审计；这会新增一条独立鉴权边界。先使用“飞书提醒 → 鉴权网页审核”可以复用现有 Session、CSRF 和审计模型，也不需要把网页进程暴露成匿名数据库写入口。
 
 ## 9. 进程通信与并发
 
@@ -491,6 +510,7 @@ anime.example.com:443 -> Caddy -> 127.0.0.1:8080
 
 - Bangumi 两步解析/确认 draft；
 - 添加、启用、禁用；
+- 修改首选标题并保留旧标题为别名，修改后入队立即检查；
 - 输入标题 + nonce + optimistic check 的永久删除；
 - 检查/同步任务入队；
 - 所有操作审计。
@@ -502,8 +522,10 @@ anime.example.com:443 -> Caddy -> 127.0.0.1:8080
 交付：
 
 - Candidate accept/reject；
+- 本集候选全部拒绝、规范 B 站链接提交与详情确认；
 - UP trust/block；
 - pending notification 和失败重试状态；
+- 候选集合 fingerprint 去重的飞书审核提醒，以及指向鉴权审核页的卡片入口；
 - 操作后的 PRG 跳转和一次性提示。
 
 验收：重复接受仍只有一条通知；同 MID 共识规则不变；被 block 的 UP 无法因网页操作绕过领域规则；全部写操作需要 CSRF 与审计。

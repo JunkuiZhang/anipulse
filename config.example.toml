@@ -38,6 +38,7 @@ jitter_ratio = 0.1
 provider = "feishu"
 channel = "feishu-private-anime"
 notify_pending = false
+# 预留给鉴权网页候选审核通知；当前版本请保持 false。
 request_timeout_secs = 15
 
 [schedule]
