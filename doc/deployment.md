@@ -76,6 +76,47 @@ cargo test --locked
 cargo build --locked --release
 ```
 
+### 从 Arch Linux 构建给 Ubuntu 使用的静态版本
+
+不能把 Arch 上普通 `cargo build --release` 生成的 `target/release/anipulse` 直接复制到 Ubuntu。它会链接 Arch 的较新 glibc，在 Ubuntu 22.04 上通常报 `GLIBC_2.38 not found`。如果不想在服务器本机编译，应在 Arch 上生成完全静态的 musl 版本。
+
+安装 musl 工具链并添加 Rust 目标：
+
+```bash
+sudo pacman -S --needed musl
+rustup target add x86_64-unknown-linux-musl
+```
+
+项目包含由 C 编译器构建的 SQLite，因此需要同时指定 C 编译器和最终 linker。`musl-gcc` wrapper 与 rustc 默认 static PIE 的组合可能生成一个没有 `NEEDED` 共享库、却仍带 `/lib/ld-musl-x86_64.so.1` 解释器的异常文件；这种文件安装 musl loader 后也可能在启动时段错误。这是 Rust 已记录的 [`musl-gcc` static PIE 问题](https://github.com/rust-lang/rust/issues/95926)，构建时必须通过 `relocation-model=static` 禁用 PIE：
+
+```bash
+cd /path/to/anipulse
+cargo test --locked
+cargo clean --target x86_64-unknown-linux-musl
+
+CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+RUSTFLAGS='-C target-feature=+crt-static -C relocation-model=static' \
+cargo build --locked --release --target x86_64-unknown-linux-musl
+```
+
+上传前必须检查产物：
+
+```bash
+file target/x86_64-unknown-linux-musl/release/anipulse
+readelf -l target/x86_64-unknown-linux-musl/release/anipulse | grep interpreter
+readelf -d target/x86_64-unknown-linux-musl/release/anipulse | grep NEEDED
+./target/x86_64-unknown-linux-musl/release/anipulse --help
+```
+
+`file` 应显示 `statically linked`；两条 `readelf` 命令都应该没有输出；`--help` 应能在 Arch 本机正常运行。只上传这个路径下的文件：
+
+```text
+target/x86_64-unknown-linux-musl/release/anipulse
+```
+
+该静态文件不依赖服务器的 glibc 或 musl loader。不要上传 Arch 原生的 `target/release/anipulse`，也不要在 Ubuntu 上把 glibc loader 软链接成 musl loader。
+
 ## 4. 安装程序和专用用户
 
 创建不可登录的系统用户：
@@ -93,6 +134,14 @@ sudo install -d -m 0755 /etc/anipulse
 sudo install -m 0644 config.example.toml /etc/anipulse/config.toml
 sudo install -m 0644 deploy/anipulse.service /etc/systemd/system/anipulse.service
 ```
+
+如果使用上一节在 Arch 生成的静态 musl 文件，应把第一条命令的源路径换成上传后的文件，例如：
+
+```bash
+sudo install -m 0755 /tmp/anipulse /usr/local/bin/anipulse
+```
+
+安装后先执行 `file /usr/local/bin/anipulse` 和 `/usr/local/bin/anipulse --help`，确认产物正确，再继续配置服务。
 
 如果 `anipulse` 用户已经存在，跳过 `useradd` 即可。
 
@@ -287,6 +336,14 @@ sudo systemctl start anipulse
 恢复前先停止服务，把备份复制回 `anipulse.db`，确认所有者仍为 `anipulse:anipulse`，再启动服务。
 
 ## 13. 常见问题
+
+### 二进制无法启动、提示 GLIBC 或 musl 段错误
+
+- `GLIBC_2.38 not found`：使用了 Arch 原生 glibc 产物。改为服务器本机编译，或按第 3 节生成静态 musl 文件。
+- `No such file or directory`，但文件实际存在：执行 `readelf -l /usr/local/bin/anipulse | grep interpreter`；通常是二进制仍要求系统中不存在的动态 loader。
+- `readelf -d` 没有 `NEEDED`，但仍显示 `/lib/ld-musl-x86_64.so.1`，运行后段错误：命中了 `musl-gcc` static PIE 问题，不能靠安装 musl 修复；必须添加 `-C relocation-model=static` 后清理目标目录并重新编译。
+
+可移植的静态文件必须同时满足：`file` 显示 `statically linked`，`readelf -l ... | grep interpreter` 没有输出，`readelf -d ... | grep NEEDED` 没有输出。服务器本机编译的 glibc 文件可以带 `/lib64/ld-linux-x86-64.so.2`，因为它与服务器自身的 glibc 匹配。
 
 ### 飞书没有收到测试卡片
 
