@@ -3,7 +3,7 @@ pub mod episode;
 pub mod evaluator;
 pub mod title;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, iter, sync::Arc};
 
 use chrono::Utc;
 use rand::RngExt;
@@ -46,17 +46,11 @@ impl Detector {
             "checking episode"
         );
 
-        let primary = format!("{} {}", anime.anime.title, episode.episode_no);
-        let mut queries = vec![primary];
-        if self.config.bilibili.max_search_requests_per_check > 1
-            && let Some(alias) = anime
-                .aliases
-                .iter()
-                .find(|alias| !alias.eq_ignore_ascii_case(&anime.anime.title))
-        {
-            queries.push(format!("{alias} {}", episode.episode_no));
-        }
-        queries.truncate(self.config.bilibili.max_search_requests_per_check);
+        let queries = build_search_queries(
+            &anime,
+            episode.episode_no,
+            self.config.bilibili.max_search_requests_per_check,
+        );
 
         let mut seen_bvids = HashSet::new();
         let mut detail_requests = 0usize;
@@ -247,6 +241,26 @@ impl Detector {
     }
 }
 
+fn build_search_queries(
+    anime: &crate::domain::AnimeWithAliases,
+    episode_no: i64,
+    limit: usize,
+) -> Vec<String> {
+    let episode_token = format!("{episode_no:02}");
+    let mut seen_aliases = HashSet::new();
+    iter::once(&anime.anime.title)
+        .chain(anime.aliases.iter())
+        .filter_map(|alias| {
+            let normalized = title::normalize_title(alias);
+            if normalized.is_empty() || !seen_aliases.insert(normalized) {
+                return None;
+            }
+            Some(format!("{} {episode_token}", alias.trim()))
+        })
+        .take(limit)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
@@ -345,5 +359,36 @@ mod tests {
             "confirmed"
         );
         assert!(repository.pending_notifications().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_queries_zero_pad_episode_and_keep_alias_fallback() {
+        let now = Utc::now();
+        let anime = crate::domain::AnimeWithAliases {
+            anime: crate::domain::Anime {
+                id: 1,
+                title: "尼古喵喵".into(),
+                bangumi_subject_id: None,
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_500,
+                duration_max_sec: 2_100,
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+                auto_schedule: true,
+                broadcast_pattern: None,
+                schedule_sync_at: None,
+                schedule_next_sync_at: None,
+                schedule_sync_error: None,
+            },
+            aliases: vec!["尼古喵喵".into(), "ヤニねこ".into()],
+        };
+
+        assert_eq!(
+            build_search_queries(&anime, 8, 2),
+            vec!["尼古喵喵 08", "ヤニねこ 08"]
+        );
     }
 }

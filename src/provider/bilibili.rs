@@ -11,6 +11,7 @@ use chrono::{TimeZone, Utc};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use tokio::{sync::Mutex, time::Instant};
+use tracing::warn;
 
 const MIXIN_KEY_ENC_TAB: [usize; 64] = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
@@ -197,6 +198,7 @@ impl BilibiliProvider {
         let mixin = self.wbi_mixin_key().await?;
         let mut params = vec![
             ("keyword".to_string(), sanitize_wbi_value(keyword)),
+            ("order".to_string(), "pubdate".to_string()),
             ("page".to_string(), "1".to_string()),
             ("page_size".to_string(), "20".to_string()),
             ("search_type".to_string(), "video".to_string()),
@@ -240,17 +242,45 @@ impl BilibiliProvider {
 #[async_trait]
 impl VideoSearchProvider for BilibiliProvider {
     async fn search(&self, query: &SearchQuery) -> ProviderResult<Vec<VideoCandidate>> {
-        let params = self.signed_search_params(&query.keyword).await?;
+        let params = vec![
+            ("keyword".to_string(), sanitize_wbi_value(&query.keyword)),
+            ("order".to_string(), "pubdate".to_string()),
+            ("page".to_string(), "1".to_string()),
+        ];
         let value = self
-            .request_value("/x/web-interface/wbi/search/type", &params)
+            .request_value("/x/web-interface/search/all/v2", &params)
             .await?;
         Self::ensure_success(&value, "search")?;
-        let Some(results) = value.pointer("/data/result").and_then(Value::as_array) else {
-            return Ok(Vec::new());
+        let results = match search_result_items(&value) {
+            Ok(results) => results,
+            Err(ProviderError::RiskControl(message)) => {
+                let until = self.record_failure(21_600, 86_400).await;
+                return Err(ProviderError::RiskControl(format!(
+                    "{message}; backoff until {until}"
+                )));
+            }
+            Err(primary_error) => {
+                warn!(%primary_error, "all-search response unusable; trying signed video search");
+                let params = self.signed_search_params(&query.keyword).await?;
+                let value = self
+                    .request_value("/x/web-interface/wbi/search/type", &params)
+                    .await?;
+                Self::ensure_success(&value, "signed search")?;
+                match search_result_items(&value) {
+                    Ok(results) => results,
+                    Err(ProviderError::RiskControl(message)) => {
+                        let until = self.record_failure(21_600, 86_400).await;
+                        return Err(ProviderError::RiskControl(format!(
+                            "{message}; backoff until {until}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         };
         let now = Utc::now();
         let mut candidates = Vec::with_capacity(results.len());
-        for item in results {
+        for item in &results {
             let Some(bvid) = string_field(item, "bvid") else {
                 continue;
             };
@@ -337,6 +367,42 @@ impl VideoSearchProvider for BilibiliProvider {
     }
 }
 
+fn search_result_items(value: &Value) -> ProviderResult<Vec<Value>> {
+    if value
+        .pointer("/data/v_voucher")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Err(ProviderError::RiskControl(
+            "Bilibili search requested a verification voucher".into(),
+        ));
+    }
+    let results = value
+        .pointer("/data/result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::InvalidResponse("search missing data.result array".into()))?;
+    if results
+        .iter()
+        .any(|group| group.get("result_type").is_some())
+    {
+        if let Some(videos) = results
+            .iter()
+            .find(|group| group.get("result_type").and_then(Value::as_str) == Some("video"))
+            .and_then(|group| group.get("data"))
+            .and_then(Value::as_array)
+        {
+            return Ok(videos.clone());
+        }
+        if value.pointer("/data/numResults").and_then(value_as_i64) == Some(0) {
+            return Ok(Vec::new());
+        }
+        return Err(ProviderError::InvalidResponse(
+            "all-search missing video result group".into(),
+        ));
+    }
+    Ok(results.clone())
+}
+
 fn file_stem(url: &str) -> ProviderResult<&str> {
     url.rsplit('/')
         .next()
@@ -417,5 +483,50 @@ mod tests {
         assert!(valid_cookie_value("1234-abc_infoc-xyz=="));
         assert!(!valid_cookie_value("abc; SESSDATA=bad"));
         assert!(!valid_cookie_value("abc\r\nInjected: yes"));
+    }
+
+    #[test]
+    fn extracts_video_group_from_all_search() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "result": [
+                    {"result_type": "media_bangumi", "data": []},
+                    {"result_type": "video", "data": [
+                        {"bvid": "BV1Es8A6UEnr", "title": "尼古喵喵 08"}
+                    ]}
+                ]
+            }
+        });
+
+        let results = search_result_items(&value).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["bvid"], "BV1Es8A6UEnr");
+    }
+
+    #[test]
+    fn recognizes_soft_risk_control_voucher() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {"v_voucher": "voucher-example"}
+        });
+
+        assert!(matches!(
+            search_result_items(&value),
+            Err(ProviderError::RiskControl(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_all_search_results() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": {
+                "numResults": 0,
+                "result": [{"result_type": "tips", "data": []}]
+            }
+        });
+
+        assert!(search_result_items(&value).unwrap().is_empty());
     }
 }

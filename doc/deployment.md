@@ -369,9 +369,11 @@ sudo systemctl start anipulse
 
 发送失败时 AniPulse 会记录简化错误、保留 pending，并按指数退避再次发送。修复飞书配置后无需修改数据库，等待重试或重启服务即可。
 
-### Bilibili 返回 412/429
+### Bilibili 返回 412/429 或 `v_voucher`
 
-这是 Provider 风控或限流。AniPulse 会持久化全局 backoff，期间不会持续高频请求。不要通过代理池、Cookie 池或高频重启绕过。
+这是 Provider 风控或限流。新版 AniPulse 会识别 `code=0` 但仅含 `v_voucher` 的软风控响应，不会再把它记录成正常的 `results=0`；公开聚合搜索响应结构异常时会尝试 WBI 回退，任一路径明确返回风控时都会进入持久化全局 backoff。期间不会持续高频请求。不要通过代理池、Cookie 池或高频重启绕过。
+
+如果旧日志连续显示 `search completed results=0`，但浏览器能够搜到目标视频，先升级到包含软风控识别和聚合搜索支持的版本，再手工执行一次 `check ID`。升级不会要求重新添加追番，也不会清空现有 SQLite 数据。
 
 ## 14. 可选：继续使用飞书群 Webhook
 

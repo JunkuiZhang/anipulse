@@ -268,4 +268,26 @@ mod tests {
             assert!(evaluation.score < 60, "{suffix}: {}", evaluation.score);
         }
     }
+
+    #[test]
+    fn accepts_real_nyanko_episode_eight_samples() {
+        for (title, duration) in [
+            ("『尼古喵喵』08（无删减版）【中文字幕】", 1_688),
+            ("【尼古喵喵】第8集（未删减版）", 1_948),
+            ("尼古喵喵 第8集（未删减版）", 2_028),
+            ("『尼古喵喵』第8话", 2_058),
+        ] {
+            let (mut anime, episode, candidate) = fixtures(duration, title);
+            anime.anime.title = "尼古喵喵".into();
+            anime.aliases = vec!["尼古喵喵".into(), "ヤニねこ".into()];
+            anime.anime.duration_min_sec = 1_500;
+            anime.anime.duration_max_sec = 2_100;
+
+            let evaluation = evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3);
+            assert!(!evaluation.hard_reject, "{title}: {:?}", evaluation.reasons);
+            assert_eq!(evaluation.episode_match, EpisodeMatch::Strong, "{title}");
+            assert_eq!(evaluation.duration_match, DurationMatch::Normal, "{title}");
+            assert!(evaluation.score >= 60, "{title}: {}", evaluation.score);
+        }
+    }
 }

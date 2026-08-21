@@ -10,7 +10,7 @@ AniPulse 是一个面向个人 Linux 服务器的番剧更新监控器。它低�
 - 标题规范化、番名匹配、整数 Episode 识别、时长/发布时间/负面标题多信号评分；
 - Candidate 按 Episode + BV 去重，同一 MID 永远只算一个 Consensus vote；
 - Trusted Uploader、Independent Consensus、Manual Confirmation 三条确认路径；
-- WBI 搜索和视频详情 Provider 隔离；全局串行限流、每日预算、429/412/临时失败退避；
+- 公共聚合搜索、WBI 回退和视频详情 Provider 隔离；识别 `v_voucher` 软风控响应，并执行全局串行限流、每日预算及 429/412/临时失败退避；
 - 飞书消息卡片通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
 - CLI 人工 accept/reject 与 per-Anime UP trust/block。
 
@@ -141,6 +141,6 @@ RUST_LOG=info
 
 ## 外部接口边界
 
-Bilibili Web API 不是本项目可控制的稳定接口。所有 endpoint、WBI 签名、响应字段和错误码映射集中在 `src/provider/bilibili.rs`；如果接口变化，应只修改 Provider。遇到 HTTP 429、HTTP/Bilibili 412 或异常响应时，AniPulse 不会高频重试。
+Bilibili Web API 不是本项目可控制的稳定接口。所有 endpoint、WBI 签名、响应字段和错误码映射集中在 `src/provider/bilibili.rs`；如果接口变化，应只修改 Provider。Provider 优先读取公开聚合搜索中的 video 分组，在响应不可用时才尝试 WBI 搜索；`code=0` 但只含 `v_voucher` 会被识别为软风控，不再误报成“0 条结果”。遇到 HTTP 429、HTTP/Bilibili 412、软风控或异常响应时，AniPulse 不会高频重试。
 
 自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知；同步失败时保留已有排期并退避重试。
