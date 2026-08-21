@@ -1,3 +1,5 @@
+pub mod application;
+pub mod auth;
 pub mod config;
 pub mod detector;
 pub mod domain;
@@ -7,3 +9,4 @@ pub mod provider;
 pub mod repository;
 pub mod schedule;
 pub mod scheduler;
+pub mod web;

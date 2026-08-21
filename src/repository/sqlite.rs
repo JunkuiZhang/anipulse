@@ -1,13 +1,19 @@
 use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde_json::to_string;
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOptions};
+use sha2::{Digest, Sha256};
+use sqlx::{
+    FromRow, Sqlite, SqlitePool, Transaction,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 
 use crate::{
     domain::{
         Anime, AnimeWithAliases, CandidateState, Episode, EpisodeState, Evaluation, NewAnime,
-        PendingNotification, ScheduleUpdate, StoredCandidate, UploaderTrust, VideoCandidate,
+        PendingNotification, PendingReviewNotification, ReviewCandidateSummary, ScheduleUpdate,
+        StoredCandidate, UploaderTrust, VideoCandidate,
     },
     error::{AppError, Result},
 };
@@ -19,6 +25,8 @@ pub struct Repository {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct CandidateListRow {
+    pub episode_id: i64,
+    pub anime_id: i64,
     pub bvid: String,
     pub anime_title: String,
     pub episode_no: i64,
@@ -31,6 +39,90 @@ pub struct CandidateListRow {
     pub state: String,
     pub seen_count: i64,
     pub evaluation_json: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DashboardStats {
+    pub anime_count: i64,
+    pub enabled_anime_count: i64,
+    pub pending_candidate_count: i64,
+    pub pending_notification_count: i64,
+    pub failed_notification_count: i64,
+    pub queued_job_count: i64,
+    pub failed_job_count: i64,
+    pub scheduler_heartbeat: Option<DateTime<Utc>>,
+    pub provider_backoff_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ManagementJob {
+    pub id: i64,
+    pub kind: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub payload_json: String,
+    pub state: String,
+    pub requested_by: Option<i64>,
+    pub dedupe_key: Option<String>,
+    pub attempts: i64,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct WebAdmin {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+    pub role: String,
+    pub disabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub password_changed_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AuthenticatedSession {
+    pub token_hmac: Vec<u8>,
+    pub admin_id: i64,
+    pub username: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+    pub renewed_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub idle_expires_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AuditEventRow {
+    pub id: i64,
+    pub actor_type: String,
+    pub actor_admin_id: Option<i64>,
+    pub action: String,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    pub outcome: String,
+    pub request_id: Option<String>,
+    pub metadata_json: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AnimeDraftRow {
+    pub id: String,
+    pub admin_id: i64,
+    pub session_token_hmac: Vec<u8>,
+    pub payload_json: String,
+    pub state: String,
+    pub resolved_json: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -62,15 +154,27 @@ impl Repository {
             SqliteConnectOptions::new()
                 .filename(path)
                 .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
         }
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePool::connect_with(options).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(if path == ":memory:" { 1 } else { 4 })
+            .min_connections(1)
+            .connect_with(options)
+            .await?;
         sqlx::migrate!()
             .run(&pool)
             .await
             .map_err(|error| sqlx::Error::Migrate(Box::new(error)))?;
         Ok(Self { pool })
+    }
+
+    pub async fn migrate(path: &str) -> Result<()> {
+        let repository = Self::connect(path).await?;
+        repository.pool.close().await;
+        Ok(())
     }
 
     pub async fn add_anime(&self, new: NewAnime) -> Result<i64> {
@@ -199,10 +303,47 @@ impl Repository {
         Ok(anime)
     }
 
+    pub async fn delete_anime_checked(
+        &self,
+        anime_id: i64,
+        expected_title: &str,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<Anime> {
+        let mut tx = self.pool.begin().await?;
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if anime.enabled {
+            return Err(AppError::InvalidInput(
+                "anime must be disabled before permanent deletion".into(),
+            ));
+        }
+        if anime.title != expected_title {
+            return Err(AppError::InvalidInput(
+                "typed title does not exactly match the current anime title".into(),
+            ));
+        }
+        if anime.updated_at != expected_updated_at {
+            return Err(AppError::InvalidInput(
+                "anime changed after the deletion page was opened; review it again".into(),
+            ));
+        }
+        sqlx::query("DELETE FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(anime)
+    }
+
     pub async fn rename_anime(&self, anime_id: i64, title: &str) -> Result<Anime> {
         let title = title.trim();
-        if title.is_empty() {
-            return Err(AppError::InvalidInput("title cannot be empty".into()));
+        if title.is_empty() || title.chars().count() > 200 {
+            return Err(AppError::InvalidInput(
+                "title must contain between 1 and 200 characters".into(),
+            ));
         }
 
         let now = Utc::now();
@@ -519,9 +660,9 @@ impl Repository {
     pub async fn list_candidates(&self, state: Option<&str>) -> Result<Vec<CandidateListRow>> {
         let rows = if let Some(state) = state {
             sqlx::query_as::<_, CandidateListRow>(
-                r#"SELECT c.bvid, a.title AS anime_title, e.episode_no,
+                r#"SELECT c.episode_id, e.anime_id, c.bvid, a.title AS anime_title, e.episode_no,
                           c.uploader_mid, c.uploader_name, c.title, c.duration_sec,
-                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json
+                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url
                    FROM candidate c
                    JOIN episode e ON e.id = c.episode_id
                    JOIN anime a ON a.id = e.anime_id
@@ -532,9 +673,9 @@ impl Repository {
             .await?
         } else {
             sqlx::query_as::<_, CandidateListRow>(
-                r#"SELECT c.bvid, a.title AS anime_title, e.episode_no,
+                r#"SELECT c.episode_id, e.anime_id, c.bvid, a.title AS anime_title, e.episode_no,
                           c.uploader_mid, c.uploader_name, c.title, c.duration_sec,
-                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json
+                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url
                    FROM candidate c
                    JOIN episode e ON e.id = c.episode_id
                    JOIN anime a ON a.id = e.anime_id
@@ -638,6 +779,12 @@ impl Repository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE review_notification SET status = 'cancelled' WHERE episode_id = ? AND status = 'pending'",
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
         if user_confirmed && previous_state != CandidateState::Confirmed.to_string() {
             Self::increment_trust_tx(&mut tx, candidate_id, true).await?;
         }
@@ -677,6 +824,54 @@ impl Repository {
             for candidate_id in &candidate_ids {
                 Self::increment_trust_tx(&mut tx, *candidate_id, false).await?;
             }
+        }
+        let result = sqlx::query(
+            "UPDATE candidate SET state = 'rejected' WHERE episode_id = ? AND state = 'pending'",
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE episode SET state = 'watching'
+               WHERE id = ? AND state IN ('candidate_found','needs_manual_review')"#,
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn pending_candidate_fingerprint(&self, episode_id: i64) -> Result<String> {
+        let bvids = sqlx::query_scalar::<_, String>(
+            "SELECT bvid FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY bvid",
+        )
+        .bind(episode_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(candidate_fingerprint(&bvids))
+    }
+
+    pub async fn reject_all_candidates_checked(
+        &self,
+        episode_id: i64,
+        expected_fingerprint: &str,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, bvid FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY bvid",
+        )
+        .bind(episode_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let bvids: Vec<String> = rows.iter().map(|(_, bvid)| bvid.clone()).collect();
+        if candidate_fingerprint(&bvids) != expected_fingerprint {
+            return Err(AppError::InvalidInput(
+                "candidate set changed; review the episode again".into(),
+            ));
+        }
+        for (candidate_id, _) in &rows {
+            Self::increment_trust_tx(&mut tx, *candidate_id, false).await?;
         }
         let result = sqlx::query(
             "UPDATE candidate SET state = 'rejected' WHERE episode_id = ? AND state = 'pending'",
@@ -762,6 +957,146 @@ impl Repository {
         .await?)
     }
 
+    pub async fn enqueue_review_notification(
+        &self,
+        episode_id: i64,
+        channel: &str,
+        candidate_fingerprint: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO review_notification(
+                   episode_id, channel, candidate_fingerprint, status, created_at
+               ) VALUES (?, ?, ?, 'pending', ?)"#,
+        )
+        .bind(episode_id)
+        .bind(channel)
+        .bind(candidate_fingerprint)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_review_notifications(
+        &self,
+        public_url: &str,
+    ) -> Result<Vec<PendingReviewNotification>> {
+        #[derive(FromRow)]
+        struct ReviewRow {
+            id: i64,
+            episode_id: i64,
+            channel: String,
+            attempts: i64,
+            anime_title: String,
+            episode_no: i64,
+            candidate_fingerprint: String,
+            anime_updated_at: DateTime<Utc>,
+        }
+        let rows = sqlx::query_as::<_, ReviewRow>(
+            r#"SELECT r.id, r.episode_id, r.channel, r.attempts,
+                      a.title AS anime_title, e.episode_no, r.candidate_fingerprint,
+                      a.updated_at AS anime_updated_at
+               FROM review_notification r
+               JOIN episode e ON e.id = r.episode_id
+               JOIN anime a ON a.id = e.anime_id
+               WHERE r.status = 'pending'
+                 AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= ?)
+               ORDER BY r.created_at, r.id"#,
+        )
+        .bind(Utc::now())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let stored_candidates = sqlx::query_as::<_, StoredCandidate>(
+                "SELECT * FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY score DESC, id LIMIT 5",
+            )
+            .bind(row.episode_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let current_bvids = sqlx::query_scalar::<_, String>(
+                "SELECT bvid FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY bvid",
+            )
+            .bind(row.episode_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let obsolete = if row.candidate_fingerprint.starts_with("none:") {
+                !current_bvids.is_empty()
+                    || row.candidate_fingerprint
+                        != format!("none:{}", row.anime_updated_at.timestamp())
+            } else {
+                candidate_fingerprint(&current_bvids) != row.candidate_fingerprint
+            };
+            if obsolete {
+                sqlx::query(
+                    "UPDATE review_notification SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+                )
+                .bind(row.id)
+                .execute(&self.pool)
+                .await?;
+                continue;
+            }
+            let candidates = stored_candidates
+                .into_iter()
+                .map(|candidate| ReviewCandidateSummary {
+                    bvid: candidate.bvid,
+                    title: candidate.title,
+                    uploader_name: candidate.uploader_name,
+                    duration_sec: candidate.duration_sec,
+                    score: candidate.score,
+                    url: candidate.url,
+                })
+                .collect();
+            events.push(PendingReviewNotification {
+                id: row.id,
+                episode_id: row.episode_id,
+                channel: row.channel,
+                attempts: row.attempts,
+                anime_title: row.anime_title,
+                episode_no: row.episode_no,
+                candidate_fingerprint: row.candidate_fingerprint,
+                review_url: format!(
+                    "{}/review/episodes/{}",
+                    public_url.trim_end_matches('/'),
+                    row.episode_id
+                ),
+                candidates,
+            });
+        }
+        Ok(events)
+    }
+
+    pub async fn mark_review_notification_sent(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE review_notification SET status = 'sent', attempts = attempts + 1, sent_at = ?, last_error = NULL WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_review_notification_failed(&self, id: i64, error: &str) -> Result<()> {
+        let safe_error: String = error.chars().take(500).collect();
+        let attempts =
+            sqlx::query_scalar::<_, i64>("SELECT attempts FROM review_notification WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        let exponent = attempts.clamp(0, 6) as u32;
+        let retry_at = Utc::now() + chrono::Duration::seconds(60 * 2_i64.pow(exponent));
+        sqlx::query(
+            "UPDATE review_notification SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ?",
+        )
+        .bind(safe_error)
+        .bind(retry_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_notification_failed(&self, id: i64, error: &str) -> Result<()> {
         let safe_error: String = error.chars().take(500).collect();
         let attempts =
@@ -828,6 +1163,715 @@ impl Repository {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn web_admin_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM web_admin")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub async fn web_admin_by_username(&self, username: &str) -> Result<Option<WebAdmin>> {
+        Ok(
+            sqlx::query_as::<_, WebAdmin>("SELECT * FROM web_admin WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn create_web_admin(&self, username: &str, password_hash: &str) -> Result<i64> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"INSERT INTO web_admin(
+                   username, password_hash, role, disabled, created_at, password_changed_at
+               ) VALUES (?, ?, 'owner', 0, ?, ?)"#,
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn reset_web_admin_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let admin_id = sqlx::query_scalar::<_, i64>("SELECT id FROM web_admin WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+        sqlx::query("UPDATE web_admin SET password_hash = ?, password_changed_at = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(now)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE web_session SET revoked_at = ? WHERE admin_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(admin_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_web_admin_disabled(&self, username: &str, disabled: bool) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let admin_id = sqlx::query_scalar::<_, i64>("SELECT id FROM web_admin WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+        sqlx::query("UPDATE web_admin SET disabled = ? WHERE id = ?")
+            .bind(disabled)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        if disabled {
+            sqlx::query(
+                "UPDATE web_session SET revoked_at = ? WHERE admin_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn revoke_web_admin_sessions(&self, username: &str) -> Result<u64> {
+        let admin_id = sqlx::query_scalar::<_, i64>("SELECT id FROM web_admin WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+        Ok(sqlx::query(
+            "UPDATE web_session SET revoked_at = ? WHERE admin_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(admin_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_web_session(
+        &self,
+        token_hmac: &[u8],
+        admin_id: i64,
+        idle_expires_at: DateTime<Utc>,
+        absolute_expires_at: DateTime<Utc>,
+        user_agent_hash: Option<&[u8]>,
+        source_ip_hash: Option<&[u8]>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO web_session(
+                   token_hmac, admin_id, created_at, renewed_at, last_seen_at,
+                   idle_expires_at, absolute_expires_at, user_agent_hash, source_ip_hash
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(token_hmac)
+        .bind(admin_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(idle_expires_at)
+        .bind(absolute_expires_at)
+        .bind(user_agent_hash)
+        .bind(source_ip_hash)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE web_admin SET last_login_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn authenticated_session(
+        &self,
+        token_hmac: &[u8],
+    ) -> Result<Option<AuthenticatedSession>> {
+        let now = Utc::now();
+        Ok(sqlx::query_as::<_, AuthenticatedSession>(
+            r#"SELECT s.token_hmac, s.admin_id, a.username, a.role,
+                      s.created_at, s.renewed_at, s.last_seen_at,
+                      s.idle_expires_at, s.absolute_expires_at
+               FROM web_session s
+               JOIN web_admin a ON a.id = s.admin_id
+               WHERE s.token_hmac = ?
+                 AND s.revoked_at IS NULL
+                 AND a.disabled = 0
+                 AND s.idle_expires_at > ?
+                 AND s.absolute_expires_at > ?"#,
+        )
+        .bind(token_hmac)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn touch_web_session(
+        &self,
+        token_hmac: &[u8],
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE web_session SET last_seen_at = ?, idle_expires_at = ? WHERE token_hmac = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(idle_expires_at)
+        .bind(token_hmac)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn rotate_web_session(
+        &self,
+        old_token_hmac: &[u8],
+        new_token_hmac: &[u8],
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            r#"UPDATE web_session
+               SET token_hmac = ?, renewed_at = ?, last_seen_at = ?, idle_expires_at = ?
+               WHERE token_hmac = ? AND revoked_at IS NULL"#,
+        )
+        .bind(new_token_hmac)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .bind(idle_expires_at)
+        .bind(old_token_hmac)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound("active web session".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn revoke_web_session(&self, token_hmac: &[u8]) -> Result<()> {
+        sqlx::query(
+            "UPDATE web_session SET revoked_at = ? WHERE token_hmac = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(token_hmac)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn auth_throttle_blocked_until(
+        &self,
+        key_hmac: &[u8],
+    ) -> Result<Option<DateTime<Utc>>> {
+        Ok(
+            sqlx::query_scalar("SELECT blocked_until FROM auth_throttle WHERE key_hmac = ?")
+                .bind(key_hmac)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    pub async fn record_auth_failure(
+        &self,
+        key_hmac: &[u8],
+        window_secs: i64,
+        max_failures: i64,
+    ) -> Result<Option<DateTime<Utc>>> {
+        #[derive(FromRow)]
+        struct ThrottleRow {
+            window_started_at: DateTime<Utc>,
+            failure_count: i64,
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query_as::<_, ThrottleRow>(
+            "SELECT window_started_at, failure_count FROM auth_throttle WHERE key_hmac = ?",
+        )
+        .bind(key_hmac)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (window_started_at, failure_count) = match existing {
+            Some(row) if row.window_started_at + chrono::Duration::seconds(window_secs) > now => {
+                (row.window_started_at, row.failure_count + 1)
+            }
+            _ => (now, 1),
+        };
+        let blocked_until = (failure_count >= max_failures).then(|| {
+            let exponent = (failure_count - max_failures).clamp(0, 6) as u32;
+            now + chrono::Duration::seconds(
+                window_secs.saturating_mul(2_i64.pow(exponent)).min(86_400),
+            )
+        });
+        sqlx::query(
+            r#"INSERT INTO auth_throttle(
+                   key_hmac, window_started_at, failure_count, blocked_until, updated_at
+               ) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(key_hmac) DO UPDATE SET
+                   window_started_at = excluded.window_started_at,
+                   failure_count = excluded.failure_count,
+                   blocked_until = excluded.blocked_until,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(key_hmac)
+        .bind(window_started_at)
+        .bind(failure_count)
+        .bind(blocked_until)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(blocked_until)
+    }
+
+    pub async fn clear_auth_throttle(&self, keys: &[Vec<u8>]) -> Result<()> {
+        for key in keys {
+            sqlx::query("DELETE FROM auth_throttle WHERE key_hmac = ?")
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn create_anime_draft(
+        &self,
+        id: &str,
+        admin_id: i64,
+        session_token_hmac: &[u8],
+        payload_json: &str,
+        state: &str,
+        resolved_json: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO anime_draft(
+                   id, admin_id, session_token_hmac, payload_json, state,
+                   resolved_json, created_at, expires_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(id)
+        .bind(admin_id)
+        .bind(session_token_hmac)
+        .bind(payload_json)
+        .bind(state)
+        .bind(resolved_json)
+        .bind(now)
+        .bind(now + chrono::Duration::minutes(15))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn anime_draft(
+        &self,
+        id: &str,
+        admin_id: i64,
+        session_token_hmac: &[u8],
+    ) -> Result<AnimeDraftRow> {
+        sqlx::query_as::<_, AnimeDraftRow>(
+            r#"SELECT * FROM anime_draft
+               WHERE id = ? AND admin_id = ? AND session_token_hmac = ?
+                 AND consumed_at IS NULL AND expires_at > ?"#,
+        )
+        .bind(id)
+        .bind(admin_id)
+        .bind(session_token_hmac)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("active anime draft {id}")))
+    }
+
+    pub async fn anime_draft_payload_for_resolution(&self, id: &str) -> Result<String> {
+        sqlx::query_scalar(
+            r#"SELECT payload_json FROM anime_draft
+               WHERE id = ? AND state = 'queued' AND consumed_at IS NULL AND expires_at > ?"#,
+        )
+        .bind(id)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("queued anime draft {id}")))
+    }
+
+    pub async fn mark_anime_draft_ready(&self, id: &str, resolved_json: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE anime_draft SET state = 'ready', resolved_json = ?, error = NULL WHERE id = ? AND consumed_at IS NULL",
+        )
+        .bind(resolved_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_anime_draft_failed(&self, id: &str, error: &str) -> Result<()> {
+        let safe_error: String = error.chars().take(500).collect();
+        sqlx::query(
+            "UPDATE anime_draft SET state = 'failed', error = ? WHERE id = ? AND consumed_at IS NULL",
+        )
+        .bind(safe_error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn claim_anime_draft(
+        &self,
+        id: &str,
+        admin_id: i64,
+        session_token_hmac: &[u8],
+    ) -> Result<AnimeDraftRow> {
+        sqlx::query_as::<_, AnimeDraftRow>(
+            r#"UPDATE anime_draft SET consumed_at = ?
+               WHERE id = ? AND admin_id = ? AND session_token_hmac = ?
+                 AND state = 'ready' AND consumed_at IS NULL AND expires_at > ?
+               RETURNING *"#,
+        )
+        .bind(Utc::now())
+        .bind(id)
+        .bind(admin_id)
+        .bind(session_token_hmac)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("ready anime draft {id}")))
+    }
+
+    pub async fn release_anime_draft(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE anime_draft SET consumed_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_action_nonce(
+        &self,
+        nonce_hmac: &[u8],
+        admin_id: i64,
+        action: &str,
+        entity_id: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO web_action_nonce(
+                   nonce_hmac, admin_id, action, entity_id, created_at, expires_at
+               ) VALUES (?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(nonce_hmac)
+        .bind(admin_id)
+        .bind(action)
+        .bind(entity_id)
+        .bind(now)
+        .bind(now + chrono::Duration::minutes(10))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_action_nonce(
+        &self,
+        nonce_hmac: &[u8],
+        admin_id: i64,
+        action: &str,
+        entity_id: Option<&str>,
+    ) -> Result<bool> {
+        Ok(sqlx::query(
+            r#"UPDATE web_action_nonce SET consumed_at = ?
+               WHERE nonce_hmac = ? AND admin_id = ? AND action = ?
+                 AND entity_id IS ? AND consumed_at IS NULL AND expires_at > ?"#,
+        )
+        .bind(Utc::now())
+        .bind(nonce_hmac)
+        .bind(admin_id)
+        .bind(action)
+        .bind(entity_id)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn enqueue_management_job(
+        &self,
+        kind: &str,
+        target_type: Option<&str>,
+        target_id: Option<&str>,
+        payload_json: &str,
+        requested_by: Option<i64>,
+        dedupe_key: Option<&str>,
+    ) -> Result<i64> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"INSERT OR IGNORE INTO management_job(
+                   kind, target_type, target_id, payload_json, state,
+                   requested_by, dedupe_key, created_at
+               ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)"#,
+        )
+        .bind(kind)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(payload_json)
+        .bind(requested_by)
+        .bind(dedupe_key)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(result.last_insert_rowid());
+        }
+        let dedupe_key = dedupe_key.ok_or_else(|| {
+            AppError::Database(sqlx::Error::Protocol(
+                "management job insert was ignored without a dedupe key".into(),
+            ))
+        })?;
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT id FROM management_job
+               WHERE dedupe_key = ? AND state IN ('queued','running')
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(dedupe_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("active management job {dedupe_key}")))
+    }
+
+    pub async fn claim_management_jobs(&self, limit: i64) -> Result<Vec<ManagementJob>> {
+        let now = Utc::now();
+        let mut jobs = sqlx::query_as::<_, ManagementJob>(
+            r#"UPDATE management_job
+               SET state = 'running', started_at = ?, attempts = attempts + 1, error = NULL
+               WHERE id IN (
+                   SELECT id FROM management_job
+                   WHERE state = 'queued'
+                   ORDER BY created_at, id
+                   LIMIT ?
+               ) AND state = 'queued'
+               RETURNING *"#,
+        )
+        .bind(now)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        jobs.sort_by_key(|job| job.id);
+        Ok(jobs)
+    }
+
+    pub async fn recover_stale_management_jobs(&self, stale_before: DateTime<Utc>) -> Result<u64> {
+        Ok(sqlx::query(
+            r#"UPDATE management_job
+               SET state = 'queued', started_at = NULL, finished_at = NULL,
+                   error = 'recovered after scheduler interruption'
+               WHERE state = 'running' AND started_at < ?"#,
+        )
+        .bind(stale_before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn complete_management_job(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE management_job SET state = 'completed', finished_at = ?, error = NULL WHERE id = ? AND state = 'running'",
+        )
+        .bind(Utc::now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn fail_management_job(&self, id: i64, error: &str) -> Result<()> {
+        let safe_error: String = error.chars().take(500).collect();
+        sqlx::query(
+            "UPDATE management_job SET state = 'failed', finished_at = ?, error = ? WHERE id = ? AND state = 'running'",
+        )
+        .bind(Utc::now())
+        .bind(safe_error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_management_jobs(&self, limit: i64) -> Result<Vec<ManagementJob>> {
+        Ok(sqlx::query_as::<_, ManagementJob>(
+            "SELECT * FROM management_job ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn update_scheduler_heartbeat(&self) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO scheduler_state(name, heartbeat_at, metadata_json)
+               VALUES ('main', ?, '{}')
+               ON CONFLICT(name) DO UPDATE SET heartbeat_at = excluded.heartbeat_at"#,
+        )
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn scheduler_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
+        Ok(
+            sqlx::query_scalar("SELECT heartbeat_at FROM scheduler_state WHERE name = 'main'")
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_audit(
+        &self,
+        actor_type: &str,
+        actor_admin_id: Option<i64>,
+        action: &str,
+        entity_type: Option<&str>,
+        entity_id: Option<&str>,
+        outcome: &str,
+        request_id: Option<&str>,
+        source_ip_hash: Option<&[u8]>,
+        metadata_json: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO audit_event(
+                   actor_type, actor_admin_id, action, entity_type, entity_id,
+                   outcome, request_id, source_ip_hash, metadata_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(actor_type)
+        .bind(actor_admin_id)
+        .bind(action)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(outcome)
+        .bind(request_id)
+        .bind(source_ip_hash)
+        .bind(metadata_json)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEventRow>> {
+        Ok(sqlx::query_as::<_, AuditEventRow>(
+            r#"SELECT id, actor_type, actor_admin_id, action, entity_type, entity_id,
+                      outcome, request_id, metadata_json, created_at
+               FROM audit_event ORDER BY created_at DESC, id DESC LIMIT ?"#,
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn cleanup_web_ephemera(&self) -> Result<()> {
+        let now = Utc::now();
+        let retained_since = now - chrono::Duration::days(30);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"DELETE FROM web_session
+               WHERE idle_expires_at <= ? OR absolute_expires_at <= ?
+                  OR (revoked_at IS NOT NULL AND revoked_at <= ?)"#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(retained_since)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM web_action_nonce WHERE expires_at <= ? OR consumed_at IS NOT NULL",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM anime_draft WHERE expires_at <= ? OR consumed_at IS NOT NULL")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM auth_throttle WHERE updated_at <= ?")
+            .bind(retained_since)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn dashboard_stats(&self) -> Result<DashboardStats> {
+        let anime_count = sqlx::query_scalar("SELECT COUNT(*) FROM anime")
+            .fetch_one(&self.pool)
+            .await?;
+        let enabled_anime_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM anime WHERE enabled = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        let pending_candidate_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM candidate WHERE state = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+        let pending_notification_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+        let failed_notification_count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification WHERE status = 'pending' AND last_error IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let queued_job_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM management_job WHERE state = 'queued'")
+                .fetch_one(&self.pool)
+                .await?;
+        let failed_job_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM management_job WHERE state = 'failed'")
+                .fetch_one(&self.pool)
+                .await?;
+        let scheduler_heartbeat = self.scheduler_heartbeat().await?;
+        let provider_backoff_until = sqlx::query_scalar(
+            "SELECT backoff_until FROM provider_state WHERE provider = 'bilibili'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(DashboardStats {
+            anime_count,
+            enabled_anime_count,
+            pending_candidate_count,
+            pending_notification_count,
+            failed_notification_count,
+            queued_job_count,
+            failed_job_count,
+            scheduler_heartbeat,
+            provider_backoff_until,
+        })
     }
 
     pub async fn reserve_provider_request(&self, max_per_day: u32) -> Result<()> {
@@ -905,6 +1949,15 @@ impl Repository {
         .await?;
         Ok(())
     }
+}
+
+fn candidate_fingerprint(bvids: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for bvid in bvids {
+        hasher.update(bvid.as_bytes());
+        hasher.update([0]);
+    }
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -1134,6 +2187,157 @@ mod tests {
                 .unwrap()
                 .next_check_at
                 < future
+        );
+    }
+
+    #[tokio::test]
+    async fn management_jobs_are_deduplicated_claimed_once_and_recovered() {
+        let (_directory, repository, anime_id, _episode) = fixture().await;
+        let target = anime_id.to_string();
+        let first = repository
+            .enqueue_management_job(
+                "check_anime",
+                Some("anime"),
+                Some(&target),
+                "{}",
+                None,
+                Some("check:1"),
+            )
+            .await
+            .unwrap();
+        let duplicate = repository
+            .enqueue_management_job(
+                "check_anime",
+                Some("anime"),
+                Some(&target),
+                "{}",
+                None,
+                Some("check:1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, duplicate);
+
+        let claimed = repository.claim_management_jobs(10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(
+            repository
+                .claim_management_jobs(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("UPDATE management_job SET started_at = ? WHERE id = ?")
+            .bind(Utc::now() - chrono::Duration::minutes(20))
+            .bind(first)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .recover_stale_management_jobs(Utc::now() - chrono::Duration::minutes(10))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(repository.claim_management_jobs(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn action_nonces_are_bound_and_consumed_once() {
+        let (_directory, repository, anime_id, _episode) = fixture().await;
+        let admin_id = repository
+            .create_web_admin("admin", "test-password-hash")
+            .await
+            .unwrap();
+        let entity = anime_id.to_string();
+        repository
+            .create_action_nonce(b"nonce-hmac", admin_id, "anime.delete", Some(&entity))
+            .await
+            .unwrap();
+        assert!(
+            !repository
+                .consume_action_nonce(b"nonce-hmac", admin_id, "candidate.accept", Some(&entity),)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .consume_action_nonce(b"nonce-hmac", admin_id, "anime.delete", Some(&entity),)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .consume_action_nonce(b"nonce-hmac", admin_id, "anime.delete", Some(&entity),)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_delete_requires_disabled_unchanged_exact_target() {
+        let (_directory, repository, anime_id, _episode) = fixture().await;
+        let original = repository.get_anime(anime_id).await.unwrap().anime;
+        assert!(
+            repository
+                .delete_anime_checked(anime_id, &original.title, original.updated_at)
+                .await
+                .is_err()
+        );
+        repository.set_anime_enabled(anime_id, false).await.unwrap();
+        let current = repository.get_anime(anime_id).await.unwrap().anime;
+        assert!(
+            repository
+                .delete_anime_checked(anime_id, "wrong title", current.updated_at)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .delete_anime_checked(anime_id, &current.title, original.updated_at)
+                .await
+                .is_err()
+        );
+        repository
+            .delete_anime_checked(anime_id, &current.title, current.updated_at)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_reject_all_does_not_reject_new_candidates() {
+        let (_directory, repository, _anime_id, episode) = fixture().await;
+        let (first, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &first, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        let fingerprint = repository
+            .pending_candidate_fingerprint(episode.id)
+            .await
+            .unwrap();
+        let mut second = first.clone();
+        second.bvid = "BVtest00002".into();
+        second.url = "https://www.bilibili.com/video/BVtest00002".into();
+        repository
+            .upsert_candidate(episode.id, &second, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .reject_all_candidates_checked(episode.id, &fingerprint)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .active_candidates(episode.id)
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 

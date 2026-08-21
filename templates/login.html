@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · AniPulse</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <p class="eyebrow">ANIME RELEASE MONITOR</p>
+    <h1>AniPulse</h1>
+    <p class="muted">登录你的个人番剧监控面板</p>
+    {% if !message.is_empty() %}<div class="alert">{{ message }}</div>{% endif %}
+    {% if initialized %}
+    <form method="post" action="/login" class="stack">
+      <label>用户名<input name="username" autocomplete="username" required maxlength="32"></label>
+      <label>密码<input type="password" name="password" autocomplete="current-password" required maxlength="256"></label>
+      <button class="primary" type="submit">登录</button>
+    </form>
+    {% else %}
+    <div class="alert">尚未创建管理员。请先在服务器终端执行 <code>anipulse auth admin create --username admin</code>。</div>
+    {% endif %}
+  </main>
+</body>
+</html>

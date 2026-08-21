@@ -7,10 +7,10 @@ use tokio::sync::Mutex;
 
 use super::{
     Notifier,
-    feishu::{release_card, test_card},
+    feishu::{release_card, review_card, test_card},
 };
 use crate::{
-    domain::PendingNotification,
+    domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
 };
 
@@ -153,6 +153,10 @@ impl Notifier for FeishuAppNotifier {
             "自建应用鉴权、收件人配置和私聊消息卡片均工作正常。",
         ))
         .await
+    }
+
+    async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
+        self.send_card(review_card(event)).await
     }
 }
 

@@ -163,8 +163,8 @@ path = "/var/lib/anipulse/anipulse.db"
 provider = "feishu"
 channel = "feishu-private-anime"
 notify_pending = false
-# 预留给鉴权网页候选审核通知；当前版本请保持 false。
 request_timeout_secs = 15
+review_grace_secs = 3600
 
 [schedule]
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
@@ -178,6 +178,8 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 ```
 
 `provider = "feishu"` 和 `provider = "feishu_app"` 都代表应用机器人私聊。`channel` 是 AniPulse 用于通知幂等的稳定标识，部署后不要随意修改，否则同一 Episode 可能因新 channel 名称产生另一条通知记录。
+
+安装鉴权网页后可以把 `notify_pending` 改为 `true`：无法自动确认时，飞书会发送指向登录审核页的橙色卡片。网页、Caddy、Secret、管理员和 systemd 的完整步骤见 [`web-deployment.md`](web-deployment.md)。在 `web.public_url` 尚未能通过 HTTPS 访问前保持 `false`。
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 

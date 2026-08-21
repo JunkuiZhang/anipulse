@@ -11,7 +11,7 @@ use url::Url;
 
 use super::Notifier;
 use crate::{
-    domain::PendingNotification,
+    domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
 };
 
@@ -109,6 +109,13 @@ impl FeishuWebhookNotifier {
             "card": test_card("Webhook、消息卡片和签名配置均工作正常。")
         })
     }
+
+    fn review_payload(event: &PendingReviewNotification) -> Value {
+        json!({
+            "msg_type": "interactive",
+            "card": review_card(event)
+        })
+    }
 }
 
 pub(super) fn release_card(event: &PendingNotification) -> Value {
@@ -198,6 +205,75 @@ pub(super) fn test_card(message: &str) -> Value {
     })
 }
 
+pub(super) fn review_card(event: &PendingReviewNotification) -> Value {
+    let title = truncate_chars(
+        &format!("🔎 {} EP{} 需要确认", event.anime_title, event.episode_no),
+        80,
+    );
+    let content = if event.candidates.is_empty() {
+        "暂时没有找到可用候选。你可以在审核页稍后重试，或直接提交 B 站视频链接。".to_owned()
+    } else {
+        let mut lines = vec![format!(
+            "找到 **{}** 个待确认候选：",
+            event.candidates.len()
+        )];
+        for candidate in event.candidates.iter().take(4) {
+            lines.push(format!(
+                "• **{}**\n  UP：{} · 时长 {}:{:02} · 评分 {}",
+                escape_lark_markdown(&truncate_chars(&candidate.title, 80)),
+                escape_lark_markdown(&truncate_chars(&candidate.uploader_name, 40)),
+                candidate.duration_sec / 60,
+                candidate.duration_sec % 60,
+                candidate.score
+            ));
+        }
+        lines.join("\n")
+    };
+
+    let mut elements = vec![json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": content
+        }
+    })];
+    if let Some(url) = safe_http_url(&event.review_url) {
+        elements.push(json!({
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "打开审核页"
+                },
+                "type": "primary",
+                "url": url
+            }]
+        }));
+    }
+    elements.push(json!({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "卡片不会直接修改追番状态；请登录 AniPulse 网页后确认、都不选或提交链接。"
+        }]
+    }));
+
+    json!({
+        "config": {
+            "wide_screen_mode": true
+        },
+        "header": {
+            "template": "orange",
+            "title": {
+                "tag": "plain_text",
+                "content": title
+            }
+        },
+        "elements": elements
+    })
+}
+
 #[async_trait]
 impl Notifier for FeishuWebhookNotifier {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()> {
@@ -206,6 +282,10 @@ impl Notifier for FeishuWebhookNotifier {
 
     async fn test(&self) -> Result<()> {
         self.send_payload(Self::test_payload()).await
+    }
+
+    async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
+        self.send_payload(Self::review_payload(event)).await
     }
 }
 
@@ -309,6 +389,17 @@ mod tests {
         assert!(serialized.contains("BVmock00001"));
     }
 
+    #[test]
+    fn review_card_links_to_authenticated_review_page() {
+        let event = review_event();
+        let payload = FeishuWebhookNotifier::review_payload(&event);
+        assert_eq!(payload["card"]["header"]["template"], "orange");
+        let serialized = payload.to_string();
+        assert!(serialized.contains("打开审核页"));
+        assert!(serialized.contains("/review/episodes/1"));
+        assert!(serialized.contains("不会直接修改"));
+    }
+
     #[tokio::test]
     async fn posts_signed_card_to_webhook() {
         let (endpoint, request) = mock_server().await;
@@ -338,6 +429,27 @@ mod tests {
             duration_sec: Some(1_420),
             url: Some("https://www.bilibili.com/video/BVmock00001".into()),
             confirmation_reason: Some("consensus:2_uploaders".into()),
+        }
+    }
+
+    fn review_event() -> PendingReviewNotification {
+        PendingReviewNotification {
+            id: 1,
+            episode_id: 1,
+            channel: "feishu-anime".into(),
+            attempts: 0,
+            anime_title: "Silent Witch".into(),
+            episode_no: 8,
+            candidate_fingerprint: "fingerprint".into(),
+            review_url: "https://anime.example.com/review/episodes/1".into(),
+            candidates: vec![crate::domain::ReviewCandidateSummary {
+                bvid: "BVmock00001".into(),
+                title: "Silent Witch 08".into(),
+                uploader_name: "测试 UP".into(),
+                duration_sec: 1_420,
+                score: 68,
+                url: "https://www.bilibili.com/video/BVmock00001".into(),
+            }],
         }
     }
 

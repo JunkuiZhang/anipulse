@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}概览 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">DASHBOARD</p><h1>监控概览</h1></div>
+  <a class="primary button" href="/anime/new">添加追番</a>
+</div>
+<section class="stats-grid">
+  <article><span>追番</span><strong>{{ anime_count }}</strong><small>{{ enabled_anime_count }} 个启用</small></article>
+  <article><span>待审核候选</span><strong>{{ pending_candidate_count }}</strong><small><a href="/candidates">前往处理</a></small></article>
+  <article><span>待发送通知</span><strong>{{ pending_notification_count }}</strong><small>{{ failed_notification_count }} 个曾失败</small></article>
+  <article><span>后台任务</span><strong>{{ queued_job_count }}</strong><small>{{ failed_job_count }} 个失败</small></article>
+</section>
+<section class="panel two-column">
+  <div><h2>Scheduler</h2><p>{{ scheduler_status }}</p></div>
+  <div><h2>Bilibili Provider</h2><p>{{ provider_status }}</p></div>
+</section>
+{% endblock %}

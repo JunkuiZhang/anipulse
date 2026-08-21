@@ -1,0 +1,25 @@
+# 把域名改成你实际解析到服务器的域名。Caddy 会自动申请并续期 HTTPS 证书。
+anime.example.com {
+	encode zstd gzip
+
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up -Forwarded
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 20s
+		}
+	}
+
+	log {
+		output file /var/log/caddy/anipulse-access.log
+		format json
+	}
+}

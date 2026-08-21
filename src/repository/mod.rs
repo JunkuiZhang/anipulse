@@ -1,3 +1,6 @@
 mod sqlite;
 
-pub use sqlite::{CandidateListRow, Repository};
+pub use sqlite::{
+    AnimeDraftRow, AuditEventRow, AuthenticatedSession, CandidateListRow, DashboardStats,
+    ManagementJob, Repository, WebAdmin,
+};

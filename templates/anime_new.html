@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}添加追番 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">NEW ANIME</p><h1>添加追番</h1></div><a class="button" href="/anime">取消</a></div>
+<section class="panel">
+<form method="post" action="/anime/resolve" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>搜索标题<input name="title" required maxlength="200" placeholder="例如：无职转生 第三季"></label>
+  <label>下一集<input type="number" name="next_episode" min="1" max="10000" value="1" required></label>
+  <div class="two-column"><label>最短时长（分钟）<input type="number" name="duration_min" min="1" max="360" value="20" required></label><label>最长时长（分钟）<input type="number" name="duration_max" min="1" max="360" value="28" required></label></div>
+  <label>时区<input name="timezone" value="Asia/Shanghai" required maxlength="64"></label>
+  <label class="check"><input type="checkbox" name="auto_schedule" value="yes" checked> 使用 Bangumi 自动匹配别名和播出时间</label>
+  <label>Bangumi ID（可选，用于同名或多季消歧）<input type="number" name="bangumi_id" min="1"></label>
+  <button class="primary" type="submit">解析并预览</button>
+</form>
+</section>
+{% endblock %}

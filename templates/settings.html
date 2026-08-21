@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}状态 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">STATUS</p><h1>服务状态</h1></div></div>
+<section class="panel details"><dl><dt>Scheduler</dt><dd>{{ scheduler }}</dd><dt>Bilibili</dt><dd>{{ provider }}</dd><dt>通知 Provider</dt><dd>{{ notification_provider }}</dd><dt>自动排期</dt><dd>{{ schedule_source }}</dd><dt>公开地址</dt><dd>{{ public_url }}</dd></dl></section>
+<form method="post" action="/notification/test"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">发送测试通知</button></form>
+{% endblock %}

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::NotificationConfig,
-    domain::PendingNotification,
+    domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
     repository::Repository,
 };
@@ -20,6 +20,7 @@ use feishu_app::FeishuAppNotifier;
 #[async_trait]
 trait Notifier: Send + Sync {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()>;
+    async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()>;
     async fn test(&self) -> Result<()>;
 }
 
@@ -34,6 +35,11 @@ impl Notifier for NoopNotifier {
 
     async fn test(&self) -> Result<()> {
         info!("notification provider is none; test succeeded without an external message");
+        Ok(())
+    }
+
+    async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
+        info!(anime = %event.anime_title, episode = event.episode_no, "review notification disabled; marking delivered");
         Ok(())
     }
 }
@@ -138,16 +144,36 @@ impl Notifier for ServerChanNotifier {
         )
         .await
     }
+
+    async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
+        let full_title = format!("🔎 {} EP{} 需要确认", event.anime_title, event.episode_no);
+        let title: String = full_title.chars().take(32).collect();
+        let body = if event.candidates.is_empty() {
+            format!("没有找到可用候选。\n\n处理：{}", event.review_url)
+        } else {
+            format!(
+                "找到 {} 个待确认候选。\n\n处理：{}",
+                event.candidates.len(),
+                event.review_url
+            )
+        };
+        self.send(&title, &body).await
+    }
 }
 
 #[derive(Clone)]
 pub struct NotificationDispatcher {
     repository: Repository,
     notifier: Arc<dyn Notifier>,
+    review_public_url: String,
 }
 
 impl NotificationDispatcher {
-    pub fn new(repository: Repository, config: &NotificationConfig) -> Result<Self> {
+    pub fn new(
+        repository: Repository,
+        config: &NotificationConfig,
+        review_public_url: &str,
+    ) -> Result<Self> {
         let notifier: Arc<dyn Notifier> = match config.provider.to_ascii_lowercase().as_str() {
             "none" => Arc::new(NoopNotifier),
             "serverchan" => Arc::new(ServerChanNotifier::from_env(config.request_timeout_secs)?),
@@ -166,6 +192,7 @@ impl NotificationDispatcher {
         Ok(Self {
             repository,
             notifier,
+            review_public_url: review_public_url.trim_end_matches('/').into(),
         })
     }
 
@@ -181,6 +208,29 @@ impl NotificationDispatcher {
                         .mark_notification_failed(event.id, &error.to_string())
                         .await?;
                     warn!(notification_id = event.id, %error, "notification remains pending");
+                }
+            }
+        }
+        for event in self
+            .repository
+            .pending_review_notifications(&self.review_public_url)
+            .await?
+        {
+            match self.notifier.notify_review(&event).await {
+                Ok(()) => {
+                    self.repository
+                        .mark_review_notification_sent(event.id)
+                        .await?;
+                    info!(
+                        review_notification_id = event.id,
+                        "review notification sent"
+                    );
+                }
+                Err(error) => {
+                    self.repository
+                        .mark_review_notification_failed(event.id, &error.to_string())
+                        .await?;
+                    warn!(review_notification_id = event.id, %error, "review notification remains pending");
                 }
             }
         }

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">ANIME #{{ id }}</p><h1>{{ title }}</h1></div><a class="button" href="/anime">返回列表</a></div>
+<section class="panel details">
+  <dl><dt>别名</dt><dd>{{ aliases }}</dd><dt>当前 Episode</dt><dd>{{ episode }}</dd><dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>下次检查</dt><dd>{{ next_check }}</dd><dt>时长范围</dt><dd>{{ duration }}</dd><dt>Bangumi</dt><dd>{{ bangumi }}</dd></dl>
+</section>
+<section class="panel"><h2>修改标题</h2><form method="post" action="/anime/{{ id }}/title" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="title" value="{{ title }}" required maxlength="200"><button type="submit">保存并重查</button></form></section>
+<section class="actions-grid">
+  {% if episode_id > 0 %}<a class="button" href="/review/episodes/{{ episode_id }}">审核当前集</a>{% endif %}
+  <form method="post" action="/anime/{{ id }}/check"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">立即检查</button></form>
+  {% if auto_schedule %}<form method="post" action="/anime/{{ id }}/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">同步排期</button></form>{% endif %}
+  {% if enabled %}<form method="post" action="/anime/{{ id }}/disable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">暂停监控</button></form>{% else %}<form method="post" action="/anime/{{ id }}/enable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">启用监控</button></form>{% endif %}
+  {% if !enabled %}<form method="post" action="/anime/{{ id }}/delete-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">准备永久删除</button></form>{% endif %}
+</section>
+{% endblock %}

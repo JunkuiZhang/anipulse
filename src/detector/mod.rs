@@ -149,6 +149,34 @@ impl Detector {
         if self.try_confirm(anime_id, episode.id).await? {
             return Ok(());
         }
+        if self.config.notification.notify_pending {
+            let pending = self.repository.active_candidates(episode.id).await?;
+            let fingerprint = if pending.is_empty() {
+                episode
+                    .expected_at
+                    .filter(|expected| {
+                        *expected
+                            + chrono::Duration::seconds(self.config.notification.review_grace_secs)
+                            <= Utc::now()
+                    })
+                    .map(|_| format!("none:{}", anime.anime.updated_at.timestamp()))
+            } else {
+                Some(
+                    self.repository
+                        .pending_candidate_fingerprint(episode.id)
+                        .await?,
+                )
+            };
+            if let Some(fingerprint) = fingerprint {
+                self.repository
+                    .enqueue_review_notification(
+                        episode.id,
+                        &self.config.notification.channel,
+                        &fingerprint,
+                    )
+                    .await?;
+            }
+        }
         let next_check = Utc::now() + self.next_interval(episode.expected_at);
         self.repository
             .reschedule_episode(episode.id, next_check)

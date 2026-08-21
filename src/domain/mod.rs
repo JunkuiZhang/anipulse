@@ -254,3 +254,26 @@ pub struct PendingNotification {
     pub url: Option<String>,
     pub confirmation_reason: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+pub struct ReviewCandidateSummary {
+    pub bvid: String,
+    pub title: String,
+    pub uploader_name: String,
+    pub duration_sec: i64,
+    pub score: i64,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingReviewNotification {
+    pub id: i64,
+    pub episode_id: i64,
+    pub channel: String,
+    pub attempts: i64,
+    pub anime_title: String,
+    pub episode_no: i64,
+    pub candidate_fingerprint: String,
+    pub review_url: String,
+    pub candidates: Vec<ReviewCandidateSummary>,
+}

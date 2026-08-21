@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}审计 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">AUDIT</p><h1>审计日志</h1></div></div>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>结果</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.created_at }}</td><td>{{ item.actor }}</td><td>{{ item.action }}</td><td>{{ item.entity }}</td><td>{{ item.outcome }}</td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}

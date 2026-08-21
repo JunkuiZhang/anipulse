@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}候选 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">REVIEW</p><h1>候选审核</h1></div></div>
+<div class="filter"><a href="/candidates?state=pending">待审核</a><a href="/candidates?state=all">全部</a></div>
+{% for item in items %}
+<article class="candidate-card">
+  <div class="candidate-main"><div><span class="badge">{{ item.state }}</span><h2>{{ item.anime_title }} EP{{ item.episode_no }}</h2><p>{{ item.title }}</p><p class="muted">UP：{{ item.uploader }} · {{ item.duration }} · 分数 {{ item.score }}</p></div><a class="button" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">查看视频</a></div>
+  <details><summary>判定详情</summary><pre>{{ item.evaluation }}</pre></details>
+  {% if item.pending %}<div class="actions-grid"><form method="post" action="/candidates/{{ item.bvid }}/accept-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="primary" type="submit">确认这个</button></form><form method="post" action="/candidates/{{ item.bvid }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">拒绝</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">信任此 UP</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/block"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">屏蔽此 UP</button></form></div>{% endif %}
+</article>
+{% endfor %}
+{% if items.is_empty() %}<div class="empty">当前没有符合筛选条件的候选。</div>{% endif %}
+{% endblock %}

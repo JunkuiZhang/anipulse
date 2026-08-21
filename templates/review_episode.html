@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}审核 {{ anime_title }} EP{{ episode_no }} · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">EPISODE REVIEW</p><h1>{{ anime_title }} EP{{ episode_no }}</h1></div><a class="button" href="/anime/{{ anime_id }}">返回番剧</a></div>
+{% for item in candidates %}
+<article class="candidate-card"><div class="candidate-main"><div><h2>{{ item.title }}</h2><p class="muted">{{ item.bvid }} · {{ item.uploader }} · {{ item.duration }} · 分数 {{ item.score }}</p></div><a class="button" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">查看视频</a></div><form method="post" action="/candidates/{{ item.bvid }}/accept-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="primary" type="submit">选择这个</button></form></article>
+{% endfor %}
+{% if candidates.is_empty() %}<div class="empty">当前没有可用候选。你可以提交一个 B 站视频链接。</div>{% else %}<form method="post" action="/episodes/{{ episode_id }}/candidates/reject-all-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">这些都不对</button></form>{% endif %}
+<section class="panel"><h2>提交 B 站视频链接</h2><p class="muted">scheduler 会读取真实标题、UP 和时长，导入为待确认候选；导入后仍需你最终确认。</p><form method="post" action="/episodes/{{ episode_id }}/candidates/from-url" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="url" required placeholder="https://www.bilibili.com/video/BV..."><button type="submit">提交给后台</button></form></section>
+{% endblock %}

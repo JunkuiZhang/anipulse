@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}确认候选 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">MANUAL CONFIRMATION</p><h1>确认这个视频</h1></div><a class="button" href="/candidates">取消</a></div>
+<section class="panel details"><dl><dt>番剧</dt><dd>{{ anime_title }} EP{{ episode_no }}</dd><dt>视频标题</dt><dd>{{ title }}</dd><dt>UP 主</dt><dd>{{ uploader }}</dd><dt>BV 号</dt><dd>{{ bvid }}</dd></dl></section>
+<div class="alert">确认后会创建更新通知，并把这次人工反馈计入该 UP 的信任记录。</div>
+<form method="post" action="/candidates/{{ bvid }}/accept" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="nonce" value="{{ nonce }}">
+  <button class="primary" type="submit">确认并发送更新通知</button>
+</form>
+{% endblock %}

@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}拒绝全部候选 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">REJECT ALL</p><h1>这些候选都不对？</h1></div><a class="button" href="/review/episodes/{{ episode_id }}">取消</a></div>
+<div class="alert">将拒绝当前页面对应的 {{ candidate_count }} 个候选，并记录对各 UP 的人工反馈。后来新出现的候选不会被误伤。</div>
+<form method="post" action="/episodes/{{ episode_id }}/candidates/reject-all" class="stack"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="nonce" value="{{ nonce }}"><input type="hidden" name="fingerprint" value="{{ fingerprint }}"><button class="primary" type="submit">确认全部拒绝</button></form>
+{% endblock %}

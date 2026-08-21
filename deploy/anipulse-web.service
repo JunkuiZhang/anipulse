@@ -1,0 +1,38 @@
+[Unit]
+Description=AniPulse authenticated web management
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=anipulse
+Group=anipulse
+WorkingDirectory=/var/lib/anipulse
+ExecStart=/usr/local/bin/anipulse --config /etc/anipulse/config.toml web
+EnvironmentFile=/etc/anipulse/anipulse-web.env
+Restart=on-failure
+RestartSec=10s
+StateDirectory=anipulse
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/anipulse
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryMax=384M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

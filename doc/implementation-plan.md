@@ -50,6 +50,8 @@
 
 验收：错误 ID 不改变数据；删除后相关 Alias、Episode、Candidate、Notification 和 Uploader Trust 全部消失；CLI 明确提示操作不可撤销。
 
-## 后续阶段（不阻塞 V1）
+## 阶段 9：鉴权网页管理端
 
-带鉴权网页管理端已进入后续路线，详细架构、鉴权威胁模型、数据表、路由、systemd/HTTPS 部署和七阶段验收标准见 [`web-management-plan.md`](web-management-plan.md)。它将保持 CLI 作为恢复入口，并让网页进程与监控进程隔离。不会加入下载、评论/弹幕分析、浏览器自动化、LLM 判定或无必要的复杂基础设施。
+交付：独立 `anipulse web` 进程、Argon2id 单管理员鉴权、不透明 Session、CSRF/Origin/限流/审计、SSR 管理页面、后台任务队列、飞书待确认审核卡片、Caddy 和 systemd 部署。
+
+验收：网页只监听 loopback；没有默认管理员；web 进程不持有飞书 Secret；添加、改名、启停、安全删除和候选审核可用；外部请求只由 scheduler 执行；完整设计边界见 [`web-management-plan.md`](web-management-plan.md)，生产教程见 [`web-deployment.md`](web-deployment.md)。

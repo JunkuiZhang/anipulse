@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}确认追番 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">DRAFT</p><h1>确认匹配结果</h1></div><a class="button" href="/anime/new">重新填写</a></div>
+{% if queued %}
+<div class="panel"><h2>正在解析 Bangumi 数据</h2><p class="muted">后台 scheduler 正在处理。通常十几秒内完成。</p><a class="button" href="/anime/drafts/{{ draft_id }}">刷新状态</a></div>
+{% else if failed %}
+<div class="alert">解析失败：{{ error }}</div>
+{% else %}
+<section class="panel details"><dl><dt>输入标题</dt><dd>{{ title }}</dd><dt>匹配标题</dt><dd>{{ matched_title }}</dd><dt>Bangumi ID</dt><dd>{{ bangumi_id }}</dd><dt>等待集数</dt><dd>EP{{ next_episode }}</dd><dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>别名</dt><dd>{{ aliases }}</dd><dt>时长</dt><dd>{{ duration }}</dd></dl></section>
+{% if has_warning %}<div class="alert">{{ warning }}</div>{% endif %}
+<form method="post" action="/anime" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="draft_id" value="{{ draft_id }}">
+  {% if has_warning %}<label class="check"><input type="checkbox" name="confirm_warning" value="yes" required> 我已核对作品和季度，仍要使用这个 Bangumi 条目</label>{% endif %}
+  <button class="primary" type="submit">确认添加</button>
+</form>
+{% endif %}
+{% endblock %}

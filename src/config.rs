@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::error::{AppError, Result};
@@ -14,6 +15,7 @@ pub struct AppConfig {
     pub notification: NotificationConfig,
     pub schedule: ScheduleConfig,
     pub scheduler: SchedulerConfig,
+    pub web: WebConfig,
 }
 
 impl AppConfig {
@@ -81,6 +83,76 @@ impl AppConfig {
             if !matches!(url.scheme(), "http" | "https") {
                 return Err(AppError::Config(format!("{name} must use HTTP or HTTPS")));
             }
+        }
+        let bind = self
+            .web
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| AppError::Config("web.bind must be an IP socket address".into()))?;
+        if !bind.ip().is_loopback() && !self.web.dangerous_allow_public_bind {
+            return Err(AppError::Config(
+                "web.bind must be loopback unless web.dangerous_allow_public_bind=true".into(),
+            ));
+        }
+        let public_url = url::Url::parse(&self.web.public_url)
+            .map_err(|_| AppError::Config("web.public_url must be a valid URL".into()))?;
+        if public_url.host_str().is_none()
+            || public_url.path() != "/"
+            || public_url.query().is_some()
+            || public_url.fragment().is_some()
+            || !public_url.username().is_empty()
+            || public_url.password().is_some()
+        {
+            return Err(AppError::Config(
+                "web.public_url must be an origin without credentials, path, query, or fragment"
+                    .into(),
+            ));
+        }
+        let local_http = public_url.scheme() == "http"
+            && public_url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+        if public_url.scheme() != "https" && !(self.web.development_mode && local_http) {
+            return Err(AppError::Config(
+                "web.public_url must use HTTPS (localhost HTTP requires web.development_mode=true)"
+                    .into(),
+            ));
+        }
+        if self.web.session_idle_secs < 300
+            || self.web.session_absolute_secs < self.web.session_idle_secs
+            || self.web.session_renewal_secs < 60
+            || self.web.session_renewal_secs > self.web.session_idle_secs
+        {
+            return Err(AppError::Config(
+                "web session timeouts are outside the safe range".into(),
+            ));
+        }
+        if !(1..=20).contains(&self.web.login_max_failures)
+            || !(60..=86_400).contains(&self.web.login_window_secs)
+            || !(4_096..=1_048_576).contains(&self.web.max_body_bytes)
+            || !(1..=120).contains(&self.web.request_timeout_secs)
+        {
+            return Err(AppError::Config(
+                "web login limits or request body limit are outside the safe range".into(),
+            ));
+        }
+        if self.scheduler.tick_secs == 0
+            || self.scheduler.due_batch_size <= 0
+            || self.scheduler.management_job_batch_size <= 0
+        {
+            return Err(AppError::Config(
+                "scheduler intervals and batch sizes must be greater than zero".into(),
+            ));
+        }
+        if !(1..=120).contains(&self.notification.request_timeout_secs)
+            || !(0..=604_800).contains(&self.notification.review_grace_secs)
+        {
+            return Err(AppError::Config(
+                "notification timeout or review grace period is outside the safe range".into(),
+            ));
         }
         Ok(())
     }
@@ -185,6 +257,7 @@ pub struct NotificationConfig {
     pub channel: String,
     pub notify_pending: bool,
     pub request_timeout_secs: u64,
+    pub review_grace_secs: i64,
 }
 
 impl Default for NotificationConfig {
@@ -194,6 +267,7 @@ impl Default for NotificationConfig {
             channel: "default".into(),
             notify_pending: false,
             request_timeout_secs: 15,
+            review_grace_secs: 3_600,
         }
     }
 }
@@ -231,6 +305,7 @@ impl Default for ScheduleConfig {
 pub struct SchedulerConfig {
     pub tick_secs: u64,
     pub due_batch_size: i64,
+    pub management_job_batch_size: i64,
 }
 
 impl Default for SchedulerConfig {
@@ -238,6 +313,77 @@ impl Default for SchedulerConfig {
         Self {
             tick_secs: 30,
             due_batch_size: 20,
+            management_job_batch_size: 10,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    pub bind: String,
+    pub public_url: String,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
+    pub session_idle_secs: i64,
+    pub session_absolute_secs: i64,
+    pub session_renewal_secs: i64,
+    pub login_window_secs: i64,
+    pub login_max_failures: i64,
+    pub request_timeout_secs: u64,
+    pub max_body_bytes: usize,
+    pub development_mode: bool,
+    pub dangerous_allow_public_bind: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8080".into(),
+            public_url: "https://localhost".into(),
+            trusted_proxy_cidrs: vec![
+                "127.0.0.1/32".parse().expect("valid loopback network"),
+                "::1/128".parse().expect("valid loopback network"),
+            ],
+            session_idle_secs: 7_200,
+            session_absolute_secs: 86_400,
+            session_renewal_secs: 1_800,
+            login_window_secs: 900,
+            login_max_failures: 5,
+            request_timeout_secs: 15,
+            max_body_bytes: 65_536,
+            development_mode: false,
+            dangerous_allow_public_bind: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_web_defaults_are_valid_and_loopback_only() {
+        let config = AppConfig::default();
+        config.validate().unwrap();
+        assert!(
+            config
+                .web
+                .bind
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+    }
+
+    #[test]
+    fn rejects_public_bind_and_non_origin_public_url() {
+        let mut config = AppConfig::default();
+        config.web.bind = "0.0.0.0:8080".into();
+        assert!(config.validate().is_err());
+
+        config.web.bind = "127.0.0.1:8080".into();
+        config.web.public_url = "https://anime.example.com/panel".into();
+        assert!(config.validate().is_err());
     }
 }

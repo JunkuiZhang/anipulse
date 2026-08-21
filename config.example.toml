@@ -38,8 +38,9 @@ jitter_ratio = 0.1
 provider = "feishu"
 channel = "feishu-private-anime"
 notify_pending = false
-# 预留给鉴权网页候选审核通知；当前版本请保持 false。
+# 开启后，无法自动确认时会发送飞书审核卡片，并跳转到鉴权网页。
 request_timeout_secs = 15
+review_grace_secs = 3600
 
 [schedule]
 # 自动排期使用 bangumi-data 的精确 broadcast，并用 Bangumi 章节日期校准停播/调档。
@@ -56,3 +57,18 @@ user_agent = "your-bangumi-id/AniPulse/0.1 (personal self-hosted)"
 [scheduler]
 tick_secs = 30
 due_batch_size = 20
+management_job_batch_size = 10
+
+[web]
+bind = "127.0.0.1:8080"
+public_url = "https://anime.example.com"
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
+session_idle_secs = 7200
+session_absolute_secs = 86400
+session_renewal_secs = 1800
+login_window_secs = 900
+login_max_failures = 5
+request_timeout_secs = 15
+max_body_bytes = 65536
+development_mode = false
+dangerous_allow_public_bind = false

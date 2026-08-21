@@ -1,12 +1,14 @@
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use anipulse::{
+    application::ApplicationService,
+    auth::{create_admin, normalize_username, reset_admin_password},
     config::AppConfig,
     detector::Detector,
-    domain::{AutoScheduleMetadata, CandidateState, NewAnime, VideoCandidate},
+    domain::{AutoScheduleMetadata, NewAnime},
     error::{AppError, Result},
     notification::NotificationDispatcher,
-    provider::{BilibiliProvider, VideoSearchProvider},
+    provider::BilibiliProvider,
     repository::Repository,
     schedule::{ScheduleProvider, ScheduleSynchronizer},
     scheduler,
@@ -38,6 +40,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Run,
+    Web,
     Check {
         anime_id: Option<i64>,
     },
@@ -56,6 +59,14 @@ enum Command {
     Notification {
         #[command(subcommand)]
         command: NotificationCommand,
+    },
+    Database {
+        #[command(subcommand)]
+        command: DatabaseCommand,
+    },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
 }
 
@@ -162,6 +173,51 @@ enum NotificationCommand {
     Test,
 }
 
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    Migrate,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+    Sessions {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    Create {
+        #[arg(long)]
+        username: String,
+    },
+    ResetPassword {
+        #[arg(long)]
+        username: String,
+    },
+    Disable {
+        #[arg(long)]
+        username: String,
+    },
+    Enable {
+        #[arg(long)]
+        username: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    RevokeAll {
+        #[arg(long)]
+        username: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -179,17 +235,29 @@ async fn main() {
 async fn execute(cli: Cli) -> Result<()> {
     let config = Arc::new(AppConfig::load(&cli.config)?);
     let repository = Repository::connect(&config.database.path).await?;
+    let application = ApplicationService::new(repository.clone(), config.clone());
     match cli.command {
-        Command::Anime { command } => handle_anime(command, &repository, &config).await,
-        Command::Candidate { command } => handle_candidate(command, &repository, &config).await,
-        Command::Uploader { command } => handle_uploader(command, &repository).await,
+        Command::Anime { command } => {
+            handle_anime(command, &application, &repository, &config).await
+        }
+        Command::Candidate { command } => {
+            handle_candidate(command, &application, &repository).await
+        }
+        Command::Uploader { command } => handle_uploader(command, &application).await,
         Command::Notification {
             command: NotificationCommand::Test,
         } => {
-            NotificationDispatcher::new(repository, &config.notification)?
+            NotificationDispatcher::new(repository, &config.notification, &config.web.public_url)?
                 .test()
                 .await
         }
+        Command::Database {
+            command: DatabaseCommand::Migrate,
+        } => {
+            println!("database migrations are up to date");
+            Ok(())
+        }
+        Command::Auth { command } => handle_auth(command, &repository).await,
         Command::Check { anime_id } => {
             let (detector, dispatcher) = build_runtime(repository.clone(), config.clone())?;
             let ids = match anime_id {
@@ -205,7 +273,145 @@ async fn execute(cli: Cli) -> Result<()> {
             let (detector, dispatcher) = build_runtime(repository.clone(), config.clone())?;
             scheduler::run(repository, detector, dispatcher, config).await
         }
+        Command::Web => anipulse::web::serve(repository, config).await,
     }
+}
+
+async fn handle_auth(command: AuthCommand, repository: &Repository) -> Result<()> {
+    match command {
+        AuthCommand::Admin {
+            command: AdminCommand::Create { username },
+        } => {
+            let username = normalize_username(&username)?;
+            let password = prompt_new_password()?;
+            let admin_id = create_admin(repository, &username, password).await?;
+            repository
+                .record_audit(
+                    "cli",
+                    Some(admin_id),
+                    "auth.admin.create",
+                    Some("web_admin"),
+                    Some(&admin_id.to_string()),
+                    "success",
+                    None,
+                    None,
+                    "{}",
+                )
+                .await?;
+            println!("created owner administrator {username:?}");
+        }
+        AuthCommand::Admin {
+            command: AdminCommand::ResetPassword { username },
+        } => {
+            let username = normalize_username(&username)?;
+            reset_admin_password(repository, &username, prompt_new_password()?).await?;
+            let admin = repository
+                .web_admin_by_username(&username)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+            repository
+                .record_audit(
+                    "cli",
+                    Some(admin.id),
+                    "auth.admin.reset_password",
+                    Some("web_admin"),
+                    Some(&admin.id.to_string()),
+                    "success",
+                    None,
+                    None,
+                    "{}",
+                )
+                .await?;
+            println!("reset password and revoked all sessions for {username:?}");
+        }
+        AuthCommand::Admin {
+            command: AdminCommand::Disable { username },
+        } => {
+            let username = normalize_username(&username)?;
+            repository.set_web_admin_disabled(&username, true).await?;
+            let admin = repository
+                .web_admin_by_username(&username)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+            repository
+                .record_audit(
+                    "cli",
+                    Some(admin.id),
+                    "auth.admin.disable",
+                    Some("web_admin"),
+                    Some(&admin.id.to_string()),
+                    "success",
+                    None,
+                    None,
+                    "{}",
+                )
+                .await?;
+            println!("disabled {username:?} and revoked all sessions");
+        }
+        AuthCommand::Admin {
+            command: AdminCommand::Enable { username },
+        } => {
+            let username = normalize_username(&username)?;
+            repository.set_web_admin_disabled(&username, false).await?;
+            let admin = repository
+                .web_admin_by_username(&username)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+            repository
+                .record_audit(
+                    "cli",
+                    Some(admin.id),
+                    "auth.admin.enable",
+                    Some("web_admin"),
+                    Some(&admin.id.to_string()),
+                    "success",
+                    None,
+                    None,
+                    "{}",
+                )
+                .await?;
+            println!("enabled {username:?}");
+        }
+        AuthCommand::Sessions {
+            command: SessionCommand::RevokeAll { username },
+        } => {
+            let username = normalize_username(&username)?;
+            let count = repository.revoke_web_admin_sessions(&username).await?;
+            let admin = repository
+                .web_admin_by_username(&username)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("web admin {username}")))?;
+            repository
+                .record_audit(
+                    "cli",
+                    Some(admin.id),
+                    "auth.sessions.revoke_all",
+                    Some("web_admin"),
+                    Some(&admin.id.to_string()),
+                    "success",
+                    None,
+                    None,
+                    &serde_json::json!({"count": count}).to_string(),
+                )
+                .await?;
+            println!("revoked {count} active session(s) for {username:?}");
+        }
+    }
+    Ok(())
+}
+
+fn prompt_new_password() -> Result<String> {
+    let password = rpassword::prompt_password("New password: ").map_err(|error| {
+        AppError::InvalidInput(format!("cannot read password from TTY: {error}"))
+    })?;
+    let confirmation = rpassword::prompt_password("Repeat password: ").map_err(|error| {
+        AppError::InvalidInput(format!("cannot read password from TTY: {error}"))
+    })?;
+    if password != confirmation {
+        return Err(AppError::InvalidInput("passwords do not match".into()));
+    }
+    anipulse::auth::PasswordService::validate_password(&password)?;
+    Ok(password)
 }
 
 fn build_runtime(
@@ -217,12 +423,14 @@ fn build_runtime(
         repository.clone(),
     )?);
     let detector = Detector::new(repository.clone(), provider, config.clone());
-    let dispatcher = NotificationDispatcher::new(repository, &config.notification)?;
+    let dispatcher =
+        NotificationDispatcher::new(repository, &config.notification, &config.web.public_url)?;
     Ok((detector, dispatcher))
 }
 
 async fn handle_anime(
     command: AnimeCommand,
+    application: &ApplicationService,
     repository: &Repository,
     config: &AppConfig,
 ) -> Result<()> {
@@ -371,7 +579,7 @@ async fn handle_anime(
             Ok(())
         }
         AnimeCommand::Edit { anime_id, title } => {
-            let previous = repository.rename_anime(anime_id, &title).await?;
+            let previous = application.rename_anime(anime_id, &title).await?;
             println!(
                 "renamed anime {anime_id} from {:?} to {:?}; the previous title remains an alias and an immediate check was scheduled",
                 previous.title,
@@ -380,12 +588,12 @@ async fn handle_anime(
             Ok(())
         }
         AnimeCommand::Enable { anime_id } => {
-            repository.set_anime_enabled(anime_id, true).await?;
+            application.set_anime_enabled(anime_id, true).await?;
             println!("enabled anime {anime_id}");
             Ok(())
         }
         AnimeCommand::Disable { anime_id } => {
-            repository.set_anime_enabled(anime_id, false).await?;
+            application.set_anime_enabled(anime_id, false).await?;
             println!("disabled anime {anime_id}");
             Ok(())
         }
@@ -397,7 +605,7 @@ async fn handle_anime(
                     anime.anime.title
                 )));
             }
-            let anime = repository.delete_anime(anime_id).await?;
+            let anime = application.delete_anime(anime_id).await?;
             println!(
                 "removed anime {} ({:?}) and all related records",
                 anime.id, anime.title
@@ -416,8 +624,8 @@ async fn handle_anime(
 
 async fn handle_candidate(
     command: CandidateCommand,
+    application: &ApplicationService,
     repository: &Repository,
-    config: &AppConfig,
 ) -> Result<()> {
     match command {
         CandidateCommand::List { state, explain } => {
@@ -448,70 +656,19 @@ async fn handle_candidate(
             Ok(())
         }
         CandidateCommand::Accept { bvid } => {
-            let (candidate, _) = repository.candidate_context(&bvid).await?;
-            repository
-                .confirm_candidate(
-                    candidate.episode_id,
-                    &bvid,
-                    "manual_confirmation",
-                    &config.notification.channel,
-                    true,
-                )
-                .await?;
+            application.accept_candidate(&bvid).await?;
             println!("accepted {bvid}; notification is pending");
             Ok(())
         }
         CandidateCommand::AcceptUrl { anime_id, url } => {
-            let bvid = parse_bilibili_bvid(&url)?;
-            let anime = repository.get_anime(anime_id).await?;
-            let episode = repository.active_episode(anime_id).await?;
-            let now = Utc::now();
-            let seed = VideoCandidate {
-                bvid: bvid.clone(),
-                title: bvid.clone(),
-                description: None,
-                uploader_mid: 0,
-                uploader_name: "unknown".into(),
-                duration_sec: 0,
-                published_at: now,
-                url: format!("https://www.bilibili.com/video/{bvid}"),
-                tags: Vec::new(),
-                page_count: None,
-                discovered_at: now,
-                enriched: false,
-            };
-            let provider = BilibiliProvider::new(config.bilibili.clone(), repository.clone())?;
-            let candidate = provider.enrich(&seed).await?;
-            let trust = repository
-                .uploader_trust(anime_id, candidate.uploader_mid)
-                .await?;
-            let evaluation = anipulse::detector::evaluator::evaluate(
-                &anime,
-                &episode,
-                &candidate,
-                &trust,
-                config.confirmation.trusted_confirmed_count,
-            );
-            repository
-                .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
-                .await?;
-            repository
-                .confirm_candidate(
-                    episode.id,
-                    &bvid,
-                    "manual_url_confirmation",
-                    &config.notification.channel,
-                    true,
-                )
-                .await?;
+            let bvid = application.accept_bilibili_url(anime_id, &url).await?;
             println!(
-                "accepted {bvid} for anime {anime_id} EP{} from Bilibili URL; notification is pending",
-                episode.episode_no
+                "accepted {bvid} for anime {anime_id} from Bilibili URL; notification is pending"
             );
             Ok(())
         }
         CandidateCommand::Reject { bvid } => {
-            repository.reject_candidate(&bvid, true).await?;
+            application.reject_candidate(&bvid).await?;
             println!("rejected {bvid}");
             Ok(())
         }
@@ -525,7 +682,7 @@ async fn handle_candidate(
                     episode.episode_no
                 )));
             }
-            let rejected = repository.reject_all_candidates(episode.id, true).await?;
+            let (_, rejected) = application.reject_all_candidates(anime_id).await?;
             println!(
                 "rejected {rejected} pending candidate(s) for anime {anime_id} EP{}",
                 episode.episode_no
@@ -535,16 +692,16 @@ async fn handle_candidate(
     }
 }
 
-async fn handle_uploader(command: UploaderCommand, repository: &Repository) -> Result<()> {
+async fn handle_uploader(command: UploaderCommand, application: &ApplicationService) -> Result<()> {
     match command {
         UploaderCommand::Trust { anime_id, mid } => {
-            repository
+            application
                 .set_uploader_flag(anime_id, mid, true, false)
                 .await?;
             println!("trusted uploader mid={mid} for anime={anime_id}");
         }
         UploaderCommand::Block { anime_id, mid } => {
-            repository
+            application
                 .set_uploader_flag(anime_id, mid, false, true)
                 .await?;
             println!("blocked uploader mid={mid} for anime={anime_id}");
@@ -578,42 +735,6 @@ fn parse_duration_arg(value: &str) -> Result<i64> {
     value
         .parse()
         .map_err(|_| AppError::InvalidInput(format!("invalid duration: {value}")))
-}
-
-fn parse_bilibili_bvid(value: &str) -> Result<String> {
-    let value = value.trim();
-    if valid_bvid(value) {
-        return Ok(value.to_string());
-    }
-
-    let url = url::Url::parse(value)
-        .map_err(|_| AppError::InvalidInput("expected a BV ID or Bilibili video URL".into()))?;
-    if url.scheme() != "https"
-        || !matches!(url.host_str(), Some("www.bilibili.com" | "m.bilibili.com"))
-    {
-        return Err(AppError::InvalidInput(
-            "only canonical HTTPS Bilibili video URLs are accepted".into(),
-        ));
-    }
-    let mut segments = url.path_segments().into_iter().flatten();
-    if segments.next() != Some("video") {
-        return Err(AppError::InvalidInput(
-            "Bilibili URL must use /video/BV...".into(),
-        ));
-    }
-    let bvid = segments.next().unwrap_or_default();
-    if !valid_bvid(bvid) {
-        return Err(AppError::InvalidInput(
-            "Bilibili URL contains an invalid BV ID".into(),
-        ));
-    }
-    Ok(bvid.to_string())
-}
-
-fn valid_bvid(value: &str) -> bool {
-    value.len() == 12
-        && value.starts_with("BV")
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn parse_weekday(value: &str) -> Result<Weekday> {
@@ -668,17 +789,6 @@ mod tests {
         assert_eq!(parse_duration_arg("20m").unwrap(), 1_200);
         assert_eq!(parse_duration_arg("23:40").unwrap(), 1_420);
         assert_eq!(parse_duration_arg("90s").unwrap(), 90);
-    }
-
-    #[test]
-    fn parses_canonical_bilibili_video_input() {
-        assert_eq!(
-            parse_bilibili_bvid("https://www.bilibili.com/video/BV1Es8A6UEnr?p=1").unwrap(),
-            "BV1Es8A6UEnr"
-        );
-        assert_eq!(parse_bilibili_bvid("BV1Es8A6UEnr").unwrap(), "BV1Es8A6UEnr");
-        assert!(parse_bilibili_bvid("https://example.com/video/BV1Es8A6UEnr").is_err());
-        assert!(parse_bilibili_bvid("https://www.bilibili.com/bangumi/BV1Es8A6UEnr").is_err());
     }
 
     #[test]

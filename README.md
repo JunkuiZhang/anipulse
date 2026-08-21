@@ -12,7 +12,9 @@ AniPulse 是一个面向个人 Linux 服务器的番剧更新监控器。它低�
 - Trusted Uploader、Independent Consensus、Manual Confirmation 三条确认路径；
 - 公共聚合搜索、WBI 回退和视频详情 Provider 隔离；识别 `v_voucher` 软风控响应，并执行全局串行限流、每日预算及 429/412/临时失败退避；
 - 飞书消息卡片通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
-- CLI 改名、按 B 站链接人工确认、候选 accept/reject 与 per-Anime UP trust/block。
+- CLI 改名、按 B 站链接人工确认、候选 accept/reject 与 per-Anime UP trust/block；
+- 单管理员鉴权网页：Dashboard、添加/启停/改名/安全删除、候选审核、后台任务与审计；
+- 无法自动确认时发送飞书私聊审核卡片，登录网页后选择候选、都不选或提交链接。
 
 V1 不下载视频、不使用登录 Cookie、不绕过风控，也不处理 `EP12.5`、SP、OVA、连播或分 P 的自动推进。此类标题只进入人工复核。
 
@@ -79,6 +81,18 @@ anipulse run
 
 如果当前集的待确认候选全都不对，可在先查看列表后执行 `candidate reject-all ANIME_ID --yes`。它只拒绝该 Anime 当前 Episode 的 pending candidates，并逐个记录人工反馈，不影响之后新发现的候选。
 
+## 网页管理端
+
+网页和 scheduler 是两个独立进程。生产环境让网页只监听 `127.0.0.1:8080`，由 Caddy 提供 HTTPS；管理员必须从服务器 TTY 创建，没有默认账号或网页注册：
+
+```bash
+anipulse database migrate
+anipulse auth admin create --username admin
+anipulse web
+```
+
+网页 Secret 只通过 `ANIPULSE_WEB_SECRET` 提供，飞书 Secret 仍只交给 `anipulse run`。完整的域名、Caddy、systemd、管理员恢复和审核提醒部署步骤见 [`doc/web-deployment.md`](doc/web-deployment.md)。
+
 ## 通知
 
 生产配置推荐使用飞书自建应用机器人，直接私聊你的飞书账号：
@@ -101,7 +115,7 @@ anipulse notification test
 
 更新确认后，应用机器人会直接向你发送包含确认依据、UP、时长、BV 号和“立即观看”按钮的消息卡片。程序缓存 `tenant_access_token` 并在过期前刷新；无需事件订阅、回调地址或服务器入站端口。不要把 App Secret、Cookie 或其他 secret 写入仓库，日志也不会打印这些值。
 
-当前飞书通道是单向通知：机器人可以私聊发卡片，但不能接收按钮选择或你回复的视频链接。候选不确定时的安全交互会与鉴权网页共用审核页：飞书卡片只打开登录后的审核页面，由页面执行“确认一个、全部拒绝、提交 B 站链接”。这样无需暴露一个可直接改数据库的匿名飞书回调；具体设计见网页计划。
+飞书通道保持单向通知：机器人可以私聊发卡片，但不接收卡片回调或你回复的文本。启用 `notify_pending` 后，不确定候选卡片会打开登录后的网页审核页，由页面执行“确认一个、全部拒绝、提交 B 站链接”。这样无需暴露一个可匿名修改数据库的飞书回调；部署见 [`doc/web-deployment.md`](doc/web-deployment.md)。
 
 原有飞书群自定义机器人仍可作为兼容选项：把 `provider` 设为 `feishu_webhook`，并提供 `FEISHU_WEBHOOK_URL` 以及可选的 `FEISHU_BOT_SECRET`。
 
@@ -144,7 +158,7 @@ RUST_LOG=info
 
 从创建飞书自建应用、开通私聊权限、构建 Linux 二进制到备份升级的完整步骤见 [`doc/deployment.md`](doc/deployment.md)。
 
-带鉴权网页管理端的目标架构、威胁模型、数据表、路由、部署和分阶段验收标准见 [`doc/web-management-plan.md`](doc/web-management-plan.md)。
+鉴权网页的架构、威胁模型、数据表、路由和验收标准见 [`doc/web-management-plan.md`](doc/web-management-plan.md)，生产部署教程见 [`doc/web-deployment.md`](doc/web-deployment.md)。
 
 ## 判定语义
 

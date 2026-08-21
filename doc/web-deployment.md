@@ -1,0 +1,243 @@
+# AniPulse 网页管理端部署教程
+
+网页管理端是独立的 `anipulse web` 进程：它和监控调度器共享 SQLite，但只读取 `ANIPULSE_WEB_SECRET`，不读取飞书 App Secret。默认只监听 `127.0.0.1:8080`，必须由 Caddy 通过 HTTPS 暴露。
+
+部署后的使用链路是：
+
+```text
+飞书私聊审核卡片 → HTTPS 网页 → 登录 → 选择候选 / 都不选 / 提交 B 站链接
+                                      ↓
+                                SQLite management_job
+                                      ↓
+                    anipulse run 请求 Bilibili / Bangumi / 飞书
+```
+
+飞书卡片里的按钮只打开页面，不会匿名修改数据库。所有网页写操作都要求 Session、同源检查和 CSRF；接受候选、全部拒绝和永久删除还要求一次性确认。
+
+## 1. 准备域名和端口
+
+准备一个域名，例如 `anime.example.com`，把 A/AAAA 记录指向服务器。安全组和系统防火墙只需要允许：
+
+- SSH 管理端口；
+- TCP 80（Caddy 申请证书和跳转 HTTPS）；
+- TCP 443（网页 HTTPS）。
+
+不要开放 8080。AniPulse 会拒绝非 loopback 的 `web.bind`，除非显式开启危险选项。
+
+如果不想把登录页放到公网，可通过 Tailscale/WireGuard 私网域名提供 HTTPS；配置步骤相同，只需换成该私网 HTTPS 地址。
+
+## 2. 安装新二进制和部署文件
+
+先按 [`deployment.md`](deployment.md) 的构建章节得到能在 Ubuntu 22.04 运行的二进制。升级已有部署前先停服务并备份：
+
+```bash
+sudo systemctl stop anipulse-web.service anipulse.service 2>/dev/null || true
+sudo cp --preserve=mode,ownership \
+  /var/lib/anipulse/anipulse.db \
+  /var/lib/anipulse/anipulse.db.before-web
+```
+
+安装新文件：
+
+```bash
+sudo install -m 0755 target/release/anipulse /usr/local/bin/anipulse
+sudo install -m 0644 deploy/anipulse.service /etc/systemd/system/anipulse.service
+sudo install -m 0644 deploy/anipulse-web.service /etc/systemd/system/anipulse-web.service
+```
+
+如果是在 Arch 上交叉构建，请把第一条命令中的源路径换成经过 `file` 和 `readelf` 检查的静态 musl 产物，不要使用 Arch 的 `target/release/anipulse`。
+
+## 3. 配置网页
+
+编辑 `/etc/anipulse/config.toml`，将域名替换为你的真实域名：
+
+```toml
+[web]
+bind = "127.0.0.1:8080"
+public_url = "https://anime.example.com"
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
+session_idle_secs = 7200
+session_absolute_secs = 86400
+session_renewal_secs = 1800
+login_window_secs = 900
+login_max_failures = 5
+request_timeout_secs = 15
+max_body_bytes = 65536
+development_mode = false
+dangerous_allow_public_bind = false
+```
+
+`public_url` 必须和浏览器实际访问的 origin 完全一致，包括非默认端口。生产环境必须是 HTTPS；不要为了省略反向代理而把 `development_mode` 或 `dangerous_allow_public_bind` 打开。
+
+若 Caddy 与 AniPulse 在同一台服务器，默认可信代理范围无需修改。不要写 `0.0.0.0/0`；只有 TCP peer 属于这里的 CIDR 时，登录限流才会读取 `X-Forwarded-For`。
+
+## 4. 生成网页 Secret
+
+创建独立的网页环境文件：
+
+```bash
+sudo sh -c 'umask 077; printf "ANIPULSE_WEB_SECRET=" > /etc/anipulse/anipulse-web.env; openssl rand -base64 48 >> /etc/anipulse/anipulse-web.env; printf "RUST_LOG=info\n" >> /etc/anipulse/anipulse-web.env'
+sudo chown root:root /etc/anipulse/anipulse-web.env
+sudo chmod 600 /etc/anipulse/anipulse-web.env
+```
+
+这个 Secret 用 HKDF 派生 Session、CSRF、一次性操作和审计哈希密钥。不要和 `FEISHU_APP_SECRET` 混用，不要放进 TOML 或 Git。Secret 丢失或更换后，已有网页 Session 和未完成的一次性确认会失效，但追番数据不受影响。
+
+`anipulse-web.service` 只加载 `anipulse-web.env`；原来的 `anipulse.service` 继续只加载包含飞书凭证的 `anipulse.env`。
+
+## 5. 迁移数据库并创建管理员
+
+两个服务都保持停止时执行 migration：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  database migrate
+```
+
+然后通过 TTY 创建唯一的 owner 管理员：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  auth admin create --username admin
+```
+
+程序会隐藏密码输入并要求重复确认；密码至少 12 个字符。没有默认账号、默认密码，也不能在登录页注册。
+
+恢复命令如下：
+
+```bash
+# 重置密码，同时撤销全部旧 Session
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  auth admin reset-password --username admin
+
+# 只撤销全部登录
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  auth sessions revoke-all --username admin
+
+# 紧急禁用账号并撤销全部登录
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  auth admin disable --username admin
+```
+
+## 6. 配置 Caddy HTTPS
+
+按 [Caddy 官方安装说明](https://caddyserver.com/docs/install)安装 Caddy，然后复制示例：
+
+```bash
+sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
+sudoedit /etc/caddy/Caddyfile
+```
+
+把第一行的 `anime.example.com` 换成实际域名。示例会限制请求体、设置 HSTS、覆盖代理来源信息并反向代理到 `127.0.0.1:8080`。验证并加载：
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
+sudo systemctl reload caddy
+sudo systemctl status caddy --no-pager
+```
+
+Caddy 默认会为域名申请 HTTPS 证书，并在反向代理时安全地重建 `X-Forwarded-*` 头。若域名前还有 Cloudflare 等 CDN，不能直接沿用默认可信代理设置；先按 Caddy 官方 `trusted_proxies` 文档配置真实 CDN 网段，再把 AniPulse 的 `trusted_proxy_cidrs` 保持为本机 Caddy 地址。
+
+## 7. 启动两个服务
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now anipulse.service anipulse-web.service
+sudo systemctl status anipulse.service anipulse-web.service --no-pager
+```
+
+本机确认监听边界和健康检查：
+
+```bash
+ss -ltnp | grep -E ':443|127\.0\.0\.1:8080'
+curl -i http://127.0.0.1:8080/healthz
+curl -I https://anime.example.com/login
+```
+
+8080 应只出现在 `127.0.0.1`，`/healthz` 只返回固定的 `ok`。打开 `https://anime.example.com/login` 登录后，可看到 Dashboard、追番、候选、后台任务、审计和状态页面。
+
+网页空闲时不请求 Bilibili。点击“立即检查”“同步排期”“测试通知”或提交 B 站链接只会写入 `management_job`；`anipulse run` 在下一个 scheduler tick 领取任务。因此 scheduler 停止时任务会保持 `queued`，网页仍可查看和编辑本地数据。
+
+## 8. 开启飞书“不确定候选”提醒
+
+确认 HTTPS 网页可以登录后，再修改通知配置：
+
+```toml
+[notification]
+provider = "feishu"
+channel = "feishu-private-anime"
+notify_pending = true
+request_timeout_secs = 15
+review_grace_secs = 3600
+```
+
+重启 scheduler：
+
+```bash
+sudo systemctl restart anipulse.service
+```
+
+行为如下：
+
+- 找到候选但可信 UP/独立共识不足：候选集合变化时发送一张橙色审核卡片；
+- 到预计更新时间后仍没有候选：等待 `review_grace_secs` 后发送一次审核卡片；
+- Bilibili 超时、412/429、软风控或全局 backoff：不发送“没有候选”的误导提醒；
+- 同一个候选集合只提醒一次，失败会指数退避重试；
+- 审核提醒不会推进下一集，也不会替代绿色“已更新”通知。
+
+在审核页可以选择一个候选、将页面当时展示的候选全部拒绝，或提交规范的 B 站 HTTPS `/video/BV...` 链接。链接由 scheduler 获取真实标题、UP 和时长后保存为待确认候选，你还需要在页面上最终点一次确认。
+
+## 9. 升级、回滚和日志
+
+以后升级网页 schema：
+
+```bash
+sudo systemctl stop anipulse-web.service anipulse.service
+sudo cp --preserve=mode,ownership /var/lib/anipulse/anipulse.db \
+  /var/lib/anipulse/anipulse.db.$(date +%Y%m%d-%H%M%S).backup
+sudo install -m 0755 target/release/anipulse /usr/local/bin/anipulse
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml database migrate
+sudo systemctl start anipulse.service anipulse-web.service
+```
+
+查看日志：
+
+```bash
+sudo journalctl -u anipulse.service -f
+sudo journalctl -u anipulse-web.service -f
+sudo tail -f /var/log/caddy/anipulse-access.log
+```
+
+网页日志不会记录表单正文、Cookie 或 Secret。数据库处于 WAL 模式，网页和 scheduler 可以并发使用；如果 scheduler 在执行后台任务时中断，运行超过 10 分钟的 `running` 任务会被重新入队。
+
+回滚时先停止两个服务。如果只是关闭网页，可直接禁用 `anipulse-web.service`，原有 scheduler 和 CLI 不受影响。若需要回到不认识新 migration 的旧版本，恢复升级前的完整数据库备份，而不是手工删除表。
+
+## 10. 常见问题
+
+### 登录后反复回到登录页
+
+检查浏览器访问地址是否与 `web.public_url` 完全相同，并确认是 HTTPS。查看响应中的 Cookie 是否具有 `Secure; HttpOnly; SameSite=Lax; Path=/`。修改 `ANIPULSE_WEB_SECRET` 会让旧 Cookie 立即失效，这是预期行为。
+
+### POST 显示“请求来源校验失败”
+
+通常是 `web.public_url` 域名或端口不匹配，或者反向代理改写了浏览器可见 origin。不要关闭 Origin/CSRF 校验；把 `public_url` 改成浏览器地址并重启 web。
+
+### 添加追番一直显示“后台解析中”
+
+自动排期解析由 scheduler 的任务执行。确认 `anipulse.service` 正常、有 Bangumi 网络访问，并在“任务”页查看错误。修复后重新走一次添加向导即可；15 分钟未确认的 draft 会过期。
+
+### 飞书卡片按钮打不开
+
+检查 `web.public_url` 是否为手机/电脑可以访问的真实 HTTPS 地址。`localhost` 指的是打开飞书的设备自己，不能用于服务器部署。
+
+### 页面显示 scheduler 已停止或任务一直 queued
+
+```bash
+sudo systemctl status anipulse.service --no-pager
+sudo journalctl -u anipulse.service -n 100 --no-pager
+```
+
+网页服务不会替 scheduler 执行外部请求，这是刻意的 Secret 与故障隔离。
