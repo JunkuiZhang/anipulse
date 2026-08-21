@@ -19,23 +19,37 @@
 
 ## 2. 确定私聊收件人
 
-最简单的方式是使用你在当前飞书组织通讯录中的邮箱：
+最简单的方式是使用你在当前飞书组织通讯录中的邮箱。按以下步骤查找：
+
+1. 登录[飞书管理后台](https://www.feishu.cn/admin)。
+2. 进入“组织架构”→“成员与部门”→“成员”。
+3. 点击你自己的名字，打开成员详情。
+4. 复制详情中的“邮箱”字段。
+
+这里应填写成员资料中的邮箱，不一定等同于你登录飞书时使用的手机号、第三方账号或后来绑定的邮箱。将它写入 `/etc/anipulse/anipulse.env`：
 
 ```text
 FEISHU_RECEIVE_ID_TYPE=email
 FEISHU_RECEIVE_ID=you@example.com
 ```
 
-这里应填写组织通讯录中记录的邮箱，不一定等同于你登录飞书时使用的手机号或第三方账号。
+如果成员资料中没有邮箱，可以在同一个成员详情页面找到并复制“用户 ID”：
 
-如果账号没有邮箱，也可以使用已经获得的用户 ID：
+```text
+FEISHU_RECEIVE_ID_TYPE=user_id
+FEISHU_RECEIVE_ID=成员详情中的用户ID
+```
+
+使用 `user_id` 时，在自建应用的“开发配置”→“权限管理”中开通“获取用户 user ID”（`contact:user.employee_id:readonly`），然后创建新版本并重新发布。飞书也支持通过邮箱或手机号调用[获取用户 ID 接口](https://open.feishu.cn/document/server-docs/contact-v3/user/batch_get_id)，但个人部署直接从管理后台复制更简单。
+
+程序也支持 `open_id` 和 `union_id`。其中 `open_id` 通常以 `ou_` 开头，并且与具体自建应用绑定；同一个人在不同应用中的 `open_id` 不同，不能复制其他机器人的值。如果已经通过当前 AniPulse 应用获得了它，可以这样填写：
 
 ```text
 FEISHU_RECEIVE_ID_TYPE=open_id
 FEISHU_RECEIVE_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-程序还支持 `user_id` 和 `union_id`。收件人必须处于该应用的可用范围内。具体参数格式见飞书官方的[发送消息接口](https://open.feishu.cn/document/server-docs/im-v1/message/create)。
+个人部署推荐优先使用 `email`，没有邮箱时再使用 `user_id`，通常不需要 `union_id`。无论使用哪一种，收件人都必须属于当前飞书组织，并包含在该应用已发布版本的“可用范围”内。具体参数格式见飞书官方的[发送消息接口](https://open.feishu.cn/document/server-docs/im-v1/message/create)和[通讯录常见问题](https://open.feishu.cn/document/ugTN1YjL4UTN24CO1UjN/uQzN1YjL0cTN24CN3UjN)。保存环境变量后，按第 7 节发送测试卡片验证配置。
 
 ## 3. 准备 Linux 服务器
 
