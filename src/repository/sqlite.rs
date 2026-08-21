@@ -181,6 +181,24 @@ impl Repository {
         Ok(AnimeWithAliases { anime, aliases })
     }
 
+    pub async fn delete_anime(&self, anime_id: i64) -> Result<Anime> {
+        let mut tx = self.pool.begin().await?;
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        let result = sqlx::query("DELETE FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!("anime {anime_id}")));
+        }
+        tx.commit().await?;
+        Ok(anime)
+    }
+
     pub async fn set_anime_enabled(&self, anime_id: i64, enabled: bool) -> Result<()> {
         let result = sqlx::query("UPDATE anime SET enabled = ?, updated_at = ? WHERE id = ?")
             .bind(enabled)
@@ -967,5 +985,44 @@ mod tests {
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));
+    }
+
+    #[tokio::test]
+    async fn deleting_anime_cascades_related_state() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (candidate, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &candidate.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+
+        let deleted = repository.delete_anime(anime_id).await.unwrap();
+        assert_eq!(deleted.title, "Silent Witch");
+        assert!(matches!(
+            repository.get_anime(anime_id).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            repository.episode(episode.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(repository.list_candidates(None).await.unwrap().is_empty());
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        let trust = repository
+            .uploader_trust(anime_id, candidate.uploader_mid)
+            .await
+            .unwrap();
+        assert_eq!(trust.confirmed_count, 0);
+        assert_eq!(trust.rejected_count, 0);
+        assert!(!trust.manually_trusted);
+        assert!(!trust.manually_blocked);
+        assert!(matches!(
+            repository.delete_anime(anime_id).await,
+            Err(AppError::NotFound(_))
+        ));
     }
 }

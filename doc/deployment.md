@@ -287,6 +287,22 @@ sudo journalctl -u anipulse -f
 
 ## 10. 日常操作
 
+禁用追番不会删除历史数据；适合暂停监控或先处理误添加记录：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime disable 4
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime show 4
+```
+
+彻底删除前先核对目标。第一次不带 `--yes` 的调用会显示目标并拒绝执行；确认无误后再永久删除：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime remove 4
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime remove 4 --yes
+```
+
+删除会在一个 SQLite 事务内完成，并通过外键级联清除该 Anime 的别名、Episode、候选、通知和 UP 信任数据，无法撤销。重要数据应先按“备份与恢复”一节创建备份。对于刚误加且担心调度器正在处理的记录，先执行 `anime disable ID`，再删除。
+
 查看待确认候选及解释：
 
 ```bash

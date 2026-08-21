@@ -63,10 +63,26 @@ enum Command {
 enum AnimeCommand {
     Add(Box<AddAnimeArgs>),
     List,
-    Show { anime_id: i64 },
-    Enable { anime_id: i64 },
-    Disable { anime_id: i64 },
-    Sync { anime_id: i64 },
+    Show {
+        anime_id: i64,
+    },
+    Enable {
+        anime_id: i64,
+    },
+    Disable {
+        anime_id: i64,
+    },
+    Remove {
+        anime_id: i64,
+        #[arg(
+            long,
+            help = "confirm permanent deletion of the anime and all related records"
+        )]
+        yes: bool,
+    },
+    Sync {
+        anime_id: i64,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -344,6 +360,21 @@ async fn handle_anime(
             println!("disabled anime {anime_id}");
             Ok(())
         }
+        AnimeCommand::Remove { anime_id, yes } => {
+            if !yes {
+                let anime = repository.get_anime(anime_id).await?;
+                return Err(AppError::InvalidInput(format!(
+                    "refusing to permanently delete anime {anime_id} ({:?}); re-run `anime remove {anime_id} --yes` after verifying the ID",
+                    anime.anime.title
+                )));
+            }
+            let anime = repository.delete_anime(anime_id).await?;
+            println!(
+                "removed anime {} ({:?}) and all related records",
+                anime.id, anime.title
+            );
+            Ok(())
+        }
         AnimeCommand::Sync { anime_id } => {
             ScheduleSynchronizer::new(repository.clone(), config.schedule.clone())?
                 .sync_now(anime_id)
@@ -506,5 +537,30 @@ mod tests {
         assert_eq!(parse_duration_arg("20m").unwrap(), 1_200);
         assert_eq!(parse_duration_arg("23:40").unwrap(), 1_420);
         assert_eq!(parse_duration_arg("90s").unwrap(), 90);
+    }
+
+    #[test]
+    fn anime_remove_requires_explicit_confirmation_flag() {
+        let cli = Cli::try_parse_from(["anipulse", "anime", "remove", "4"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::Remove {
+                    anime_id: 4,
+                    yes: false
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["anipulse", "anime", "remove", "4", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::Remove {
+                    anime_id: 4,
+                    yes: true
+                }
+            }
+        ));
     }
 }

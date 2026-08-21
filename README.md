@@ -54,6 +54,8 @@ anipulse anime add \
 anipulse anime list
 anipulse anime show 1
 anipulse anime sync 1
+anipulse anime disable 4
+anipulse anime remove 4 --yes
 anipulse check 1
 anipulse candidate list --state pending --explain
 anipulse candidate accept BVxxxxxxxxxx
@@ -63,6 +65,8 @@ anipulse uploader block 1 123456
 anipulse notification test
 anipulse run
 ```
+
+`anime remove ID` 是永久删除操作，会级联清除该番剧的别名、Episode、候选、通知和 UP 信任记录。命令默认拒绝执行；必须先用 `anime show ID` 核对目标，再显式添加 `--yes`。误添加时先 `anime disable ID` 可立即阻止后台继续调度。
 
 `candidate accept` 只事务化确认状态并创建 pending notification；下一次 `run` 或 `check` 会发送它。这样即使通知服务暂时失败也不会丢失已确认更新。
 
@@ -128,6 +132,8 @@ RUST_LOG=info
 ```
 
 从创建飞书自建应用、开通私聊权限、构建 Linux 二进制到备份升级的完整步骤见 [`doc/deployment.md`](doc/deployment.md)。
+
+带鉴权网页管理端的目标架构、威胁模型、数据表、路由、部署和分阶段验收标准见 [`doc/web-management-plan.md`](doc/web-management-plan.md)。
 
 ## 判定语义
 
