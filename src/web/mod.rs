@@ -384,7 +384,13 @@ async fn anime_list(
             title: anime.title,
             episode: episode
                 .as_ref()
-                .map(|episode| format!("EP{} · {}", episode.episode_no, episode.state))
+                .map(|episode| {
+                    format!(
+                        "EP{} · {}",
+                        episode.episode_no,
+                        episode_state_label(&episode.state)
+                    )
+                })
                 .unwrap_or_else(|| "—".into()),
             next_check: episode
                 .as_ref()
@@ -633,7 +639,13 @@ async fn anime_detail(
         aliases: anime.aliases.join("、"),
         episode: episode
             .as_ref()
-            .map(|episode| format!("EP{} · {}", episode.episode_no, episode.state))
+            .map(|episode| {
+                format!(
+                    "EP{} · {}",
+                    episode.episode_no,
+                    episode_state_label(&episode.state)
+                )
+            })
             .unwrap_or_else(|| "—".into()),
         expected_at: episode
             .as_ref()
@@ -903,6 +915,7 @@ struct CandidateView {
     state: String,
     evaluation: String,
     url: String,
+    has_video_url: bool,
     pending: bool,
 }
 
@@ -912,6 +925,8 @@ struct CandidateTemplate {
     username: String,
     csrf_token: String,
     items: Vec<CandidateView>,
+    pending_selected: bool,
+    all_selected: bool,
 }
 
 async fn candidate_list(
@@ -936,6 +951,8 @@ async fn candidate_list(
         username: identity.username,
         csrf_token: identity.csrf_token,
         items,
+        pending_selected: selected == "pending",
+        all_selected: selected == "all",
     })
 }
 
@@ -943,23 +960,22 @@ fn candidate_view(row: CandidateListRow) -> CandidateView {
     let evaluation = serde_json::from_str::<serde_json::Value>(&row.evaluation_json)
         .and_then(|value| serde_json::to_string_pretty(&value))
         .unwrap_or_else(|_| "判定详情不可用".into());
-    let url = parse_bilibili_bvid(&row.url)
-        .map(|bvid| format!("https://www.bilibili.com/video/{bvid}"))
-        .unwrap_or_else(|_| "https://www.bilibili.com".into());
+    let url = canonical_bilibili_url(&row.bvid);
     CandidateView {
         bvid: row.bvid,
         anime_id: row.anime_id,
         uploader_mid: row.uploader_mid,
         anime_title: row.anime_title,
         episode_no: row.episode_no,
-        title: row.title,
+        title: clean_bilibili_title(&row.title),
         uploader: row.uploader_name,
-        duration: format!("{}:{:02}", row.duration_sec / 60, row.duration_sec % 60),
+        duration: format_duration(row.duration_sec),
         score: row.score,
         pending: row.state == "pending",
-        state: row.state,
+        state: candidate_state_label(&row.state).into(),
         evaluation,
-        url,
+        has_video_url: url.is_some(),
+        url: url.unwrap_or_default(),
     }
 }
 
@@ -1113,6 +1129,7 @@ struct ReviewCandidate {
     duration: String,
     score: i64,
     url: String,
+    has_video_url: bool,
 }
 
 #[derive(Template)]
@@ -1139,17 +1156,17 @@ async fn review_episode(
         .active_candidates(id)
         .await?
         .into_iter()
-        .map(|candidate| ReviewCandidate {
-            bvid: candidate.bvid.clone(),
-            title: candidate.title,
-            uploader: candidate.uploader_name,
-            duration: format!(
-                "{}:{:02}",
-                candidate.duration_sec / 60,
-                candidate.duration_sec % 60
-            ),
-            score: candidate.score,
-            url: format!("https://www.bilibili.com/video/{}", candidate.bvid),
+        .map(|candidate| {
+            let url = canonical_bilibili_url(&candidate.bvid);
+            ReviewCandidate {
+                bvid: candidate.bvid,
+                title: clean_bilibili_title(&candidate.title),
+                uploader: candidate.uploader_name,
+                duration: format_duration(candidate.duration_sec),
+                score: candidate.score,
+                has_video_url: url.is_some(),
+                url: url.unwrap_or_default(),
+            }
         })
         .collect();
     render(ReviewEpisodeTemplate {
@@ -1622,6 +1639,66 @@ fn provider_status(value: Option<DateTime<Utc>>) -> String {
         _ => "可用".into(),
     }
 }
+
+fn canonical_bilibili_url(bvid: &str) -> Option<String> {
+    parse_bilibili_bvid(bvid)
+        .ok()
+        .map(|bvid| format!("https://www.bilibili.com/video/{bvid}"))
+}
+
+fn clean_bilibili_title(value: &str) -> String {
+    let mut cleaned = String::with_capacity(value.len());
+    let mut inside_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' if inside_tag => inside_tag = false,
+            _ if !inside_tag => cleaned.push(character),
+            _ => {}
+        }
+    }
+    let cleaned = cleaned
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    cleaned.trim().to_string()
+}
+
+fn format_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds >= 3_600 {
+        let hours = seconds / 3_600;
+        let minutes = seconds % 3_600 / 60;
+        format!("{hours} 小时 {minutes} 分")
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+fn candidate_state_label(state: &str) -> &str {
+    match state {
+        "pending" => "待审核",
+        "confirmed" => "已确认",
+        "rejected" => "已拒绝",
+        "expired" => "已过期",
+        _ => "未知状态",
+    }
+}
+
+fn episode_state_label(state: &str) -> &str {
+    match state {
+        "waiting" => "等待更新",
+        "watching" => "监控中",
+        "candidate_found" => "发现候选",
+        "confirmed" => "已确认",
+        "notified" => "已通知",
+        "needs_manual_review" => "需要审核",
+        _ => "未知状态",
+    }
+}
+
 fn format_time(value: Option<DateTime<Utc>>) -> String {
     value
         .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -1744,6 +1821,38 @@ mod tests {
             origin_of("https://anime.example.com/path").unwrap(),
             "https://anime.example.com"
         );
+    }
+
+    #[test]
+    fn candidate_link_uses_validated_bvid_instead_of_provider_url() {
+        let view = candidate_view(CandidateListRow {
+            episode_id: 1,
+            anime_id: 2,
+            bvid: "BV1Es8A6UEnr".into(),
+            anime_title: "测试番剧".into(),
+            episode_no: 7,
+            uploader_mid: 3,
+            uploader_name: "测试 UP".into(),
+            title: "第7话 <em class=\"keyword\">测试番剧</em> &amp; 新内容".into(),
+            duration_sec: 22_263,
+            published_at: Utc::now(),
+            score: -5,
+            state: "pending".into(),
+            seen_count: 1,
+            evaluation_json: "{}".into(),
+            url: "https://www.bilibili.com".into(),
+        });
+
+        assert_eq!(view.url, "https://www.bilibili.com/video/BV1Es8A6UEnr");
+        assert!(view.has_video_url);
+        assert_eq!(view.title, "第7话 测试番剧 & 新内容");
+        assert_eq!(view.duration, "6 小时 11 分");
+        assert_eq!(view.state, "待审核");
+    }
+
+    #[test]
+    fn invalid_candidate_bvid_never_falls_back_to_bilibili_homepage() {
+        assert!(canonical_bilibili_url("not-a-bvid").is_none());
     }
 
     #[tokio::test]

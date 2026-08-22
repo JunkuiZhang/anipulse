@@ -1,14 +1,17 @@
 {% extends "base.html" %}
 {% block title %}候选 · AniPulse{% endblock %}
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">REVIEW</p><h1>候选审核</h1></div></div>
-<div class="filter"><a href="/candidates?state=pending">待审核</a><a href="/candidates?state=all">全部</a></div>
+<div class="page-heading"><div><p class="eyebrow">REVIEW QUEUE</p><h1>候选审核</h1><p class="page-description">在自动判断不够确定时，由你做最后决定。</p></div></div>
+<div class="filter" aria-label="候选筛选"><a {% if pending_selected %}class="selected"{% endif %} href="/candidates?state=pending">待审核</a><a {% if all_selected %}class="selected"{% endif %} href="/candidates?state=all">全部记录</a></div>
+<div class="candidate-list">
 {% for item in items %}
 <article class="candidate-card">
-  <div class="candidate-main"><div><span class="badge">{{ item.state }}</span><h2>{{ item.anime_title }} EP{{ item.episode_no }}</h2><p>{{ item.title }}</p><p class="muted">UP：{{ item.uploader }} · {{ item.duration }} · 分数 {{ item.score }}</p></div><a class="button" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">查看视频</a></div>
-  <details><summary>判定详情</summary><pre>{{ item.evaluation }}</pre></details>
-  {% if item.pending %}<div class="actions-grid"><form method="post" action="/candidates/{{ item.bvid }}/accept-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="primary" type="submit">确认这个</button></form><form method="post" action="/candidates/{{ item.bvid }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">拒绝</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">信任此 UP</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/block"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">屏蔽此 UP</button></form></div>{% endif %}
+  <div class="candidate-topline"><span class="badge review">{{ item.state }}</span><span class="candidate-id">{{ item.bvid }}</span></div>
+  <div class="candidate-main"><div class="candidate-copy"><h2>{{ item.anime_title }} <span>EP{{ item.episode_no }}</span></h2><p class="candidate-title">{{ item.title }}</p><div class="candidate-meta"><span>UP {{ item.uploader }}</span><span>{{ item.duration }}</span><span>评分 {{ item.score }}</span></div></div>{% if item.has_video_url %}<a class="button video-link" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">在 B 站打开 <span aria-hidden="true">↗</span></a>{% else %}<span class="button disabled" aria-disabled="true">视频地址无效</span>{% endif %}</div>
+  <details class="evaluation"><summary>查看判定详情</summary><pre>{{ item.evaluation }}</pre></details>
+  {% if item.pending %}<div class="actions-grid candidate-actions"><form method="post" action="/candidates/{{ item.bvid }}/accept-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="primary" type="submit">确认此视频</button></form><form method="post" action="/candidates/{{ item.bvid }}/reject"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">拒绝</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">信任此 UP</button></form><form method="post" action="/anime/{{ item.anime_id }}/uploaders/{{ item.uploader_mid }}/block"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger-ghost" type="submit">屏蔽此 UP</button></form></div>{% endif %}
 </article>
 {% endfor %}
+</div>
 {% if items.is_empty() %}<div class="empty">当前没有符合筛选条件的候选。</div>{% endif %}
 {% endblock %}

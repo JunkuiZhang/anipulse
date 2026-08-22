@@ -8,20 +8,22 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/">AniPulse</a>
-    <nav aria-label="主导航">
-      <a href="/anime">追番</a>
-      <a href="/candidates">候选</a>
-      <a href="/jobs">任务</a>
-      <a href="/audit">审计</a>
-      <a href="/settings/status">状态</a>
-    </nav>
-    <div class="account">
-      <span>{{ username }}</span>
-      <form method="post" action="/logout">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button class="link-button" type="submit">退出</button>
-      </form>
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="AniPulse 首页"><span class="brand-mark"></span>AniPulse</a>
+      <nav aria-label="主导航">
+        <a href="/anime">追番</a>
+        <a href="/candidates">候选</a>
+        <a href="/jobs">任务</a>
+        <a href="/audit">审计</a>
+        <a href="/settings/status">状态</a>
+      </nav>
+      <div class="account">
+        <span class="account-name">{{ username }}</span>
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="link-button" type="submit">退出</button>
+        </form>
+      </div>
     </div>
   </header>
   <main class="container">
