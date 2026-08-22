@@ -139,6 +139,11 @@ impl AppConfig {
                 "web login limits or request body limit are outside the safe range".into(),
             ));
         }
+        if self.web.cover_cache_dir.trim().is_empty() {
+            return Err(AppError::Config(
+                "web.cover_cache_dir must not be empty".into(),
+            ));
+        }
         if self.scheduler.tick_secs == 0
             || self.scheduler.due_batch_size <= 0
             || self.scheduler.management_job_batch_size <= 0
@@ -323,6 +328,7 @@ impl Default for SchedulerConfig {
 pub struct WebConfig {
     pub bind: String,
     pub public_url: String,
+    pub cover_cache_dir: String,
     pub trusted_proxy_cidrs: Vec<IpNet>,
     pub session_idle_secs: i64,
     pub session_absolute_secs: i64,
@@ -340,6 +346,7 @@ impl Default for WebConfig {
         Self {
             bind: "127.0.0.1:8080".into(),
             public_url: "https://localhost".into(),
+            cover_cache_dir: "covers".into(),
             trusted_proxy_cidrs: vec![
                 "127.0.0.1/32".parse().expect("valid loopback network"),
                 "::1/128".parse().expect("valid loopback network"),

@@ -62,6 +62,8 @@ management_job_batch_size = 10
 [web]
 bind = "127.0.0.1:8080"
 public_url = "https://anime.example.com"
+# 相对路径以 systemd 的 WorkingDirectory=/var/lib/anipulse 为基准。
+cover_cache_dir = "covers"
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
 session_idle_secs = 7200
 session_absolute_secs = 86400

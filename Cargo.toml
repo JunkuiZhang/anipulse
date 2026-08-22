@@ -38,6 +38,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 thiserror = "2.0"
 tokio = { version = "1.47", features = [
+    "fs",
     "io-util",
     "macros",
     "net",

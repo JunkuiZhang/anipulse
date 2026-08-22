@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+mod cover_cache;
+
 use askama::Template;
 use axum::{
     Extension, Form, Router,
@@ -33,6 +35,7 @@ use crate::{
     error::{AppError, Result},
     repository::{AuditEventRow, CandidateListRow, ManagementJob, Repository},
 };
+use cover_cache::{CoverAsset, CoverCache};
 
 const SESSION_COOKIE: &str = "__Host-anipulse_session";
 const APP_CSS: &str = include_str!("../../static/app.css");
@@ -44,10 +47,13 @@ struct WebState {
     auth: AuthService,
     config: Arc<AppConfig>,
     public_origin: String,
+    cover_cache: CoverCache,
 }
 
 pub async fn serve(repository: Repository, config: Arc<AppConfig>) -> Result<()> {
     repository.cleanup_web_ephemera().await?;
+    let cover_cache = CoverCache::new(&config)?;
+    cover_cache.initialize(&repository).await?;
     let auth = AuthService::from_env(repository.clone(), config.web.clone()).await?;
     let public_origin = origin_of(&config.web.public_url)?;
     let state = WebState {
@@ -56,8 +62,9 @@ pub async fn serve(repository: Repository, config: Arc<AppConfig>) -> Result<()>
         auth,
         config: config.clone(),
         public_origin,
+        cover_cache: cover_cache.clone(),
     };
-    spawn_web_cleanup(repository.clone());
+    spawn_web_cleanup(repository.clone(), cover_cache);
     let app = build_router(state, &config);
 
     let address = config
@@ -80,7 +87,7 @@ pub async fn serve(repository: Repository, config: Arc<AppConfig>) -> Result<()>
     .map_err(|error| AppError::Config(format!("web server stopped: {error}")))
 }
 
-fn spawn_web_cleanup(repository: Repository) {
+fn spawn_web_cleanup(repository: Repository, cover_cache: CoverCache) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3_600));
         interval.tick().await;
@@ -88,6 +95,9 @@ fn spawn_web_cleanup(repository: Repository) {
             interval.tick().await;
             if let Err(error) = repository.cleanup_web_ephemera().await {
                 tracing::warn!(%error, "web state cleanup failed");
+            }
+            if let Err(error) = cover_cache.prune(&repository).await {
+                tracing::warn!(%error, "cover cache cleanup failed");
             }
         }
     });
@@ -108,6 +118,7 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/sync", post(anime_sync))
         .route("/anime/{id}/delete-intent", post(anime_delete_intent))
         .route("/anime/{id}/delete", post(anime_delete))
+        .route("/covers/{subject_id}", get(cover_image))
         .route("/candidates", get(candidate_list))
         .route(
             "/candidates/{bvid}/accept-intent",
@@ -170,7 +181,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     insert_header(
         headers,
         "content-security-policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://api.bgm.tv https://lain.bgm.tv https://i0.hdslb.com https://i1.hdslb.com https://i2.hdslb.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://i0.hdslb.com https://i1.hdslb.com https://i2.hdslb.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     );
     insert_header(headers, "x-content-type-options", "nosniff");
     insert_header(
@@ -227,6 +238,74 @@ async fn stylesheet() -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+async fn cover_image(
+    State(state): State<WebState>,
+    Path(subject_id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    if subject_id <= 0 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.repository.has_bangumi_subject_id(subject_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(subject_id, %error, "failed to authorize cover cache lookup");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    match state.cover_cache.get(subject_id).await {
+        Ok(asset) => cover_response(asset, &headers),
+        Err(error) => {
+            tracing::warn!(subject_id, %error, "cover unavailable; serving placeholder");
+            cover_placeholder_response()
+        }
+    }
+}
+
+fn cover_response(asset: CoverAsset, request_headers: &HeaderMap) -> Response {
+    let not_modified = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|value| value == "*" || value == asset.etag)
+        });
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        asset.bytes.into_response()
+    };
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset.content_type),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&asset.etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+fn cover_placeholder_response() -> Response {
+    const PLACEHOLDER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 440"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#f0e8e4"/><stop offset="1" stop-color="#dfe9e7"/></linearGradient></defs><rect width="320" height="440" rx="24" fill="url(#g)"/><circle cx="160" cy="196" r="62" fill="#fff" fill-opacity=".65"/><path d="M128 201h64M160 169v64" stroke="#8f817b" stroke-width="12" stroke-linecap="round"/><text x="160" y="310" text-anchor="middle" font-family="sans-serif" font-size="25" fill="#756b67">封面稍后重试</text></svg>"##;
+    let mut response = PLACEHOLDER.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=300"),
+    );
     response
 }
 
@@ -909,6 +988,13 @@ async fn anime_delete(
         serde_json::json!({"title": deleted.title}),
     )
     .await?;
+    let cover_cache = state.cover_cache.clone();
+    let repository = state.repository.clone();
+    tokio::spawn(async move {
+        if let Err(error) = cover_cache.prune(&repository).await {
+            tracing::warn!(%error, "cover cache cleanup after anime deletion failed");
+        }
+    });
     Ok(Redirect::to("/anime").into_response())
 }
 
@@ -1662,8 +1748,7 @@ fn canonical_bilibili_url(bvid: &str) -> Option<String> {
 }
 
 fn bangumi_cover_url(subject_id: i64) -> Option<String> {
-    (subject_id > 0)
-        .then(|| format!("https://api.bgm.tv/v0/subjects/{subject_id}/image?type=medium"))
+    (subject_id > 0).then(|| format!("/covers/{subject_id}"))
 }
 
 fn title_initial(title: &str) -> String {
@@ -1885,14 +1970,43 @@ mod tests {
     }
 
     #[test]
-    fn bangumi_cover_uses_official_subject_image_endpoint() {
-        assert_eq!(
-            bangumi_cover_url(622206).as_deref(),
-            Some("https://api.bgm.tv/v0/subjects/622206/image?type=medium")
-        );
+    fn bangumi_cover_uses_local_cache_endpoint() {
+        assert_eq!(bangumi_cover_url(622206).as_deref(), Some("/covers/622206"));
         assert!(bangumi_cover_url(0).is_none());
         assert_eq!(title_initial("  恶女不才"), "恶");
         assert_eq!(title_initial("  "), "番");
+    }
+
+    #[tokio::test]
+    async fn local_cover_response_supports_browser_cache_validation() {
+        let asset = CoverAsset {
+            bytes: vec![0xff, 0xd8, 0xff, 0xd9],
+            content_type: "image/jpeg",
+            etag: "\"cover-etag\"".into(),
+        };
+        let response = cover_response(asset, &HeaderMap::new());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, max-age=86400"
+        );
+        assert_eq!(response.headers()[header::ETAG], "\"cover-etag\"");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"cover-etag\""),
+        );
+        let response = cover_response(
+            CoverAsset {
+                bytes: vec![0xff, 0xd8, 0xff, 0xd9],
+                content_type: "image/jpeg",
+                etag: "\"cover-etag\"".into(),
+            },
+            &headers,
+        );
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
@@ -1926,8 +2040,8 @@ mod tests {
         let content_security_policy = response.headers()["content-security-policy"]
             .to_str()
             .unwrap();
-        assert!(content_security_policy.contains("https://api.bgm.tv"));
-        assert!(content_security_policy.contains("https://lain.bgm.tv"));
+        assert!(!content_security_policy.contains("https://api.bgm.tv"));
+        assert!(!content_security_policy.contains("https://lain.bgm.tv"));
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 
         let response = app
@@ -2058,6 +2172,7 @@ mod tests {
             .unwrap();
         let mut config = AppConfig::default();
         config.web.public_url = "https://anime.example.com".into();
+        config.web.cover_cache_dir = directory.path().join("covers").display().to_string();
         let config = Arc::new(config);
         let auth = AuthService::for_test(repository.clone(), config.web.clone())
             .await
@@ -2068,6 +2183,7 @@ mod tests {
             auth: auth.clone(),
             config: config.clone(),
             public_origin: origin_of(&config.web.public_url).unwrap(),
+            cover_cache: CoverCache::new(&config).unwrap(),
         };
         let app = build_router(state, &config);
         (directory, repository, config, auth, app)

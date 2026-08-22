@@ -55,6 +55,7 @@ sudo install -m 0644 deploy/anipulse-web.service /etc/systemd/system/anipulse-we
 [web]
 bind = "127.0.0.1:8080"
 public_url = "https://anime.example.com"
+cover_cache_dir = "covers"
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
 session_idle_secs = 7200
 session_absolute_secs = 86400
@@ -68,6 +69,10 @@ dangerous_allow_public_bind = false
 ```
 
 `public_url` 必须和浏览器实际访问的 origin 完全一致，包括非默认端口。生产环境必须是 HTTPS；不要为了省略反向代理而把 `development_mode` 或 `dangerous_allow_public_bind` 打开。
+
+`cover_cache_dir = "covers"` 会把 Bangumi 封面保存到 `/var/lib/anipulse/covers`（相对路径以 systemd 的 `WorkingDirectory` 为基准）。第一次显示某张封面时由网页进程下载，服务器缓存 7 天；上游临时不可用时会继续返回已经存在的旧图。浏览器收到 `Cache-Control: private, max-age=86400` 和 ETag，会缓存 1 天，过期后通常只向 AniPulse 做条件校验，不会再次下载完整图片。缓存单图上限为 5 MiB，只接受常见位图格式。
+
+网页进程会在启动时和此后每小时对照数据库清理缓存；网页中永久删除追番后还会立即清理。只有当同一个 Bangumi subject ID 不再被任何追番引用时才删除对应文件，因此重复绑定不会误删共享封面。通过 CLI 删除的缓存最迟在一小时后清理，也可以重启 `anipulse-web.service` 立即触发。缓存目录中 AniPulse 不认识的其他扩展名文件不会被删除。
 
 若 Caddy 与 AniPulse 在同一台服务器，默认可信代理范围无需修改。不要写 `0.0.0.0/0`；只有 TCP peer 属于这里的 CIDR 时，登录限流才会读取 `X-Forwarded-For`。
 

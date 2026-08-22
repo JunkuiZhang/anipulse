@@ -270,6 +270,15 @@ impl Repository {
         )
     }
 
+    pub async fn has_bangumi_subject_id(&self, subject_id: i64) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM anime WHERE bangumi_subject_id = ?)",
+        )
+        .bind(subject_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn get_anime(&self, anime_id: i64) -> Result<AnimeWithAliases> {
         let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
             .bind(anime_id)
