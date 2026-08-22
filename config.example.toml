@@ -49,7 +49,8 @@ bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
 # 这里只选择 bangumi-data 里的排期元数据，服务器不会访问这些平台的网站。
 preferred_site = "bilibili"
-# preferred_site 没有具体时刻时，按顺序选可信网络平台的 begin/broadcast。
+# preferred_site 没有具体时刻时，会比较以下可信来源：优先采用至少两个独立平台
+# 在 2 小时内相互印证的最早档期；列表顺序只用于同时间决胜和无共识时回退。
 stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
 # 网络先行/延后可能跨日或跨周；默认最多接受与 Bangumi 首集日期相差 14 天。
 max_stream_offset_days = 14

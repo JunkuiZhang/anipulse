@@ -20,6 +20,8 @@ use crate::{
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
 const CATALOG_SOURCE: &str = "bangumi-data";
 const SOURCE_ALERT_FAILURE_THRESHOLD: i64 = 2;
+const STREAM_CONSENSUS_WINDOW_SECS: i64 = 2 * 60 * 60;
+const MIN_STREAM_SOURCE_FAMILIES: usize = 2;
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
@@ -266,8 +268,6 @@ impl ScheduleProvider {
                 item.title
             ))
         })?;
-        let selected = select_broadcast(item, &self.config)?;
-        let recurrence = parse_recurrence(&selected.pattern)?;
         let (subject_episode_index, bangumi_episode_no) = episode_target
             .mapping
             .map(|mapping| mapping.mapped_numbers(next_episode))
@@ -310,6 +310,8 @@ impl ScheduleProvider {
         } else {
             None
         };
+        let selected = select_broadcast(item, &self.config, origin_airdate)?;
+        let recurrence = parse_recurrence(&selected.pattern)?;
         let expected = expected_at(
             recurrence,
             subject_episode_index,
@@ -326,7 +328,7 @@ impl ScheduleProvider {
             .expected_at
             .map(|expected_at| expected_at.with_timezone(&timezone));
         let schedule_warning = merge_warnings(
-            expected.warning,
+            merge_warnings(selected.warning, expected.warning),
             source_health_error
                 .as_ref()
                 .map(|error| format!("Bangumi 章节日期请求失败：{error}")),
@@ -600,10 +602,18 @@ impl ResolvedSchedule {
     }
 }
 
+#[derive(Clone)]
 struct SelectedBroadcast {
     pattern: String,
     source: String,
     kind: BroadcastSourceKind,
+    warning: Option<String>,
+}
+
+struct StreamBroadcastCandidate {
+    selected: SelectedBroadcast,
+    anchor: DateTime<Utc>,
+    priority: usize,
 }
 
 fn match_item<'a>(
@@ -685,46 +695,128 @@ fn item_aliases(item: &BangumiDataItem) -> Vec<String> {
     aliases
 }
 
-fn select_broadcast(item: &BangumiDataItem, config: &ScheduleConfig) -> Result<SelectedBroadcast> {
+fn select_broadcast(
+    item: &BangumiDataItem,
+    config: &ScheduleConfig,
+    origin_airdate: Option<NaiveDate>,
+) -> Result<SelectedBroadcast> {
     let item_pattern = item
         .broadcast
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| fallback_weekly_pattern(&item.begin));
-    let mut seen = HashSet::new();
-    for preferred_site in std::iter::once(config.preferred_site.as_str())
-        .chain(config.stream_site_priority.iter().map(String::as_str))
-        .filter(|site| seen.insert((*site).to_string()))
+
+    if let Some(site) = item
+        .sites
+        .iter()
+        .find(|site| site.site == config.preferred_site)
+        && let Some(pattern) = site_pattern(site, item_pattern.as_deref())
     {
-        let Some(site) = item.sites.iter().find(|site| site.site == preferred_site) else {
+        return Ok(SelectedBroadcast {
+            pattern,
+            source: site.site.clone(),
+            kind: BroadcastSourceKind::Stream,
+            warning: None,
+        });
+    }
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut rejected_by_date = Vec::new();
+    for (priority, source) in config.stream_site_priority.iter().enumerate() {
+        if source == &config.preferred_site || !seen.insert(source.clone()) {
+            continue;
+        }
+        let Some(site) = item.sites.iter().find(|site| site.site == *source) else {
             continue;
         };
-        let pattern = site
-            .broadcast
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                site.begin
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .and_then(|begin| site_pattern_from_item(begin, item_pattern.as_deref()))
-            });
-        if let Some(pattern) = pattern {
-            return Ok(SelectedBroadcast {
+        let Some(pattern) = site_pattern(site, item_pattern.as_deref()) else {
+            continue;
+        };
+        let Ok(recurrence) = parse_recurrence(&pattern) else {
+            continue;
+        };
+        if let Some(origin_airdate) = origin_airdate {
+            let source_day_offset =
+                (recurrence.anchor.with_timezone(&Tokyo).date_naive() - origin_airdate).num_days();
+            if source_day_offset.abs() > config.max_stream_offset_days {
+                rejected_by_date.push(site.site.clone());
+                continue;
+            }
+        }
+        candidates.push(StreamBroadcastCandidate {
+            selected: SelectedBroadcast {
                 pattern,
                 source: site.site.clone(),
                 kind: BroadcastSourceKind::Stream,
-            });
-        }
+                warning: None,
+            },
+            anchor: recurrence.anchor,
+            priority,
+        });
     }
+
+    let corroborated = candidates
+        .iter()
+        .filter(|candidate| {
+            candidates
+                .iter()
+                .filter(|other| {
+                    (other.anchor - candidate.anchor).num_seconds().abs()
+                        <= STREAM_CONSENSUS_WINDOW_SECS
+                })
+                .map(|other| stream_source_family(&other.selected.source))
+                .collect::<HashSet<_>>()
+                .len()
+                >= MIN_STREAM_SOURCE_FAMILIES
+        })
+        .min_by_key(|candidate| (candidate.anchor, candidate.priority));
+    if let Some(candidate) = corroborated {
+        return Ok(candidate.selected.clone());
+    }
+
+    if let Some(candidate) = candidates.iter().min_by_key(|candidate| candidate.priority) {
+        let mut selected = candidate.selected.clone();
+        selected.warning = Some(format!(
+            "没有两个独立网络来源能相互印证，暂按优先级使用 {} 的排期。",
+            candidate.selected.source
+        ));
+        return Ok(selected);
+    }
+
     item_pattern
         .map(|pattern| SelectedBroadcast {
             pattern,
             source: "bangumi-data".into(),
             kind: BroadcastSourceKind::Catalog,
+            warning: (!rejected_by_date.is_empty()).then(|| {
+                format!(
+                    "网络平台排期未通过首集日期安全校验（{}），已回退到 bangumi-data 默认时段。",
+                    rejected_by_date.join("、")
+                )
+            }),
         })
         .ok_or_else(|| AppError::Schedule(format!("'{}' has no broadcast time", item.title)))
+}
+
+fn site_pattern(site: &BangumiDataSite, item_pattern: Option<&str>) -> Option<String> {
+    site.broadcast
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            site.begin
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .and_then(|begin| site_pattern_from_item(begin, item_pattern))
+        })
+}
+
+fn stream_source_family(source: &str) -> &str {
+    match source {
+        "gamer" | "gamer_hk" => "gamer",
+        value => value,
+    }
 }
 
 fn fallback_weekly_pattern(begin: &str) -> Option<String> {
@@ -1045,6 +1137,132 @@ mod tests {
         let recurrence = parse_recurrence("R/2026-07-03T15:00:00.000Z/P7D").unwrap();
         assert_eq!(recurrence.period, Duration::days(7));
         assert!(parse_recurrence("R/2026-07-03T15:00:00.000Z/P1M").is_err());
+    }
+
+    #[test]
+    fn cat_and_dragon_uses_the_earliest_corroborated_stream() {
+        let item: BangumiDataItem = serde_json::from_str(
+            r#"{
+                "title":"猫と竜",
+                "titleTranslate":{},
+                "type":"tv",
+                "begin":"2026-07-04T12:00:00.000Z",
+                "broadcast":"R/2026-07-04T12:00:00.000Z/P7D",
+                "sites":[
+                    {"site":"bangumi","id":"538760"},
+                    {"site":"unext","begin":"2026-07-04T12:00:00.000Z"},
+                    {"site":"danime","begin":"2026-06-27T12:30:00.000Z"},
+                    {"site":"gamer","begin":"2026-06-27T13:00:00.000Z"},
+                    {"site":"gamer_hk","begin":"2026-06-27T13:00:00.000Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let origin = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
+
+        let selected = select_broadcast(&item, &ScheduleConfig::default(), Some(origin)).unwrap();
+
+        assert_eq!(selected.source, "danime");
+        let expected = expected_at(
+            parse_recurrence(&selected.pattern).unwrap(),
+            10,
+            Some(NaiveDate::from_ymd_opt(2026, 9, 5).unwrap()),
+            Some(origin),
+            BroadcastSourceKind::Stream,
+            14,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            expected.expected_at.unwrap().to_rfc3339(),
+            "2026-08-29T12:30:00+00:00"
+        );
+    }
+
+    #[test]
+    fn explicit_preferred_site_overrides_fallback_consensus() {
+        let item: BangumiDataItem = serde_json::from_str(
+            r#"{
+                "title":"example",
+                "titleTranslate":{},
+                "type":"tv",
+                "begin":"2026-07-04T12:00:00.000Z",
+                "sites":[
+                    {"site":"bangumi","id":"1"},
+                    {"site":"bilibili","begin":"2026-07-04T13:00:00.000Z"},
+                    {"site":"danime","begin":"2026-06-27T12:30:00.000Z"},
+                    {"site":"gamer","begin":"2026-06-27T13:00:00.000Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let selected = select_broadcast(
+            &item,
+            &ScheduleConfig::default(),
+            Some(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(selected.source, "bilibili");
+    }
+
+    #[test]
+    fn corroborated_cluster_beats_a_single_suspicious_early_source() {
+        let item: BangumiDataItem = serde_json::from_str(
+            r#"{
+                "title":"example",
+                "titleTranslate":{},
+                "type":"tv",
+                "begin":"2026-07-02T15:30:00.000Z",
+                "sites":[
+                    {"site":"bangumi","id":"1"},
+                    {"site":"unext","begin":"2026-06-23T02:11:00.000Z"},
+                    {"site":"danime","begin":"2026-07-02T16:00:00.000Z"},
+                    {"site":"gamer","begin":"2026-07-02T16:00:00.000Z"},
+                    {"site":"gamer_hk","begin":"2026-07-02T16:00:00.000Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let selected = select_broadcast(
+            &item,
+            &ScheduleConfig::default(),
+            Some(NaiveDate::from_ymd_opt(2026, 7, 2).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(selected.source, "danime");
+    }
+
+    #[test]
+    fn regional_variants_do_not_count_as_independent_streams() {
+        let item: BangumiDataItem = serde_json::from_str(
+            r#"{
+                "title":"example",
+                "titleTranslate":{},
+                "type":"tv",
+                "begin":"2026-07-04T12:00:00.000Z",
+                "sites":[
+                    {"site":"bangumi","id":"1"},
+                    {"site":"unext","begin":"2026-07-04T12:00:00.000Z"},
+                    {"site":"gamer","begin":"2026-06-27T13:00:00.000Z"},
+                    {"site":"gamer_hk","begin":"2026-06-27T13:00:00.000Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let selected = select_broadcast(
+            &item,
+            &ScheduleConfig::default(),
+            Some(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(selected.source, "unext");
+        assert!(selected.warning.is_some());
     }
 
     #[test]

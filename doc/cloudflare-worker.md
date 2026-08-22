@@ -227,6 +227,8 @@ max_catalog_offset_days = 1
 
 `bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加 `/v0/episodes` 和封面路径。
 
+`stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。AniPulse 会在本地比较 `/data.json` 中的全部候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
+
 调度器和网页封面服务都会读取该配置，因此两个服务都要重启：
 
 ```bash
