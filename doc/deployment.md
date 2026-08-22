@@ -423,6 +423,10 @@ sudo systemctl start anipulse
 
 后台同步失败不会清空现有时间；程序会保留旧排期，默认 15 分钟后重试。可用 `anime show ID` 查看最近同步时间和错误。
 
+常驻服务连续两次无法读取 `bangumi-data` 时，会通过当前通知通道发送一次“数据源异常”告警。同一轮故障只告警一次；读取恢复后再发送一次“数据源已恢复”。告警期间已有排期和 Bilibili 视频检查继续工作，只是自动排期暂时不能刷新。数据库迁移会在新版本首次启动时自动创建告警状态表，无需手工执行 SQL。
+
+日志中的 `Bangumi episode API timed out; using broadcast recurrence` 不会触发该告警：它表示章节日期校准不可用，但 `bangumi-data` 给出的周播递推仍然有效。只有 `bangumi-data` 目录本身连续读取失败才会告警。
+
 ### 通知一直是 pending
 
 发送失败时 AniPulse 会记录简化错误、保留 pending，并按指数退避再次发送。修复飞书配置后无需修改数据库，等待重试或重启服务即可。

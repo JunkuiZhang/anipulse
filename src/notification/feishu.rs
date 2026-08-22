@@ -13,6 +13,7 @@ use super::Notifier;
 use crate::{
     domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
+    repository::PendingSourceAlert,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -114,6 +115,13 @@ impl FeishuWebhookNotifier {
         json!({
             "msg_type": "interactive",
             "card": review_card(event)
+        })
+    }
+
+    fn source_alert_payload(event: &PendingSourceAlert) -> Value {
+        json!({
+            "msg_type": "interactive",
+            "card": source_alert_card(event)
         })
     }
 }
@@ -274,6 +282,74 @@ pub(super) fn review_card(event: &PendingReviewNotification) -> Value {
     })
 }
 
+pub(super) fn source_alert_card(event: &PendingSourceAlert) -> Value {
+    let (template, title, content, note) = match event.alert_state.as_str() {
+        "failure_pending" => {
+            let failed_at = event
+                .first_failed_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "未知".into());
+            let error = escape_lark_markdown(&truncate_chars(
+                event.last_error.as_deref().unwrap_or("未知错误"),
+                300,
+            ));
+            (
+                "red",
+                "⚠️ AniPulse 数据源异常",
+                format!(
+                    "**数据源：** {}\n**连续失败：** {} 次\n**首次失败：** {}\n**最近错误：** {}",
+                    escape_lark_markdown(&event.source),
+                    event.consecutive_failures,
+                    failed_at,
+                    error
+                ),
+                "现有排期和 B 站检查会继续运行，但自动排期暂不刷新。",
+            )
+        }
+        "recovery_pending" => (
+            "green",
+            "✅ AniPulse 数据源已恢复",
+            format!(
+                "**数据源：** {}\n**恢复时间：** {}",
+                escape_lark_markdown(&event.source),
+                event.last_checked_at.to_rfc3339()
+            ),
+            "自动排期刷新已恢复正常。",
+        ),
+        _ => (
+            "grey",
+            "AniPulse 数据源状态",
+            format!("**数据源：** {}", escape_lark_markdown(&event.source)),
+            "收到了一条无法识别的数据源状态。",
+        ),
+    };
+    json!({
+        "config": {
+            "wide_screen_mode": true
+        },
+        "header": {
+            "template": template,
+            "title": {
+                "tag": "plain_text",
+                "content": title
+            }
+        },
+        "elements": [{
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": content
+            }
+        }, {
+            "tag": "note",
+            "elements": [{
+                "tag": "plain_text",
+                "content": note
+            }]
+        }]
+    })
+}
+
 #[async_trait]
 impl Notifier for FeishuWebhookNotifier {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()> {
@@ -286,6 +362,10 @@ impl Notifier for FeishuWebhookNotifier {
 
     async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
         self.send_payload(Self::review_payload(event)).await
+    }
+
+    async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()> {
+        self.send_payload(Self::source_alert_payload(event)).await
     }
 }
 
@@ -398,6 +478,24 @@ mod tests {
         assert!(serialized.contains("打开审核页"));
         assert!(serialized.contains("/review/episodes/1"));
         assert!(serialized.contains("不会直接修改"));
+    }
+
+    #[test]
+    fn source_failure_card_explains_degraded_behavior() {
+        let event = PendingSourceAlert {
+            source: "bangumi-data".into(),
+            alert_state: "failure_pending".into(),
+            consecutive_failures: 2,
+            first_failed_at: Some(Utc::now()),
+            last_checked_at: Utc::now(),
+            last_error: Some("catalog request timed out".into()),
+        };
+        let payload = FeishuWebhookNotifier::source_alert_payload(&event);
+        assert_eq!(payload["card"]["header"]["template"], "red");
+        let serialized = payload.to_string();
+        assert!(serialized.contains("bangumi-data"));
+        assert!(serialized.contains("catalog request timed out"));
+        assert!(serialized.contains("B 站检查会继续运行"));
     }
 
     #[tokio::test]

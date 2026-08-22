@@ -15,6 +15,8 @@ use crate::{
 };
 
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
+const CATALOG_SOURCE: &str = "bangumi-data";
+const SOURCE_ALERT_FAILURE_THRESHOLD: i64 = 2;
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
@@ -295,7 +297,7 @@ impl ScheduleSynchronizer {
         if ids.is_empty() {
             return Ok(());
         }
-        let catalog = match self.provider.load_catalog().await {
+        let catalog = match self.load_catalog_with_health().await {
             Ok(catalog) => catalog,
             Err(error) => {
                 for anime_id in ids {
@@ -315,8 +317,29 @@ impl ScheduleSynchronizer {
     }
 
     pub async fn sync_now(&self, anime_id: i64) -> Result<()> {
-        let catalog = self.provider.load_catalog().await?;
+        let catalog = self.load_catalog_with_health().await?;
         self.sync_with_catalog(anime_id, &catalog).await
+    }
+
+    async fn load_catalog_with_health(&self) -> Result<ScheduleCatalog> {
+        match self.provider.load_catalog().await {
+            Ok(catalog) => {
+                self.repository
+                    .record_source_success(CATALOG_SOURCE)
+                    .await?;
+                Ok(catalog)
+            }
+            Err(error) => {
+                self.repository
+                    .record_source_failure(
+                        CATALOG_SOURCE,
+                        &error.to_string(),
+                        SOURCE_ALERT_FAILURE_THRESHOLD,
+                    )
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     async fn sync_with_catalog(&self, anime_id: i64, catalog: &ScheduleCatalog) -> Result<()> {

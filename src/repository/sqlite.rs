@@ -98,6 +98,16 @@ pub struct ManagementJob {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct PendingSourceAlert {
+    pub source: String,
+    pub alert_state: String,
+    pub consecutive_failures: i64,
+    pub first_failed_at: Option<DateTime<Utc>>,
+    pub last_checked_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct WebAdmin {
     pub id: i64,
     pub username: String,
@@ -2273,6 +2283,176 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn record_source_failure(
+        &self,
+        source: &str,
+        error: &str,
+        alert_after_failures: i64,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let safe_error: String = error.chars().take(500).collect();
+        sqlx::query(
+            r#"INSERT INTO source_health(
+                   source, consecutive_failures, first_failed_at, last_checked_at,
+                   last_error, alert_attempts, next_alert_attempt_at, alert_state
+               ) VALUES (?, 1, ?, ?, ?, 0, NULL,
+                   CASE WHEN ? <= 1 THEN 'failure_pending' ELSE 'none' END)
+               ON CONFLICT(source) DO UPDATE SET
+                   consecutive_failures = source_health.consecutive_failures + 1,
+                   first_failed_at = COALESCE(source_health.first_failed_at, excluded.first_failed_at),
+                   last_checked_at = excluded.last_checked_at,
+                   last_error = excluded.last_error,
+                   alert_attempts = CASE
+                       WHEN source_health.alert_state IN ('none', 'recovery_pending') THEN 0
+                       ELSE source_health.alert_attempts
+                   END,
+                   next_alert_attempt_at = CASE
+                       WHEN source_health.alert_state IN ('none', 'recovery_pending') THEN NULL
+                       ELSE source_health.next_alert_attempt_at
+                   END,
+                   alert_state = CASE
+                       WHEN source_health.alert_state = 'recovery_pending' THEN 'failure_sent'
+                       WHEN source_health.alert_state = 'none'
+                            AND source_health.consecutive_failures + 1 >= ?
+                           THEN 'failure_pending'
+                       ELSE source_health.alert_state
+                   END"#,
+        )
+        .bind(source)
+        .bind(now)
+        .bind(now)
+        .bind(safe_error)
+        .bind(alert_after_failures)
+        .bind(alert_after_failures)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn record_source_success(&self, source: &str) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO source_health(
+                   source, consecutive_failures, first_failed_at, last_checked_at,
+                   last_error, alert_attempts, next_alert_attempt_at, alert_state
+               ) VALUES (?, 0, NULL, ?, NULL, 0, NULL, 'none')
+               ON CONFLICT(source) DO UPDATE SET
+                   consecutive_failures = CASE
+                       WHEN source_health.alert_state IN ('failure_sent', 'recovery_pending')
+                           THEN source_health.consecutive_failures
+                       ELSE 0
+                   END,
+                   first_failed_at = CASE
+                       WHEN source_health.alert_state IN ('failure_sent', 'recovery_pending')
+                           THEN source_health.first_failed_at
+                       ELSE NULL
+                   END,
+                   last_checked_at = excluded.last_checked_at,
+                   last_error = CASE
+                       WHEN source_health.alert_state IN ('failure_sent', 'recovery_pending')
+                           THEN source_health.last_error
+                       ELSE NULL
+                   END,
+                   alert_attempts = CASE
+                       WHEN source_health.alert_state = 'recovery_pending'
+                           THEN source_health.alert_attempts
+                       ELSE 0
+                   END,
+                   next_alert_attempt_at = CASE
+                       WHEN source_health.alert_state = 'recovery_pending'
+                           THEN source_health.next_alert_attempt_at
+                       ELSE NULL
+                   END,
+                   alert_state = CASE
+                       WHEN source_health.alert_state = 'failure_sent' THEN 'recovery_pending'
+                       WHEN source_health.alert_state = 'recovery_pending' THEN 'recovery_pending'
+                       ELSE 'none'
+                   END"#,
+        )
+        .bind(source)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_source_alerts(&self) -> Result<Vec<PendingSourceAlert>> {
+        Ok(sqlx::query_as::<_, PendingSourceAlert>(
+            r#"SELECT source, alert_state, consecutive_failures, first_failed_at,
+                      last_checked_at, last_error
+               FROM source_health
+               WHERE alert_state IN ('failure_pending', 'recovery_pending')
+                 AND (next_alert_attempt_at IS NULL OR next_alert_attempt_at <= ?)
+               ORDER BY last_checked_at, source"#,
+        )
+        .bind(Utc::now())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn mark_source_alert_sent(&self, source: &str, alert_state: &str) -> Result<()> {
+        let result = match alert_state {
+            "failure_pending" => {
+                sqlx::query(
+                    "UPDATE source_health SET alert_state = 'failure_sent', alert_attempts = 0, next_alert_attempt_at = NULL WHERE source = ? AND alert_state = 'failure_pending'",
+                )
+                .bind(source)
+                .execute(&self.pool)
+                .await?
+            }
+            "recovery_pending" => {
+                sqlx::query(
+                    r#"UPDATE source_health SET alert_state = 'none', consecutive_failures = 0,
+                           first_failed_at = NULL, last_error = NULL, alert_attempts = 0,
+                           next_alert_attempt_at = NULL
+                       WHERE source = ? AND alert_state = 'recovery_pending'"#,
+                )
+                .bind(source)
+                .execute(&self.pool)
+                .await?
+            }
+            _ => {
+                return Err(AppError::InvalidInput(format!(
+                    "unsupported source alert state: {alert_state}"
+                )));
+            }
+        };
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(format!(
+                "pending source alert {source}:{alert_state}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn mark_source_alert_failed(&self, source: &str, error: &str) -> Result<()> {
+        let safe_error: String = error.chars().take(500).collect();
+        let attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT alert_attempts FROM source_health WHERE source = ? AND alert_state IN ('failure_pending', 'recovery_pending')",
+        )
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+        let exponent = attempts.clamp(0, 6) as u32;
+        let retry_at = Utc::now() + chrono::Duration::seconds(60 * 2_i64.pow(exponent));
+        sqlx::query(
+            r#"UPDATE source_health
+               SET alert_attempts = alert_attempts + 1,
+                   next_alert_attempt_at = ?,
+                   last_error = CASE
+                       WHEN alert_state = 'failure_pending' THEN last_error
+                       ELSE ?
+                   END
+               WHERE source = ? AND alert_state IN ('failure_pending', 'recovery_pending')"#,
+        )
+        .bind(retry_at)
+        .bind(safe_error)
+        .bind(source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn scheduler_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
         Ok(
             sqlx::query_scalar("SELECT heartbeat_at FROM scheduler_state WHERE name = 'main'")
@@ -2650,6 +2830,81 @@ mod tests {
         repository.clear_provider_failures().await.unwrap();
         repository.record_provider_failure(60, 60).await.unwrap();
         assert!(repository.reserve_provider_request(500).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn source_health_alerts_once_per_outage_and_once_on_recovery() {
+        let (_directory, repository, _anime_id, _episode) = fixture().await;
+
+        repository
+            .record_source_failure("bangumi-data", "first timeout", 2)
+            .await
+            .unwrap();
+        assert!(repository.pending_source_alerts().await.unwrap().is_empty());
+
+        repository
+            .record_source_failure("bangumi-data", "second timeout", 2)
+            .await
+            .unwrap();
+        let pending = repository.pending_source_alerts().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].alert_state, "failure_pending");
+        assert_eq!(pending[0].consecutive_failures, 2);
+        assert_eq!(pending[0].last_error.as_deref(), Some("second timeout"));
+
+        repository
+            .mark_source_alert_failed("bangumi-data", "Feishu timeout")
+            .await
+            .unwrap();
+        assert!(repository.pending_source_alerts().await.unwrap().is_empty());
+        sqlx::query(
+            "UPDATE source_health SET next_alert_attempt_at = ? WHERE source = 'bangumi-data'",
+        )
+        .bind(Utc::now() - chrono::Duration::seconds(1))
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(repository.pending_source_alerts().await.unwrap().len(), 1);
+
+        repository
+            .mark_source_alert_sent("bangumi-data", "failure_pending")
+            .await
+            .unwrap();
+        repository
+            .record_source_failure("bangumi-data", "third timeout", 2)
+            .await
+            .unwrap();
+        assert!(repository.pending_source_alerts().await.unwrap().is_empty());
+
+        repository
+            .record_source_success("bangumi-data")
+            .await
+            .unwrap();
+        let recovered = repository.pending_source_alerts().await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].alert_state, "recovery_pending");
+        assert_eq!(recovered[0].consecutive_failures, 3);
+
+        repository
+            .record_source_success("bangumi-data")
+            .await
+            .unwrap();
+        assert_eq!(repository.pending_source_alerts().await.unwrap().len(), 1);
+        repository
+            .mark_source_alert_sent("bangumi-data", "recovery_pending")
+            .await
+            .unwrap();
+        assert!(repository.pending_source_alerts().await.unwrap().is_empty());
+
+        repository
+            .record_source_failure("bangumi-data", "new outage one", 2)
+            .await
+            .unwrap();
+        repository
+            .record_source_failure("bangumi-data", "new outage two", 2)
+            .await
+            .unwrap();
+        assert_eq!(repository.pending_source_alerts().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

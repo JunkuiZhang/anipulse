@@ -11,7 +11,7 @@ use crate::{
     config::NotificationConfig,
     domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
-    repository::Repository,
+    repository::{PendingSourceAlert, Repository},
 };
 
 use feishu::FeishuWebhookNotifier;
@@ -21,6 +21,7 @@ use feishu_app::FeishuAppNotifier;
 trait Notifier: Send + Sync {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()>;
     async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()>;
+    async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()>;
     async fn test(&self) -> Result<()>;
 }
 
@@ -40,6 +41,11 @@ impl Notifier for NoopNotifier {
 
     async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
         info!(anime = %event.anime_title, episode = event.episode_no, "review notification disabled; marking delivered");
+        Ok(())
+    }
+
+    async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()> {
+        info!(source = %event.source, state = %event.alert_state, "source alert disabled; marking delivered");
         Ok(())
     }
 }
@@ -159,6 +165,38 @@ impl Notifier for ServerChanNotifier {
         };
         self.send(&title, &body).await
     }
+
+    async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()> {
+        let (title, body) = match event.alert_state.as_str() {
+            "failure_pending" => (
+                "⚠️ AniPulse 数据源异常",
+                format!(
+                    "{} 已连续失败 {} 次。\n\n首次失败：{}\n\n最近错误：{}\n\n现有排期和 B 站检查会继续运行，但自动排期暂不刷新。",
+                    event.source,
+                    event.consecutive_failures,
+                    event
+                        .first_failed_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "未知".into()),
+                    event.last_error.as_deref().unwrap_or("未知错误")
+                ),
+            ),
+            "recovery_pending" => (
+                "✅ AniPulse 数据源已恢复",
+                format!(
+                    "{} 已恢复访问，自动排期刷新恢复正常。\n\n恢复时间：{}",
+                    event.source,
+                    event.last_checked_at.to_rfc3339()
+                ),
+            ),
+            state => {
+                return Err(AppError::Notification(format!(
+                    "unsupported source alert state: {state}"
+                )));
+            }
+        };
+        self.send(title, &body).await
+    }
 }
 
 #[derive(Clone)]
@@ -231,6 +269,22 @@ impl NotificationDispatcher {
                         .mark_review_notification_failed(event.id, &error.to_string())
                         .await?;
                     warn!(review_notification_id = event.id, %error, "review notification remains pending");
+                }
+            }
+        }
+        for event in self.repository.pending_source_alerts().await? {
+            match self.notifier.notify_source_alert(&event).await {
+                Ok(()) => {
+                    self.repository
+                        .mark_source_alert_sent(&event.source, &event.alert_state)
+                        .await?;
+                    info!(source = %event.source, state = %event.alert_state, "source alert sent");
+                }
+                Err(error) => {
+                    self.repository
+                        .mark_source_alert_failed(&event.source, &error.to_string())
+                        .await?;
+                    warn!(source = %event.source, state = %event.alert_state, %error, "source alert remains pending");
                 }
             }
         }

@@ -7,11 +7,12 @@ use tokio::sync::Mutex;
 
 use super::{
     Notifier,
-    feishu::{release_card, review_card, test_card},
+    feishu::{release_card, review_card, source_alert_card, test_card},
 };
 use crate::{
     domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
+    repository::PendingSourceAlert,
 };
 
 const FEISHU_API_BASE: &str = "https://open.feishu.cn";
@@ -157,6 +158,10 @@ impl Notifier for FeishuAppNotifier {
 
     async fn notify_review(&self, event: &PendingReviewNotification) -> Result<()> {
         self.send_card(review_card(event)).await
+    }
+
+    async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()> {
+        self.send_card(source_alert_card(event)).await
     }
 }
 
