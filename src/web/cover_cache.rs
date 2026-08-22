@@ -17,12 +17,16 @@ use crate::{
 
 const SERVER_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_COVER_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SUBJECT_PAGE_BYTES: usize = 2 * 1024 * 1024;
+const FALLBACK_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone)]
 pub(super) struct CoverCache {
     directory: PathBuf,
     api_base_url: String,
     client: Client,
+    request_timeout: Duration,
+    fallback_request_timeout: Duration,
     filesystem_guard: Arc<RwLock<()>>,
 }
 
@@ -40,6 +44,7 @@ impl CoverCache {
             .saturating_sub(1)
             .max(1)
             .min(config.schedule.request_timeout_secs);
+        let fallback_timeout_secs = (timeout_secs / 2).clamp(1, 6);
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .user_agent(&config.schedule.user_agent)
@@ -55,6 +60,8 @@ impl CoverCache {
                 .trim_end_matches('/')
                 .into(),
             client,
+            request_timeout: Duration::from_secs(timeout_secs),
+            fallback_request_timeout: Duration::from_secs(fallback_timeout_secs),
             filesystem_guard: Arc::new(RwLock::new(())),
         })
     }
@@ -124,13 +131,46 @@ impl CoverCache {
     }
 
     async fn download(&self, subject_id: i64) -> std::result::Result<CoverAsset, String> {
-        let url = format!(
+        let api_url = format!(
             "{}/v0/subjects/{subject_id}/image?type=medium",
             self.api_base_url
         );
+        let primary = self.download_image_url(api_url, self.request_timeout);
+        let fallback = async {
+            tokio::time::sleep(FALLBACK_DELAY).await;
+            let cover_url = self.discover_cover_url(subject_id).await?;
+            self.download_image_url(cover_url, self.fallback_request_timeout)
+                .await
+        };
+        tokio::pin!(primary);
+        tokio::pin!(fallback);
+        let asset = tokio::select! {
+            result = &mut primary => match result {
+                Ok(asset) => asset,
+                Err(primary_error) => fallback.await.map_err(|fallback_error| {
+                    format!("{primary_error}; official subject page fallback failed: {fallback_error}")
+                })?,
+            },
+            result = &mut fallback => match result {
+                Ok(asset) => asset,
+                Err(fallback_error) => primary.await.map_err(|primary_error| {
+                    format!("{primary_error}; official subject page fallback failed: {fallback_error}")
+                })?,
+            },
+        };
+        self.store(subject_id, &asset.bytes).await?;
+        Ok(asset)
+    }
+
+    async fn download_image_url(
+        &self,
+        url: String,
+        timeout: Duration,
+    ) -> std::result::Result<CoverAsset, String> {
         let mut response = self
             .client
-            .get(url)
+            .get(&url)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|error| format!("Bangumi cover request failed: {error}"))?;
@@ -160,8 +200,37 @@ impl CoverCache {
         }
         let asset = asset_from_bytes(bytes)
             .ok_or_else(|| "Bangumi returned an unsupported image format".to_string())?;
-        self.store(subject_id, &asset.bytes).await?;
         Ok(asset)
+    }
+
+    async fn discover_cover_url(&self, subject_id: i64) -> std::result::Result<String, String> {
+        let mut response = self
+            .client
+            .get(format!("https://bgm.tv/subject/{subject_id}"))
+            .timeout(self.fallback_request_timeout)
+            .send()
+            .await
+            .map_err(|error| format!("Bangumi subject page request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Bangumi subject page returned HTTP {}",
+                response.status()
+            ));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("Bangumi subject page download failed: {error}"))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_SUBJECT_PAGE_BYTES {
+                return Err("Bangumi subject page exceeds the 2 MiB limit".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let html = String::from_utf8_lossy(&body);
+        extract_official_cover_url(&html)
+            .ok_or_else(|| "Bangumi subject page contains no official cover URL".into())
     }
 
     async fn store(&self, subject_id: i64, bytes: &[u8]) -> std::result::Result<(), String> {
@@ -270,6 +339,38 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn extract_official_cover_url(html: &str) -> Option<String> {
+    for prefix in ["https://lain.bgm.tv/", "//lain.bgm.tv/"] {
+        for (start, _) in html.match_indices(prefix) {
+            let tail = &html[start..];
+            let end = tail
+                .find(|character: char| {
+                    matches!(
+                        character,
+                        '\"' | '\'' | '<' | '>' | ' ' | '\t' | '\r' | '\n'
+                    )
+                })
+                .unwrap_or(tail.len());
+            let candidate = &tail[..end];
+            let candidate = if candidate.starts_with("//") {
+                format!("https:{candidate}")
+            } else {
+                candidate.to_string()
+            };
+            let Ok(url) = url::Url::parse(&candidate) else {
+                continue;
+            };
+            if url.scheme() == "https"
+                && url.host_str() == Some("lain.bgm.tv")
+                && url.path().contains("/pic/cover/")
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn cache_error(path: &Path, operation: &str, error: std::io::Error) -> AppError {
     AppError::Config(format!(
         "cannot {operation} cover cache path {}: {error}",
@@ -299,6 +400,23 @@ mod tests {
             Some("image/png")
         );
         assert_eq!(image_content_type(b"not an image"), None);
+    }
+
+    #[test]
+    fn extracts_only_official_bangumi_cover_urls() {
+        assert_eq!(
+            extract_official_cover_url(
+                r#"<a href="//lain.bgm.tv/pic/cover/l/14/a1/622206_pNnzQ.jpg">cover</a>"#
+            )
+            .as_deref(),
+            Some("https://lain.bgm.tv/pic/cover/l/14/a1/622206_pNnzQ.jpg")
+        );
+        assert!(
+            extract_official_cover_url(
+                r#"<img src="https://evil.example/pic/cover/l/not-bangumi.jpg">"#
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

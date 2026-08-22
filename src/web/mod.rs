@@ -302,10 +302,9 @@ fn cover_placeholder_response() -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("image/svg+xml; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=300"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -1001,6 +1000,8 @@ async fn anime_delete(
 #[derive(Deserialize, Default)]
 struct CandidateQuery {
     state: Option<String>,
+    result: Option<String>,
+    changed: Option<u64>,
 }
 
 struct CandidateView {
@@ -1028,6 +1029,7 @@ struct CandidateTemplate {
     items: Vec<CandidateView>,
     pending_selected: bool,
     all_selected: bool,
+    notice: String,
 }
 
 async fn candidate_list(
@@ -1048,12 +1050,24 @@ async fn candidate_list(
         .into_iter()
         .map(candidate_view)
         .collect();
+    let notice = match query.result.as_deref() {
+        Some("uploader-blocked") => format!(
+            "已屏蔽此 UP，并拒绝其当前 {} 个待审核候选。以后发现该 UP 的视频也会自动排除。",
+            query.changed.unwrap_or(0)
+        ),
+        Some("uploader-trusted") => {
+            "已信任此 UP；以后符合番剧、集数和时长条件的视频可以自动确认。".into()
+        }
+        Some("candidate-rejected") => "已拒绝该候选。".into(),
+        _ => String::new(),
+    };
     render(CandidateTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
         items,
         pending_selected: selected == "pending",
         all_selected: selected == "all",
+        notice,
     })
 }
 
@@ -1175,7 +1189,7 @@ async fn uploader_trust(
         serde_json::json!({}),
     )
     .await?;
-    Ok(Redirect::to("/candidates?state=pending").into_response())
+    Ok(Redirect::to("/candidates?state=pending&result=uploader-trusted").into_response())
 }
 
 async fn uploader_block(
@@ -1186,20 +1200,20 @@ async fn uploader_block(
     Form(form): Form<CsrfForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
-    state
-        .application
-        .set_uploader_flag(anime_id, mid, false, true)
-        .await?;
+    let rejected = state.application.block_uploader(anime_id, mid).await?;
     audit_success_string(
         &state,
         &identity,
         "uploader.block",
         "uploader",
         &format!("{anime_id}:{mid}"),
-        serde_json::json!({}),
+        serde_json::json!({"rejected_candidates": rejected}),
     )
     .await?;
-    Ok(Redirect::to("/candidates?state=pending").into_response())
+    Ok(Redirect::to(&format!(
+        "/candidates?state=pending&result=uploader-blocked&changed={rejected}"
+    ))
+    .into_response())
 }
 
 async fn candidate_reject(
@@ -1220,7 +1234,7 @@ async fn candidate_reject(
         serde_json::json!({}),
     )
     .await?;
-    Ok(Redirect::to("/candidates?state=pending").into_response())
+    Ok(Redirect::to("/candidates?state=pending&result=candidate-rejected").into_response())
 }
 
 struct ReviewCandidate {
@@ -2048,7 +2062,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/static/app.css?v=light-1")
+                    .uri("/static/app.css?v=light-2")
                     .body(Body::empty())
                     .unwrap(),
             )

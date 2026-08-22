@@ -2,6 +2,7 @@
 {% block title %}候选 · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">REVIEW QUEUE</p><h1>候选审核</h1><p class="page-description">在自动判断不够确定时，由你做最后决定。</p></div></div>
+{% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
 <div class="filter" aria-label="候选筛选"><a {% if pending_selected %}class="selected"{% endif %} href="/candidates?state=pending">待审核</a><a {% if all_selected %}class="selected"{% endif %} href="/candidates?state=all">全部记录</a></div>
 <div class="candidate-list">
 {% for item in items %}

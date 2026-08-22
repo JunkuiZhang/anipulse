@@ -70,7 +70,7 @@ dangerous_allow_public_bind = false
 
 `public_url` 必须和浏览器实际访问的 origin 完全一致，包括非默认端口。生产环境必须是 HTTPS；不要为了省略反向代理而把 `development_mode` 或 `dangerous_allow_public_bind` 打开。
 
-`cover_cache_dir = "covers"` 会把 Bangumi 封面保存到 `/var/lib/anipulse/covers`（相对路径以 systemd 的 `WorkingDirectory` 为基准）。第一次显示某张封面时由网页进程下载，服务器缓存 7 天；上游临时不可用时会继续返回已经存在的旧图。浏览器收到 `Cache-Control: private, max-age=86400` 和 ETag，会缓存 1 天，过期后通常只向 AniPulse 做条件校验，不会再次下载完整图片。缓存单图上限为 5 MiB，只接受常见位图格式。
+`cover_cache_dir = "covers"` 会把 Bangumi 封面保存到 `/var/lib/anipulse/covers`（相对路径以 systemd 的 `WorkingDirectory` 为基准）。第一次显示某张封面时由网页进程下载，服务器缓存 7 天；图片 API 失败时会并行尝试从 Bangumi 官方条目页发现封面，上游临时不可用时则继续返回已经存在的旧图。浏览器收到 `Cache-Control: private, max-age=86400` 和 ETag，会缓存 1 天，过期后通常只向 AniPulse 做条件校验，不会再次下载完整图片。缓存单图上限为 5 MiB，只接受常见位图格式；下载失败占位图不缓存，刷新页面即可重试。
 
 网页进程会在启动时和此后每小时对照数据库清理缓存；网页中永久删除追番后还会立即清理。只有当同一个 Bangumi subject ID 不再被任何追番引用时才删除对应文件，因此重复绑定不会误删共享封面。通过 CLI 删除的缓存最迟在一小时后清理，也可以重启 `anipulse-web.service` 立即触发。缓存目录中 AniPulse 不认识的其他扩展名文件不会被删除。
 
@@ -195,6 +195,8 @@ sudo systemctl restart anipulse.service
 
 在审核页可以选择一个候选、将页面当时展示的候选全部拒绝，或提交规范的 B 站 HTTPS `/video/BV...` 链接。链接由 scheduler 获取真实标题、UP 和时长后保存为待确认候选，你还需要在页面上最终点一次确认。
 
+候选列表中的“屏蔽此 UP”只对当前番剧生效：它会在一个事务中记录屏蔽状态，并拒绝该 UP 在此番剧下已有的全部待审核候选；以后检测到的候选也会自动排除。操作完成后页面会显示结果提示。“信任此 UP”同样只对当前番剧生效。
+
 ## 9. 升级、回滚和日志
 
 以后升级网页 schema：
@@ -233,6 +235,17 @@ sudo tail -f /var/log/caddy/anipulse-access.log
 ### 添加追番一直显示“后台解析中”
 
 自动排期解析由 scheduler 的任务执行。确认 `anipulse.service` 正常、有 Bangumi 网络访问，并在“任务”页查看错误。修复后重新走一次添加向导即可；15 分钟未确认的 draft 会过期。
+
+### 封面一直显示“封面稍后重试”
+
+先刷新页面；失败占位图不会被浏览器缓存。然后查看网页服务记录的两个官方来源错误：
+
+```bash
+sudo journalctl -u anipulse-web.service -n 100 --no-pager \
+  | grep -E 'cover unavailable|cover refresh'
+```
+
+服务器至少需要能够通过 HTTPS 访问 `api.bgm.tv`，或者同时访问 `bgm.tv` 与 `lain.bgm.tv`。成功一次后图片会写入本地缓存，之后即使上游暂时失败也会继续显示旧图。
 
 ### 飞书卡片按钮打不开
 

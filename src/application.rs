@@ -162,6 +162,10 @@ impl ApplicationService {
             .await
     }
 
+    pub async fn block_uploader(&self, anime_id: i64, mid: i64) -> Result<u64> {
+        self.repository.block_uploader(anime_id, mid).await
+    }
+
     pub async fn enqueue_job(
         &self,
         kind: ManagementJobKind,

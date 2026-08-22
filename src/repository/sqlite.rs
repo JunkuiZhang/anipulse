@@ -747,6 +747,78 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn block_uploader(&self, anime_id: i64, mid: i64) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let anime_exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM anime WHERE id = ?)")
+                .bind(anime_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !anime_exists {
+            return Err(AppError::NotFound(format!("anime {anime_id}")));
+        }
+        let uploader_name = sqlx::query_scalar::<_, String>(
+            r#"SELECT c.uploader_name
+               FROM candidate c JOIN episode e ON e.id = c.episode_id
+               WHERE e.anime_id = ? AND c.uploader_mid = ?
+               ORDER BY c.last_seen_at DESC LIMIT 1"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO uploader_trust(
+                anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
+            ) VALUES (?, ?, ?, 0, 1)
+            ON CONFLICT(anime_id, uploader_mid) DO UPDATE SET
+                uploader_name = COALESCE(excluded.uploader_name, uploader_trust.uploader_name),
+                manually_trusted = 0,
+                manually_blocked = 1"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .bind(uploader_name)
+        .execute(&mut *tx)
+        .await?;
+        let rejected = sqlx::query(
+            r#"UPDATE candidate SET state = 'rejected'
+               WHERE state = 'pending' AND uploader_mid = ?
+                 AND episode_id IN (SELECT id FROM episode WHERE anime_id = ?)"#,
+        )
+        .bind(mid)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            r#"UPDATE episode SET state = 'watching'
+               WHERE anime_id = ? AND state IN ('candidate_found','needs_manual_review')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM candidate c
+                   WHERE c.episode_id = episode.id AND c.state = 'pending'
+                 )"#,
+        )
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE review_notification SET status = 'cancelled'
+               WHERE status = 'pending' AND episode_id IN (
+                 SELECT e.id FROM episode e
+                 WHERE e.anime_id = ? AND NOT EXISTS (
+                   SELECT 1 FROM candidate c
+                   WHERE c.episode_id = e.id AND c.state = 'pending'
+                 )
+               )"#,
+        )
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rejected)
+    }
+
     pub async fn confirm_candidate(
         &self,
         episode_id: i64,
@@ -2387,5 +2459,44 @@ mod tests {
             repository.delete_anime(anime_id).await,
             Err(AppError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn blocking_uploader_rejects_existing_pending_candidates() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (candidate, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .set_episode_manual_review(episode.id)
+            .await
+            .unwrap();
+
+        let rejected = repository
+            .block_uploader(anime_id, candidate.uploader_mid)
+            .await
+            .unwrap();
+
+        assert_eq!(rejected, 1);
+        assert!(
+            repository
+                .active_candidates(episode.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let trust = repository
+            .uploader_trust(anime_id, candidate.uploader_mid)
+            .await
+            .unwrap();
+        assert!(trust.manually_blocked);
+        assert!(!trust.manually_trusted);
+        assert_eq!(trust.uploader_name.as_deref(), Some("test up"));
+        assert_eq!(
+            repository.episode(episode.id).await.unwrap().state,
+            "watching"
+        );
     }
 }

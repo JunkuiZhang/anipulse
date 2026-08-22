@@ -632,6 +632,16 @@ input:focus {
   color: #8d5240;
 }
 
+.notice {
+  margin-bottom: 18px;
+  padding: 13px 16px;
+  border: 1px solid rgba(79, 138, 114, 0.28);
+  border-radius: 11px;
+  background: var(--ok-soft);
+  color: #386b57;
+  box-shadow: 0 8px 24px rgba(73, 84, 91, 0.06);
+}
+
 .login-page { display: grid; place-items: center; }
 
 .login-card {
