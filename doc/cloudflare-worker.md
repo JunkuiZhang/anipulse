@@ -1,0 +1,234 @@
+# 使用 Cloudflare Worker 转发 Bangumi 数据
+
+这个方案不替换 AniPulse 的排期来源：排期仍然来自 `bangumi-data`，章节日期和封面仍然来自 Bangumi。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
+
+```text
+阿里云 AniPulse
+  └── https://bgm-proxy.example.com
+        ├── /data.json                  → unpkg 上的 bangumi-data
+        ├── /bangumi/v0/episodes        → api.bgm.tv 章节 API
+        └── /bangumi/v0/subjects/...    → api.bgm.tv，并在 Worker 内跟随封面重定向
+```
+
+Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不是通用反向代理：只接受 AniPulse 当前使用的三个固定路由、严格校验查询参数，并只允许配置的服务器出口 IP。
+
+## 1. 前提
+
+- 域名的 DNS Zone 已托管在 Cloudflare；
+- 准备一个没有被其他服务占用的子域名，例如 `bgm-proxy.example.com`；
+- 阿里云 ECS 有稳定的公网出口 IPv4 或 IPv6；
+- 部署电脑有 Node.js 20 或更高版本。Node 只用于运行 Wrangler，不需要安装到 ECS。
+
+可以从阿里云控制台确认实例公网 IP。若实例通过 NAT 网关出站，应填写 NAT 网关的出口 IP，而不是实例内网地址。
+
+普通 Cloudflare 全球网络不等于 [Cloudflare 中国网络](https://developers.cloudflare.com/china-network/)。个人免费方案通常可以从大陆访问，但跨境链路没有可用性保证；真正的中国网络是 Enterprise 的独立订阅，并要求 ICP。AniPulse 的数据源故障飞书告警仍然应当保留。
+
+Workers Free 当前包含每天 100,000 次请求，对个人 AniPulse 足够使用；具体额度以 Cloudflare 的 [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/) 为准。
+
+## 2. 本地测试 Worker
+
+进入 Worker 目录：
+
+```bash
+cd deploy/cloudflare-worker
+cp .dev.vars.example .dev.vars
+```
+
+将 `.dev.vars` 中的 `UPSTREAM_USER_AGENT` 改成自己的稳定标识。`.dev.vars` 已被 Git 忽略，不要提交实际配置。
+
+运行不需要网络和第三方测试库的单元测试：
+
+```bash
+npm test
+```
+
+需要本地启动时执行：
+
+```bash
+npm run dev
+```
+
+本地请求来自 `127.0.0.1` 或 `::1`，示例 allowlist 已包含它们。
+
+## 3. 登录并部署
+
+```bash
+cd deploy/cloudflare-worker
+npx wrangler@latest login
+npx wrangler@latest deploy
+```
+
+`wrangler.jsonc` 默认关闭 `workers.dev` 公网地址。首次部署后 Worker 还没有对外入口，这是刻意的；下一步使用自己的子域名。
+
+设置仅允许访问 Worker 的阿里云出口 IP。命令会提示输入值，多个地址用英文逗号分隔：
+
+```bash
+npx wrangler@latest secret put ALLOWED_CLIENT_IPS
+```
+
+输入示例：
+
+```text
+47.120.50.146,2001:db8::10
+```
+
+再设置 Bangumi 要求的可识别 User-Agent：
+
+```bash
+npx wrangler@latest secret put UPSTREAM_USER_AGENT
+```
+
+输入示例：
+
+```text
+你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted via Cloudflare Worker)
+```
+
+Worker 没有配置 `ALLOWED_CLIENT_IPS` 时会 fail closed，所有请求返回 HTTP 503；IP 不在名单中时返回 HTTP 403。
+
+## 4. 绑定自定义域名
+
+进入 Cloudflare Dashboard：
+
+1. 打开 **Workers & Pages**；
+2. 选择 `anipulse-bangumi-proxy`；
+3. 打开 **Settings → Domains & Routes**；
+4. 添加 **Custom Domain**；
+5. 输入 `bgm-proxy.example.com`。
+
+Cloudflare 会为该子域名创建 DNS 记录和 TLS 证书。这个子域名的源站就是 Worker，不要再将它解析到阿里云或其他服务器。
+
+Cloudflare 官方也建议生产 Worker 使用 [Custom Domain 或 Route](https://developers.cloudflare.com/workers/configuration/routing/)，而不是把 `workers.dev` 当作正式入口。
+
+## 5. 从阿里云验证
+
+以下命令必须在 ECS 上执行，因为本机 IP 默认不在 allowlist 中。
+
+检查 Worker：
+
+```bash
+curl -fsS https://bgm-proxy.example.com/healthz
+```
+
+预期：
+
+```json
+{"ok":true,"service":"anipulse-bangumi-proxy"}
+```
+
+检查 `bangumi-data`，避免把完整 JSON 打到终端：
+
+```bash
+curl -fsS -D /tmp/anipulse-worker-data.headers \
+  -o /tmp/anipulse-worker-data.json \
+  https://bgm-proxy.example.com/data.json
+wc -c /tmp/anipulse-worker-data.json
+grep -i x-anipulse-proxy-cache /tmp/anipulse-worker-data.headers
+```
+
+检查章节 API：
+
+```bash
+curl -fsS \
+  'https://bgm-proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=1&offset=8'
+```
+
+检查封面。Worker 必须直接返回 `image/*`，而不是将客户端重定向到 `lain.bgm.tv`：
+
+```bash
+curl -fsS -D /tmp/anipulse-worker-cover.headers \
+  -o /tmp/anipulse-worker-cover \
+  'https://bgm-proxy.example.com/bangumi/v0/subjects/622206/image?type=medium'
+file /tmp/anipulse-worker-cover
+grep -iE 'content-type|x-anipulse-proxy-cache' /tmp/anipulse-worker-cover.headers
+```
+
+第一次通常显示 `X-AniPulse-Proxy-Cache: MISS`，同一 Cloudflare 节点的后续请求应显示 `HIT`。Cloudflare Cache API 是按边缘节点缓存，因此换网络或换地区后首次请求仍可能是 `MISS`。
+
+## 6. 修改 AniPulse 配置
+
+先备份配置：
+
+```bash
+sudo cp -a /etc/anipulse/config.toml /etc/anipulse/config.toml.before-worker
+```
+
+编辑 `/etc/anipulse/config.toml`：
+
+```toml
+[schedule]
+bangumi_data_url = "https://bgm-proxy.example.com/data.json"
+bangumi_api_base_url = "https://bgm-proxy.example.com/bangumi"
+```
+
+`bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加 `/v0/episodes` 和封面路径。
+
+调度器和网页封面服务都会读取该配置，因此两个服务都要重启：
+
+```bash
+sudo systemctl restart anipulse.service anipulse-web.service
+sudo systemctl --no-pager --full status anipulse.service anipulse-web.service
+```
+
+手工同步一个自动排期条目：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  anime sync 1
+```
+
+然后刷新网页封面并检查日志：
+
+```bash
+sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
+```
+
+如果封面之前一直是占位图，成功请求后会写入 `/var/lib/anipulse/covers`。浏览器随后继续通过 AniPulse 自己的 `/covers/{subject_id}` 读取服务器本地缓存，不会直接访问 Worker。
+
+## 7. 缓存策略
+
+Worker 使用以下边缘缓存时间：
+
+| 内容 | Cloudflare 边缘缓存 | 返回给客户端的缓存 |
+|---|---:|---:|
+| `bangumi-data` | 6 小时 | 5 分钟 |
+| 章节日期 | 15 分钟 | 1 分钟 |
+| 封面 | 30 天 | 1 天 |
+
+封面下载到 AniPulse 服务器后，还有现有的 7 天服务器缓存和浏览器条件缓存。删除番剧时，AniPulse 会按现有清理逻辑删除不再被数据库引用的本地封面；Cloudflare 上的匿名公共封面缓存会在 TTL 到期后自然淘汰。
+
+需要立即绕过旧 Worker 缓存时，在 Worker 的 Variables and Secrets 中添加或修改普通变量 `CACHE_VERSION`，例如从 `v1` 改为 `v2`。新版本会使用新的 cache key，不需要修改 AniPulse URL。
+
+## 8. 故障排查
+
+### HTTP 403
+
+阿里云实际出口 IP 不在 `ALLOWED_CLIENT_IPS`。通过阿里云控制台或 NAT 网关配置确认出口地址，然后重新执行：
+
+```bash
+npx wrangler@latest secret put ALLOWED_CLIENT_IPS
+```
+
+### HTTP 503
+
+Worker 没有配置 `ALLOWED_CLIENT_IPS`，或者配置值为空。
+
+### HTTP 404
+
+路径或查询参数不属于 AniPulse allowlist。章节 API 只允许 `subject_id`、`type=0`、`limit=1`、`offset`；封面只允许 `type=medium`。
+
+### HTTP 502/504
+
+上游返回错误、内容类型异常、内容超过限制，或者 Worker 到上游超时。查看 Cloudflare Worker Logs，同时保留 AniPulse 飞书数据源告警。Worker 不会把上游错误正文或内部重定向地址直接暴露给客户端。
+
+### 回滚
+
+恢复配置并重启两个服务：
+
+```bash
+sudo cp -a /etc/anipulse/config.toml.before-worker /etc/anipulse/config.toml
+sudo systemctl restart anipulse.service anipulse-web.service
+```
+
+回滚只改变网络入口，不修改 SQLite、追番、排期或本地封面缓存。
