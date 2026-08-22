@@ -42,6 +42,31 @@ pub struct CandidateListRow {
     pub url: String,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct BlockedKeywordRow {
+    pub id: i64,
+    pub keyword: String,
+    pub normalized_keyword: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct TrustedUploaderRow {
+    pub anime_id: i64,
+    pub anime_title: String,
+    pub uploader_mid: i64,
+    pub uploader_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EpisodeRepairSummary {
+    pub episode_no: i64,
+    pub expired_candidates: u64,
+    pub removed_notifications: u64,
+    pub removed_future_episodes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DashboardStats {
     pub anime_count: i64,
@@ -279,6 +304,62 @@ impl Repository {
         .await?)
     }
 
+    pub async fn list_blocked_keywords(&self) -> Result<Vec<BlockedKeywordRow>> {
+        Ok(sqlx::query_as::<_, BlockedKeywordRow>(
+            "SELECT * FROM blocked_keyword ORDER BY normalized_keyword, id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn add_blocked_keyword(&self, keyword: &str, normalized: &str) -> Result<i64> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "INSERT INTO blocked_keyword(keyword, normalized_keyword, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(keyword)
+        .bind(normalized)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(map_unique_rule_error)?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_blocked_keyword(
+        &self,
+        id: i64,
+        keyword: &str,
+        normalized: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE blocked_keyword SET keyword = ?, normalized_keyword = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(keyword)
+        .bind(normalized)
+        .bind(Utc::now())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_unique_rule_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!("blocked keyword {id}")));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_blocked_keyword(&self, id: i64) -> Result<()> {
+        let result = sqlx::query("DELETE FROM blocked_keyword WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!("blocked keyword {id}")));
+        }
+        Ok(())
+    }
+
     pub async fn get_anime(&self, anime_id: i64) -> Result<AnimeWithAliases> {
         let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
             .bind(anime_id)
@@ -426,6 +507,109 @@ impl Repository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("active episode for anime {anime_id}")))
+    }
+
+    pub async fn repair_current_episode(
+        &self,
+        anime_id: i64,
+        expected_current_episode_id: i64,
+        target_episode_no: i64,
+    ) -> Result<EpisodeRepairSummary> {
+        if target_episode_no <= 0 || target_episode_no > 10_000 {
+            return Err(AppError::InvalidInput(
+                "target episode must be between 1 and 10000".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let enabled = sqlx::query_scalar::<_, bool>("SELECT enabled FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if enabled {
+            return Err(AppError::InvalidInput(
+                "anime must be disabled before repairing its episode state".into(),
+            ));
+        }
+        let current = sqlx::query_as::<_, Episode>(
+            r#"SELECT * FROM episode
+               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+               ORDER BY episode_no LIMIT 1"#,
+        )
+        .bind(anime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("active episode for anime {anime_id}")))?;
+        if current.id != expected_current_episode_id {
+            return Err(AppError::InvalidInput(
+                "current episode changed; inspect the anime and retry".into(),
+            ));
+        }
+        if target_episode_no > current.episode_no {
+            return Err(AppError::InvalidInput(
+                "repair can only reset to the current or an earlier existing episode".into(),
+            ));
+        }
+        let target = sqlx::query_as::<_, Episode>(
+            "SELECT * FROM episode WHERE anime_id = ? AND episode_no = ?",
+        )
+        .bind(anime_id)
+        .bind(target_episode_no)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("anime {anime_id} episode {target_episode_no}"))
+        })?;
+        let expired_candidates = sqlx::query(
+            "UPDATE candidate SET state = 'expired' WHERE episode_id = ? AND state IN ('pending','confirmed')",
+        )
+        .bind(target.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let removed_notifications = sqlx::query("DELETE FROM notification WHERE episode_id = ?")
+            .bind(target.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query(
+            "UPDATE review_notification SET status = 'cancelled' WHERE episode_id = ? AND status = 'pending'",
+        )
+        .bind(target.id)
+        .execute(&mut *tx)
+        .await?;
+        let removed_future_episodes =
+            sqlx::query("DELETE FROM episode WHERE anime_id = ? AND episode_no > ?")
+                .bind(anime_id)
+                .bind(target_episode_no)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        sqlx::query(
+            r#"UPDATE episode SET state = 'waiting', next_check_at = ?,
+                   first_candidate_at = NULL, confirmed_at = NULL, notified_at = NULL
+               WHERE id = ?"#,
+        )
+        .bind(now)
+        .bind(target.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE anime SET updated_at = ?, schedule_next_sync_at = CASE WHEN auto_schedule = 1 THEN ? ELSE schedule_next_sync_at END WHERE id = ?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(EpisodeRepairSummary {
+            episode_no: target_episode_no,
+            expired_candidates,
+            removed_notifications,
+            removed_future_episodes,
+        })
     }
 
     pub async fn episode(&self, episode_id: i64) -> Result<Episode> {
@@ -675,8 +859,11 @@ impl Repository {
                    FROM candidate c
                    JOIN episode e ON e.id = c.episode_id
                    JOIN anime a ON a.id = e.anime_id
-                   WHERE c.state = ? ORDER BY c.last_seen_at DESC"#,
+                   WHERE c.state = ?
+                     AND (? != 'pending' OR e.state NOT IN ('confirmed', 'notified'))
+                   ORDER BY c.last_seen_at DESC"#,
             )
+            .bind(state)
             .bind(state)
             .fetch_all(&self.pool)
             .await?
@@ -697,14 +884,42 @@ impl Repository {
     }
 
     pub async fn candidate_context(&self, bvid: &str) -> Result<(StoredCandidate, Episode)> {
-        let candidate = sqlx::query_as::<_, StoredCandidate>(
-            "SELECT * FROM candidate WHERE bvid = ? ORDER BY last_seen_at DESC LIMIT 1",
+        let candidates = sqlx::query_as::<_, StoredCandidate>(
+            r#"SELECT c.* FROM candidate c JOIN episode e ON e.id = c.episode_id
+               WHERE c.bvid = ? AND c.state = 'pending'
+                 AND e.state NOT IN ('confirmed', 'notified')
+               ORDER BY c.last_seen_at DESC"#,
         )
+        .bind(bvid)
+        .fetch_all(&self.pool)
+        .await?;
+        let candidate = match candidates.as_slice() {
+            [] => return Err(AppError::NotFound(format!("pending candidate {bvid}"))),
+            [candidate] => candidate.clone(),
+            _ => {
+                return Err(AppError::InvalidInput(format!(
+                    "candidate {bvid} belongs to multiple active episodes; use the web review page"
+                )));
+            }
+        };
+        let episode = self.episode(candidate.episode_id).await?;
+        Ok((candidate, episode))
+    }
+
+    pub async fn candidate_context_for_episode(
+        &self,
+        episode_id: i64,
+        bvid: &str,
+    ) -> Result<(StoredCandidate, Episode)> {
+        let candidate = sqlx::query_as::<_, StoredCandidate>(
+            "SELECT * FROM candidate WHERE episode_id = ? AND bvid = ?",
+        )
+        .bind(episode_id)
         .bind(bvid)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("candidate {bvid}")))?;
-        let episode = self.episode(candidate.episode_id).await?;
+        .ok_or_else(|| AppError::NotFound(format!("candidate {episode_id}:{bvid}")))?;
+        let episode = self.episode(episode_id).await?;
         Ok((candidate, episode))
     }
 
@@ -723,6 +938,128 @@ impl Repository {
         }))
     }
 
+    pub async fn list_manually_trusted_uploaders(&self) -> Result<Vec<TrustedUploaderRow>> {
+        Ok(sqlx::query_as::<_, TrustedUploaderRow>(
+            r#"SELECT u.anime_id, a.title AS anime_title, u.uploader_mid, u.uploader_name
+               FROM uploader_trust u JOIN anime a ON a.id = u.anime_id
+               WHERE u.manually_trusted = 1
+               ORDER BY a.title, u.uploader_name, u.uploader_mid"#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn add_manually_trusted_uploader(
+        &self,
+        anime_id: i64,
+        mid: i64,
+        name: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            r#"INSERT INTO uploader_trust(
+                anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
+            ) VALUES (?, ?, ?, 1, 0)
+            ON CONFLICT(anime_id, uploader_mid) DO UPDATE SET
+                uploader_name = excluded.uploader_name,
+                manually_trusted = 1,
+                manually_blocked = 0"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .bind(name)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(error)) if error.is_foreign_key_violation() => {
+                Err(AppError::NotFound(format!("anime {anime_id}")))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn update_manually_trusted_uploader(
+        &self,
+        old_anime_id: i64,
+        old_mid: i64,
+        anime_id: i64,
+        mid: i64,
+        name: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM uploader_trust WHERE anime_id = ? AND uploader_mid = ? AND manually_trusted = 1)",
+        )
+        .bind(old_anime_id)
+        .bind(old_mid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "trusted uploader {old_anime_id}:{old_mid}"
+            )));
+        }
+        if old_anime_id == anime_id && old_mid == mid {
+            sqlx::query(
+                "UPDATE uploader_trust SET uploader_name = ? WHERE anime_id = ? AND uploader_mid = ?",
+            )
+            .bind(name)
+            .bind(anime_id)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"UPDATE uploader_trust SET manually_trusted = 0
+                   WHERE anime_id = ? AND uploader_mid = ?"#,
+            )
+            .bind(old_anime_id)
+            .bind(old_mid)
+            .execute(&mut *tx)
+            .await?;
+            let result = sqlx::query(
+                r#"INSERT INTO uploader_trust(
+                    anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
+                ) VALUES (?, ?, ?, 1, 0)
+                ON CONFLICT(anime_id, uploader_mid) DO UPDATE SET
+                    uploader_name = excluded.uploader_name,
+                    manually_trusted = 1,
+                    manually_blocked = 0"#,
+            )
+            .bind(anime_id)
+            .bind(mid)
+            .bind(name)
+            .execute(&mut *tx)
+            .await;
+            match result {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(error)) if error.is_foreign_key_violation() => {
+                    return Err(AppError::NotFound(format!("anime {anime_id}")));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn remove_manual_uploader_trust(&self, anime_id: i64, mid: i64) -> Result<()> {
+        let result = sqlx::query(
+            r#"UPDATE uploader_trust SET manually_trusted = 0
+               WHERE anime_id = ? AND uploader_mid = ? AND manually_trusted = 1"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!(
+                "trusted uploader {anime_id}:{mid}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn set_uploader_flag(
         &self,
         anime_id: i64,
@@ -730,16 +1067,28 @@ impl Repository {
         trusted: bool,
         blocked: bool,
     ) -> Result<()> {
+        let uploader_name = sqlx::query_scalar::<_, String>(
+            r#"SELECT c.uploader_name
+               FROM candidate c JOIN episode e ON e.id = c.episode_id
+               WHERE e.anime_id = ? AND c.uploader_mid = ?
+               ORDER BY c.last_seen_at DESC LIMIT 1"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .fetch_optional(&self.pool)
+        .await?;
         sqlx::query(
             r#"INSERT INTO uploader_trust(
-                anime_id, uploader_mid, manually_trusted, manually_blocked
-            ) VALUES (?, ?, ?, ?)
+                anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
+            ) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(anime_id, uploader_mid) DO UPDATE SET
+                uploader_name = COALESCE(excluded.uploader_name, uploader_trust.uploader_name),
                 manually_trusted = excluded.manually_trusted,
                 manually_blocked = excluded.manually_blocked"#,
         )
         .bind(anime_id)
         .bind(mid)
+        .bind(uploader_name)
         .bind(trusted)
         .bind(blocked)
         .execute(&self.pool)
@@ -829,25 +1178,62 @@ impl Repository {
     ) -> Result<()> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let (candidate_id, previous_state) = sqlx::query_as::<_, (i64, String)>(
-            "SELECT id, state FROM candidate WHERE episode_id = ? AND bvid = ?",
+        let (candidate_id, previous_state, anime_id, episode_state) =
+            sqlx::query_as::<_, (i64, String, i64, String)>(
+                r#"SELECT c.id, c.state, e.anime_id, e.state
+               FROM candidate c JOIN episode e ON e.id = c.episode_id
+               WHERE c.episode_id = ? AND c.bvid = ?"#,
+            )
+            .bind(episode_id)
+            .bind(bvid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("candidate {bvid}")))?;
+        if previous_state == CandidateState::Confirmed.to_string()
+            && episode_state == EpisodeState::Confirmed.to_string()
+        {
+            return Ok(());
+        }
+        if previous_state != CandidateState::Pending.to_string() {
+            return Err(AppError::InvalidInput(
+                "candidate is no longer pending; refresh the review page".into(),
+            ));
+        }
+        if matches!(episode_state.as_str(), "confirmed" | "notified") {
+            return Err(AppError::InvalidInput(
+                "candidate belongs to an episode that is already complete".into(),
+            ));
+        }
+        let current_episode_id = sqlx::query_scalar::<_, i64>(
+            r#"SELECT id FROM episode
+               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+               ORDER BY episode_no LIMIT 1"#,
         )
-        .bind(episode_id)
-        .bind(bvid)
+        .bind(anime_id)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("candidate {bvid}")))?;
+        .await?;
+        if current_episode_id != Some(episode_id) {
+            return Err(AppError::InvalidInput(
+                "candidate no longer belongs to the current episode; refresh the review page"
+                    .into(),
+            ));
+        }
         sqlx::query("UPDATE candidate SET state = 'confirmed' WHERE id = ?")
             .bind(candidate_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE episode SET state = 'confirmed', confirmed_at = COALESCE(confirmed_at, ?) WHERE id = ? AND state != 'notified'",
+            "UPDATE candidate SET state = 'expired' WHERE episode_id = ? AND id != ? AND state = 'pending'",
         )
-        .bind(now)
         .bind(episode_id)
+        .bind(candidate_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("UPDATE episode SET state = 'confirmed', confirmed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             r#"INSERT OR IGNORE INTO notification(
                 episode_id, candidate_id, channel, confirmation_reason, status, created_at
@@ -874,14 +1260,56 @@ impl Repository {
     }
 
     pub async fn reject_candidate(&self, bvid: &str, user_rejected: bool) -> Result<()> {
+        let (candidate, _) = self.candidate_context(bvid).await?;
+        self.reject_candidate_for_episode(candidate.episode_id, bvid, user_rejected)
+            .await
+    }
+
+    pub async fn reject_candidate_for_episode(
+        &self,
+        episode_id: i64,
+        bvid: &str,
+        user_rejected: bool,
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let (candidate_id, previous_state) = sqlx::query_as::<_, (i64, String)>(
-            "SELECT id, state FROM candidate WHERE bvid = ? ORDER BY last_seen_at DESC LIMIT 1",
+        let (candidate_id, previous_state, anime_id, episode_state) =
+            sqlx::query_as::<_, (i64, String, i64, String)>(
+                r#"SELECT c.id, c.state, e.anime_id, e.state
+                   FROM candidate c JOIN episode e ON e.id = c.episode_id
+                   WHERE c.episode_id = ? AND c.bvid = ?"#,
+            )
+            .bind(episode_id)
+            .bind(bvid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("candidate {bvid}")))?;
+        if previous_state == CandidateState::Rejected.to_string() {
+            return Ok(());
+        }
+        if previous_state != CandidateState::Pending.to_string() {
+            return Err(AppError::InvalidInput(
+                "candidate is no longer pending; refresh the review page".into(),
+            ));
+        }
+        if matches!(episode_state.as_str(), "confirmed" | "notified") {
+            return Err(AppError::InvalidInput(
+                "candidate belongs to an episode that is already complete".into(),
+            ));
+        }
+        let current_episode_id = sqlx::query_scalar::<_, i64>(
+            r#"SELECT id FROM episode
+               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+               ORDER BY episode_no LIMIT 1"#,
         )
-        .bind(bvid)
+        .bind(anime_id)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("candidate {bvid}")))?;
+        .await?;
+        if current_episode_id != Some(episode_id) {
+            return Err(AppError::InvalidInput(
+                "candidate no longer belongs to the current episode; refresh the review page"
+                    .into(),
+            ));
+        }
         sqlx::query("UPDATE candidate SET state = 'rejected' WHERE id = ?")
             .bind(candidate_id)
             .execute(&mut *tx)
@@ -889,6 +1317,17 @@ impl Repository {
         if user_rejected && previous_state != CandidateState::Rejected.to_string() {
             Self::increment_trust_tx(&mut tx, candidate_id, false).await?;
         }
+        sqlx::query(
+            r#"UPDATE episode SET state = 'watching'
+               WHERE id = ? AND state IN ('candidate_found','needs_manual_review')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM candidate c
+                   WHERE c.episode_id = episode.id AND c.state = 'pending'
+                 )"#,
+        )
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1081,6 +1520,7 @@ impl Repository {
                JOIN episode e ON e.id = r.episode_id
                JOIN anime a ON a.id = e.anime_id
                WHERE r.status = 'pending'
+                 AND e.state NOT IN ('confirmed', 'notified')
                  AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= ?)
                ORDER BY r.created_at, r.id"#,
         )
@@ -1233,6 +1673,18 @@ impl Repository {
         .bind(episode.episode_no + 1)
         .bind(next_expected)
         .bind(next_check)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE candidate SET state = 'expired' WHERE episode_id = ? AND state = 'pending'",
+        )
+        .bind(episode.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE review_notification SET status = 'cancelled' WHERE episode_id = ? AND status = 'pending'",
+        )
+        .bind(episode.id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -2032,6 +2484,15 @@ impl Repository {
     }
 }
 
+fn map_unique_rule_error(error: sqlx::Error) -> AppError {
+    match error {
+        sqlx::Error::Database(error) if error.is_unique_violation() => {
+            AppError::InvalidInput("an equivalent blocked keyword already exists".into())
+        }
+        error => error.into(),
+    }
+}
+
 fn candidate_fingerprint(bvids: &[String]) -> String {
     let mut hasher = Sha256::new();
     for bvid in bvids {
@@ -2497,6 +2958,217 @@ mod tests {
         assert_eq!(
             repository.episode(episode.id).await.unwrap().state,
             "watching"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_episode_candidates_cannot_confirm_the_next_episode() {
+        let (_directory, repository, _anime_id, episode_eight) = fixture().await;
+        let (confirmed, evaluation) = candidate();
+        let mut stale = confirmed.clone();
+        stale.bvid = "BVstale0001".into();
+        stale.url = "https://www.bilibili.com/video/BVstale0001".into();
+        repository
+            .upsert_candidate(
+                episode_eight.id,
+                &confirmed,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+        repository
+            .upsert_candidate(
+                episode_eight.id,
+                &stale,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode_eight.id, &confirmed.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+
+        let stale_old = repository
+            .candidate_context_for_episode(episode_eight.id, &stale.bvid)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(stale_old.state, "expired");
+
+        let episode_nine = repository
+            .active_episode(episode_eight.anime_id)
+            .await
+            .unwrap();
+        stale.title = "Silent Witch EP09".into();
+        repository
+            .upsert_candidate(
+                episode_nine.id,
+                &stale,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .confirm_candidate(episode_eight.id, &stale.bvid, "manual", "default", true,)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .active_episode(episode_eight.anime_id)
+                .await
+                .unwrap()
+                .episode_no,
+            9
+        );
+        repository
+            .confirm_candidate(episode_nine.id, &stale.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_episode_rewinds_wrong_notification_and_later_episode() {
+        let (_directory, repository, anime_id, episode_eight) = fixture().await;
+        let (mut video, evaluation) = candidate();
+        repository
+            .upsert_candidate(
+                episode_eight.id,
+                &video,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode_eight.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let first_notification = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(first_notification)
+            .await
+            .unwrap();
+
+        let episode_nine = repository.active_episode(anime_id).await.unwrap();
+        video.bvid = "BVwrongEP09".into();
+        video.title = "Silent Witch EP08 stale".into();
+        video.url = "https://www.bilibili.com/video/BVwrongEP09".into();
+        repository
+            .upsert_candidate(
+                episode_nine.id,
+                &video,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode_nine.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let wrong_notification = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(wrong_notification)
+            .await
+            .unwrap();
+        let episode_ten = repository.active_episode(anime_id).await.unwrap();
+
+        repository.set_anime_enabled(anime_id, false).await.unwrap();
+        let summary = repository
+            .repair_current_episode(anime_id, episode_ten.id, 9)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.episode_no, 9);
+        assert_eq!(summary.removed_notifications, 1);
+        assert_eq!(summary.removed_future_episodes, 1);
+        let repaired = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(repaired.id, episode_nine.id);
+        assert_eq!(repaired.episode_no, 9);
+        assert_eq!(repaired.state, "waiting");
+        assert!(matches!(
+            repository.episode(episode_ten.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert_eq!(
+            repository
+                .candidate_context_for_episode(episode_nine.id, &video.bvid)
+                .await
+                .unwrap()
+                .0
+                .state,
+            "expired"
+        );
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_keywords_and_manual_trust_are_editable() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let keyword_id = repository
+            .add_blocked_keyword("有声漫画", "有声漫画")
+            .await
+            .unwrap();
+        repository
+            .update_blocked_keyword(keyword_id, "有声小说", "有声小说")
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.list_blocked_keywords().await.unwrap()[0].keyword,
+            "有声小说"
+        );
+        repository.delete_blocked_keyword(keyword_id).await.unwrap();
+        assert!(repository.list_blocked_keywords().await.unwrap().is_empty());
+
+        let (video, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .set_uploader_flag(anime_id, video.uploader_mid, true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.list_manually_trusted_uploaders().await.unwrap()[0]
+                .uploader_name
+                .as_deref(),
+            Some("test up")
+        );
+        repository
+            .add_manually_trusted_uploader(anime_id, 100, "可信 UP")
+            .await
+            .unwrap();
+        repository
+            .update_manually_trusted_uploader(anime_id, 100, anime_id, 101, "新名字")
+            .await
+            .unwrap();
+        let trusted = repository.list_manually_trusted_uploaders().await.unwrap();
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[0].uploader_mid, 101);
+        assert_eq!(trusted[0].uploader_name.as_deref(), Some("新名字"));
+        repository
+            .remove_manual_uploader_trust(anime_id, 101)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .list_manually_trusted_uploaders()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

@@ -40,6 +40,13 @@ impl Detector {
     pub async fn check_anime(&self, anime_id: i64) -> Result<()> {
         let anime = self.repository.get_anime(anime_id).await?;
         let episode = self.repository.active_episode(anime_id).await?;
+        let blocked_keywords = self
+            .repository
+            .list_blocked_keywords()
+            .await?
+            .into_iter()
+            .map(|row| row.normalized_keyword)
+            .collect::<Vec<_>>();
         info!(
             anime = %anime.anime.title,
             episode = episode.episode_no,
@@ -76,6 +83,7 @@ impl Detector {
                     &candidate,
                     &trust,
                     self.config.confirmation.trusted_confirmed_count,
+                    &blocked_keywords,
                 );
                 if preliminary.hard_reject {
                     self.repository
@@ -114,6 +122,7 @@ impl Detector {
                     &detailed,
                     &trust,
                     self.config.confirmation.trusted_confirmed_count,
+                    &blocked_keywords,
                 );
                 let state = if evaluation.hard_reject {
                     CandidateState::Rejected

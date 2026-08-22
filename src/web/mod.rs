@@ -120,12 +120,31 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/delete", post(anime_delete))
         .route("/covers/{subject_id}", get(cover_image))
         .route("/candidates", get(candidate_list))
+        .route("/rules", get(rule_list))
+        .route("/rules/keywords", post(keyword_create))
+        .route("/rules/keywords/{id}", post(keyword_update))
+        .route("/rules/keywords/{id}/delete", post(keyword_delete))
+        .route("/rules/uploaders", post(trusted_uploader_create))
         .route(
-            "/candidates/{bvid}/accept-intent",
+            "/rules/uploaders/{anime_id}/{mid}",
+            post(trusted_uploader_update),
+        )
+        .route(
+            "/rules/uploaders/{anime_id}/{mid}/delete",
+            post(trusted_uploader_delete),
+        )
+        .route(
+            "/episodes/{episode_id}/candidates/{bvid}/accept-intent",
             post(candidate_accept_intent),
         )
-        .route("/candidates/{bvid}/accept", post(candidate_accept))
-        .route("/candidates/{bvid}/reject", post(candidate_reject))
+        .route(
+            "/episodes/{episode_id}/candidates/{bvid}/accept",
+            post(candidate_accept),
+        )
+        .route(
+            "/episodes/{episode_id}/candidates/{bvid}/reject",
+            post(candidate_reject),
+        )
         .route("/review/episodes/{id}", get(review_episode))
         .route(
             "/episodes/{id}/candidates/reject-all-intent",
@@ -1005,6 +1024,7 @@ struct CandidateQuery {
 }
 
 struct CandidateView {
+    episode_id: i64,
     bvid: String,
     anime_id: i64,
     uploader_mid: i64,
@@ -1077,6 +1097,7 @@ fn candidate_view(row: CandidateListRow) -> CandidateView {
         .unwrap_or_else(|_| "判定详情不可用".into());
     let url = canonical_bilibili_url(&row.bvid);
     CandidateView {
+        episode_id: row.episode_id,
         bvid: row.bvid,
         anime_id: row.anime_id,
         uploader_mid: row.uploader_mid,
@@ -1094,25 +1115,267 @@ fn candidate_view(row: CandidateListRow) -> CandidateView {
     }
 }
 
-async fn candidate_accept_intent(
+#[derive(Deserialize, Default)]
+struct RuleQuery {
+    result: Option<String>,
+}
+
+struct RuleAnimeOption {
+    id: i64,
+    title: String,
+}
+
+struct TrustedUploaderView {
+    anime_id: i64,
+    uploader_mid: i64,
+    uploader_name: String,
+}
+
+#[derive(Template)]
+#[template(path = "rules.html")]
+struct RuleTemplate {
+    username: String,
+    csrf_token: String,
+    keywords: Vec<crate::repository::BlockedKeywordRow>,
+    uploaders: Vec<TrustedUploaderView>,
+    anime: Vec<RuleAnimeOption>,
+    notice: String,
+}
+
+async fn rule_list(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
-    Path(bvid): Path<String>,
+    Query(query): Query<RuleQuery>,
+) -> WebResponse {
+    let keywords = state.repository.list_blocked_keywords().await?;
+    let uploaders = state
+        .repository
+        .list_manually_trusted_uploaders()
+        .await?
+        .into_iter()
+        .map(|row| TrustedUploaderView {
+            anime_id: row.anime_id,
+            uploader_mid: row.uploader_mid,
+            uploader_name: row
+                .uploader_name
+                .unwrap_or_else(|| format!("UID {}", row.uploader_mid)),
+        })
+        .collect();
+    let anime = state
+        .repository
+        .list_anime()
+        .await?
+        .into_iter()
+        .map(|item| RuleAnimeOption {
+            id: item.id,
+            title: item.title,
+        })
+        .collect();
+    let notice = match query.result.as_deref() {
+        Some("keyword-added") => "屏蔽词已添加，之后的候选会立即应用这条规则。",
+        Some("keyword-updated") => "屏蔽词已更新。",
+        Some("keyword-deleted") => "屏蔽词已删除。",
+        Some("uploader-added") => "信任 UP 已添加。",
+        Some("uploader-updated") => "信任 UP 已更新。",
+        Some("uploader-deleted") => "信任 UP 已移除。",
+        _ => "",
+    }
+    .to_string();
+    render(RuleTemplate {
+        username: identity.username,
+        csrf_token: identity.csrf_token,
+        keywords,
+        uploaders,
+        anime,
+        notice,
+    })
+}
+
+#[derive(Deserialize)]
+struct KeywordForm {
+    csrf_token: String,
+    keyword: String,
+}
+
+async fn keyword_create(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    headers: HeaderMap,
+    Form(form): Form<KeywordForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let id = state.application.add_blocked_keyword(&form.keyword).await?;
+    audit_success(
+        &state,
+        &identity,
+        "rule.keyword.create",
+        "blocked_keyword",
+        id,
+        serde_json::json!({"keyword": form.keyword.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=keyword-added").into_response())
+}
+
+async fn keyword_update(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<KeywordForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .update_blocked_keyword(id, &form.keyword)
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "rule.keyword.update",
+        "blocked_keyword",
+        id,
+        serde_json::json!({"keyword": form.keyword.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=keyword-updated").into_response())
+}
+
+async fn keyword_delete(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
-    state.repository.candidate_context(&bvid).await?;
+    state.application.delete_blocked_keyword(id).await?;
+    audit_success(
+        &state,
+        &identity,
+        "rule.keyword.delete",
+        "blocked_keyword",
+        id,
+        serde_json::json!({}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=keyword-deleted").into_response())
+}
+
+#[derive(Deserialize)]
+struct TrustedUploaderForm {
+    csrf_token: String,
+    anime_id: i64,
+    mid: i64,
+    name: String,
+}
+
+async fn trusted_uploader_create(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    headers: HeaderMap,
+    Form(form): Form<TrustedUploaderForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .add_trusted_uploader(form.anime_id, form.mid, &form.name)
+        .await?;
+    let entity = format!("{}:{}", form.anime_id, form.mid);
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.create",
+        "trusted_uploader",
+        &entity,
+        serde_json::json!({"name": form.name.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=uploader-added").into_response())
+}
+
+async fn trusted_uploader_update(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((old_anime_id, old_mid)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<TrustedUploaderForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .update_trusted_uploader(old_anime_id, old_mid, form.anime_id, form.mid, &form.name)
+        .await?;
+    let old_entity = format!("{old_anime_id}:{old_mid}");
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.update",
+        "trusted_uploader",
+        &old_entity,
+        serde_json::json!({"anime_id": form.anime_id, "mid": form.mid, "name": form.name.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=uploader-updated").into_response())
+}
+
+async fn trusted_uploader_delete(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, mid)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .remove_trusted_uploader(anime_id, mid)
+        .await?;
+    let entity = format!("{anime_id}:{mid}");
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.delete",
+        "trusted_uploader",
+        &entity,
+        serde_json::json!({}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=uploader-deleted").into_response())
+}
+
+async fn candidate_accept_intent(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((episode_id, bvid)): Path<(i64, String)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let (candidate, episode) = state
+        .repository
+        .candidate_context_for_episode(episode_id, &bvid)
+        .await?;
+    if candidate.state != "pending" {
+        return Err(WebError::bad_request("该候选已经处理，不能再次确认"));
+    }
+    let active = state.repository.active_episode(episode.anime_id).await?;
+    if active.id != episode.id {
+        return Err(WebError::bad_request(
+            "该候选不属于当前待更新集，已拒绝操作",
+        ));
+    }
+    let entity = format!("{episode_id}:{bvid}");
     let nonce = state
         .auth
-        .issue_action_nonce(&identity, "candidate.accept", Some(&bvid))
+        .issue_action_nonce(&identity, "candidate.accept", Some(&entity))
         .await?;
-    let (candidate, episode) = state.repository.candidate_context(&bvid).await?;
     let anime = state.repository.get_anime(episode.anime_id).await?;
     render(CandidateAcceptTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
         nonce,
+        episode_id,
         bvid,
         anime_title: anime.anime.title,
         episode_no: episode.episode_no,
@@ -1127,6 +1390,7 @@ struct CandidateAcceptTemplate {
     username: String,
     csrf_token: String,
     nonce: String,
+    episode_id: i64,
     bvid: String,
     anime_title: String,
     episode_no: i64,
@@ -1143,26 +1407,30 @@ struct CandidateAcceptForm {
 async fn candidate_accept(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
-    Path(bvid): Path<String>,
+    Path((episode_id, bvid)): Path<(i64, String)>,
     headers: HeaderMap,
     Form(form): Form<CandidateAcceptForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let entity = format!("{episode_id}:{bvid}");
     if !state
         .auth
-        .consume_action_nonce(&identity, &form.nonce, "candidate.accept", Some(&bvid))
+        .consume_action_nonce(&identity, &form.nonce, "candidate.accept", Some(&entity))
         .await?
     {
         return Err(WebError::forbidden("候选确认已使用或过期，请重新开始"));
     }
-    state.application.accept_candidate(&bvid).await?;
+    state
+        .application
+        .accept_candidate_for_episode(episode_id, &bvid)
+        .await?;
     audit_success_string(
         &state,
         &identity,
         "candidate.accept",
         "candidate",
-        &bvid,
-        serde_json::json!({}),
+        &entity,
+        serde_json::json!({"episode_id": episode_id, "bvid": bvid}),
     )
     .await?;
     Ok(Redirect::to("/candidates?state=pending").into_response())
@@ -1219,19 +1487,23 @@ async fn uploader_block(
 async fn candidate_reject(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
-    Path(bvid): Path<String>,
+    Path((episode_id, bvid)): Path<(i64, String)>,
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
-    state.application.reject_candidate(&bvid).await?;
+    state
+        .application
+        .reject_candidate_for_episode(episode_id, &bvid)
+        .await?;
+    let entity = format!("{episode_id}:{bvid}");
     audit_success_string(
         &state,
         &identity,
         "candidate.reject",
         "candidate",
-        &bvid,
-        serde_json::json!({}),
+        &entity,
+        serde_json::json!({"episode_id": episode_id, "bvid": bvid}),
     )
     .await?;
     Ok(Redirect::to("/candidates?state=pending&result=candidate-rejected").into_response())

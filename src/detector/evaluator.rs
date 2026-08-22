@@ -12,6 +12,7 @@ pub fn evaluate(
     candidate: &VideoCandidate,
     trust: &UploaderTrust,
     trusted_confirmed_count: i64,
+    blocked_keywords: &[String],
 ) -> Evaluation {
     let mut score = 0;
     let mut hard_reject = false;
@@ -77,7 +78,7 @@ pub fn evaluate(
     };
 
     let normalized = crate::detector::title::normalize_title(&candidate.title);
-    let negative_keywords = find_negative_keywords(&normalized);
+    let mut negative_keywords = find_negative_keywords(&normalized);
     for keyword in &negative_keywords {
         let strong = matches!(
             keyword.as_str(),
@@ -101,6 +102,32 @@ pub fn evaluate(
         reasons.push(format!(
             "negative title signals: {}",
             negative_keywords.join(", ")
+        ));
+    }
+    let configured_haystack = crate::detector::title::normalize_title(&format!(
+        "{} {} {}",
+        candidate.title,
+        candidate.description.as_deref().unwrap_or_default(),
+        candidate.tags.join(" ")
+    ));
+    let mut configured_hits = blocked_keywords
+        .iter()
+        .filter(|keyword| !keyword.is_empty() && configured_haystack.contains(keyword.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    configured_hits.sort();
+    configured_hits.dedup();
+    if !configured_hits.is_empty() {
+        score -= 100;
+        hard_reject = true;
+        for keyword in &configured_hits {
+            if !negative_keywords.contains(keyword) {
+                negative_keywords.push(keyword.clone());
+            }
+        }
+        reasons.push(format!(
+            "matched configured blocked keywords: {}",
+            configured_hits.join(", ")
         ));
     }
 
@@ -244,17 +271,41 @@ mod tests {
         for duration in [90, 300] {
             let (anime, episode, candidate) = fixtures(duration, "Silent Witch EP08");
             assert!(
-                evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3).hard_reject
+                evaluate(
+                    &anime,
+                    &episode,
+                    &candidate,
+                    &UploaderTrust::default(),
+                    3,
+                    &[],
+                )
+                .hard_reject
             );
         }
         let (anime, episode, candidate) = fixtures(1_420, "Silent Witch EP08");
         assert_eq!(
-            evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3).duration_match,
+            evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                3,
+                &[],
+            )
+            .duration_match,
             DurationMatch::Normal
         );
         let (anime, episode, candidate) = fixtures(2_700, "Silent Witch EP08");
         assert_eq!(
-            evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3).duration_match,
+            evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                3,
+                &[],
+            )
+            .duration_match,
             DurationMatch::Suspicious
         );
     }
@@ -264,7 +315,14 @@ mod tests {
         for suffix in ["预告", "解说", "Reaction", "名场面"] {
             let title = format!("Silent Witch EP08 {suffix}");
             let (anime, episode, candidate) = fixtures(1_420, &title);
-            let evaluation = evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3);
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                3,
+                &[],
+            );
             assert!(evaluation.score < 60, "{suffix}: {}", evaluation.score);
         }
     }
@@ -283,11 +341,40 @@ mod tests {
             anime.anime.duration_min_sec = 1_500;
             anime.anime.duration_max_sec = 2_100;
 
-            let evaluation = evaluate(&anime, &episode, &candidate, &UploaderTrust::default(), 3);
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                3,
+                &[],
+            );
             assert!(!evaluation.hard_reject, "{title}: {:?}", evaluation.reasons);
             assert_eq!(evaluation.episode_match, EpisodeMatch::Strong, "{title}");
             assert_eq!(evaluation.duration_match, DurationMatch::Normal, "{title}");
             assert!(evaluation.score >= 60, "{title}: {}", evaluation.score);
         }
+    }
+
+    #[test]
+    fn configured_blocked_keyword_is_a_hard_reject() {
+        let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
+        candidate.description = Some("有声漫画完整版".into());
+        let evaluation = evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &UploaderTrust::default(),
+            3,
+            &["有声漫画".into()],
+        );
+
+        assert!(evaluation.hard_reject);
+        assert!(
+            evaluation
+                .negative_keywords
+                .iter()
+                .any(|keyword| keyword == "有声漫画")
+        );
     }
 }

@@ -99,6 +99,16 @@ enum AnimeCommand {
         )]
         yes: bool,
     },
+    RepairEpisode {
+        anime_id: i64,
+        #[arg(long, help = "episode number that should be monitored again")]
+        episode: i64,
+        #[arg(
+            long,
+            help = "confirm removal of the wrong notification and later episode state"
+        )]
+        yes: bool,
+    },
     Sync {
         anime_id: i64,
     },
@@ -612,6 +622,30 @@ async fn handle_anime(
             );
             Ok(())
         }
+        AnimeCommand::RepairEpisode {
+            anime_id,
+            episode,
+            yes,
+        } => {
+            let current = repository.active_episode(anime_id).await?;
+            if !yes {
+                return Err(AppError::InvalidInput(format!(
+                    "refusing to rewind anime {anime_id} from EP{} to EP{episode}; disable it first, then re-run `anime repair-episode {anime_id} --episode {episode} --yes` after verifying both episode numbers",
+                    current.episode_no
+                )));
+            }
+            let repaired = application
+                .repair_current_episode(anime_id, current.id, episode)
+                .await?;
+            println!(
+                "repaired anime {anime_id} to EP{}; expired {} candidate(s), removed {} notification row(s), removed {} later episode(s); an immediate check is scheduled",
+                repaired.episode_no,
+                repaired.expired_candidates,
+                repaired.removed_notifications,
+                repaired.removed_future_episodes
+            );
+            Ok(())
+        }
         AnimeCommand::Sync { anime_id } => {
             ScheduleSynchronizer::new(repository.clone(), config.schedule.clone())?
                 .sync_now(anime_id)
@@ -835,6 +869,44 @@ mod tests {
                     ref title
                 }
             } if title == "无职转生 第三季"
+        ));
+    }
+
+    #[test]
+    fn episode_repair_requires_explicit_confirmation_flag() {
+        let cli =
+            Cli::try_parse_from(["anipulse", "anime", "repair-episode", "1", "--episode", "9"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::RepairEpisode {
+                    anime_id: 1,
+                    episode: 9,
+                    yes: false
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "anipulse",
+            "anime",
+            "repair-episode",
+            "1",
+            "--episode",
+            "9",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::RepairEpisode {
+                    anime_id: 1,
+                    episode: 9,
+                    yes: true
+                }
+            }
         ));
     }
 

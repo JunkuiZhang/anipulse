@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}过滤与信任规则 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">MATCHING RULES</p><h1>过滤与信任</h1><p class="page-description">屏蔽明显不想看的内容，并为每部番维护可自动确认的 UP。</p></div></div>
+{% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
+<div class="rules-grid">
+  <section class="panel rule-panel">
+    <div class="section-heading"><div><h2>屏蔽词</h2><p class="muted">标题或简介命中后直接排除，不进入审核。</p></div><span class="count-pill">{{ keywords.len() }}</span></div>
+    <form method="post" action="/rules/keywords" class="rule-create-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label><span>新增屏蔽词</span><input name="keyword" required maxlength="80" placeholder="例如：有声漫画"></label>
+      <button class="primary" type="submit">添加</button>
+    </form>
+    <div class="rule-list">
+    {% for item in keywords %}
+      <div class="rule-row keyword-rule">
+        <form method="post" action="/rules/keywords/{{ item.id }}" class="rule-edit-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input name="keyword" value="{{ item.keyword }}" required maxlength="80" aria-label="屏蔽词">
+          <button type="submit">保存</button>
+        </form>
+        <form method="post" action="/rules/keywords/{{ item.id }}/delete">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger-ghost" type="submit">删除</button>
+        </form>
+      </div>
+    {% endfor %}
+    </div>
+    {% if keywords.is_empty() %}<div class="empty compact">尚未添加屏蔽词。</div>{% endif %}
+  </section>
+
+  <section class="panel rule-panel trusted-panel">
+    <div class="section-heading"><div><h2>信任 UP</h2><p class="muted">信任关系按番剧生效，仍会检查集数、时长和屏蔽词。</p></div><span class="count-pill">{{ uploaders.len() }}</span></div>
+    {% if !anime.is_empty() %}
+    <form method="post" action="/rules/uploaders" class="uploader-form uploader-create-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label><span>番剧</span><select name="anime_id" required>{% for item in anime %}<option value="{{ item.id }}">{{ item.title }}</option>{% endfor %}</select></label>
+      <label><span>UP UID</span><input name="mid" type="number" min="1" required placeholder="B站 UID"></label>
+      <label><span>显示名称</span><input name="name" maxlength="100" placeholder="可留空"></label>
+      <button class="primary" type="submit">添加信任</button>
+    </form>
+    {% endif %}
+    <div class="rule-list uploader-rule-list">
+    {% for uploader in uploaders %}
+      <div class="rule-row uploader-rule">
+        <form method="post" action="/rules/uploaders/{{ uploader.anime_id }}/{{ uploader.uploader_mid }}" class="uploader-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label><span>番剧</span><select name="anime_id" required>{% for item in anime %}<option value="{{ item.id }}" {% if item.id == uploader.anime_id %}selected{% endif %}>{{ item.title }}</option>{% endfor %}</select></label>
+          <label><span>UP UID</span><input name="mid" type="number" min="1" required value="{{ uploader.uploader_mid }}"></label>
+          <label><span>显示名称</span><input name="name" maxlength="100" value="{{ uploader.uploader_name }}"></label>
+          <button type="submit">保存</button>
+        </form>
+        <form method="post" action="/rules/uploaders/{{ uploader.anime_id }}/{{ uploader.uploader_mid }}/delete" class="rule-delete-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger-ghost" type="submit">移除</button>
+        </form>
+      </div>
+    {% endfor %}
+    </div>
+    {% if uploaders.is_empty() %}<div class="empty compact">尚未手工信任 UP。候选页的“信任此 UP”也会出现在这里。</div>{% endif %}
+  </section>
+</div>
+{% endblock %}

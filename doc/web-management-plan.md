@@ -304,12 +304,15 @@ CREATE TABLE management_job (
 | POST | `/anime/{id}/check` | 是 | 入队立即检查 |
 | POST | `/anime/{id}/sync` | 是 | 入队自动排期同步 |
 | GET | `/candidates` | 是 | 候选分页、分数解释 |
-| POST | `/candidates/{bvid}/accept` | 是 | 人工确认 |
-| POST | `/candidates/{bvid}/reject` | 是 | 人工拒绝 |
+| POST | `/episodes/{id}/candidates/{bvid}/accept` | 是 | 按 Episode + BV 人工确认 |
+| POST | `/episodes/{id}/candidates/{bvid}/reject` | 是 | 按 Episode + BV 人工拒绝 |
 | POST | `/episodes/{id}/candidates/reject-all` | 是 | 拒绝本集当前全部候选 |
 | POST | `/episodes/{id}/candidates/from-url` | 是 | 校验 B 站链接并创建人工候选任务 |
 | POST | `/anime/{id}/uploaders/{mid}/trust` | 是 | 信任 UP |
 | POST | `/anime/{id}/uploaders/{mid}/block` | 是 | 屏蔽 UP |
+| GET | `/rules` | 是 | 查看全局屏蔽词和 per-Anime 信任 UP |
+| POST | `/rules/keywords[...]` | 是 | 新增、修改、删除全局屏蔽词 |
+| POST | `/rules/uploaders[...]` | 是 | 新增、修改、移除 per-Anime 信任 UP |
 | GET | `/jobs` | 是 | 后台任务状态 |
 | GET | `/audit` | 是 | 审计记录 |
 | GET | `/settings/status` | 是 | 脱敏配置与外部服务状态 |

@@ -344,6 +344,22 @@ sudo -u anipulse /usr/local/bin/anipulse \
 
 `candidate accept` 会创建 pending notification；常驻服务会在下一次调度循环私聊发送飞书卡片。通知失败会保留 pending 状态并指数退避重试，不会丢失 Episode，也不会因为一次超时生成重复通知。
 
+如果旧版本已经把上一集视频错误确认成当前集并推进到下一集，可用受保护的状态回退命令修复。先停止 scheduler 并备份数据库，再禁用目标番剧；以下把 Anime `1` 从错误的 EP10 恢复到 EP9：
+
+```bash
+sudo systemctl stop anipulse.service
+sudo cp --preserve=mode,ownership /var/lib/anipulse/anipulse.db \
+  /var/lib/anipulse/anipulse.db.before-episode-repair
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime show 1
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime disable 1
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  anime repair-episode 1 --episode 9 --yes
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime enable 1
+sudo systemctl start anipulse.service
+```
+
+它会在一个事务中删除 EP9 的错误通知、过期其错误候选、删除 EP10 及更后的派生 Episode，并把 EP9 设为立即检查。该命令要求 Anime 已禁用，且只能回到当前集或数据库中已有的更早集；已发出的飞书消息无法撤回。
+
 ## 11. 升级
 
 在源码目录拉取新版本并验证：

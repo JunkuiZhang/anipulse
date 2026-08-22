@@ -12,8 +12,8 @@ AniPulse 是一个面向个人 Linux 服务器的番剧更新监控器。它低�
 - Trusted Uploader、Independent Consensus、Manual Confirmation 三条确认路径；
 - 公共聚合搜索、WBI 回退和视频详情 Provider 隔离；识别 `v_voucher` 软风控响应，并执行全局串行限流、每日预算及 429/412/临时失败退避；
 - 飞书消息卡片通知、幂等重试、下一集推进、动态轮询、jitter 和 systemd 常驻运行；
-- CLI 改名、按 B 站链接人工确认、候选 accept/reject 与 per-Anime UP trust/block；
-- 单管理员鉴权网页：Dashboard、添加/启停/改名/安全删除、候选审核、后台任务与审计；
+- CLI 改名、状态回退修复、按 B 站链接人工确认、候选 accept/reject 与 per-Anime UP trust/block；
+- 单管理员鉴权网页：Dashboard、卡片式追番、添加/启停/改名/安全删除、候选审核、过滤与信任规则、后台任务与审计；
 - 无法自动确认时发送飞书私聊审核卡片，登录网页后选择候选、都不选或提交链接。
 
 V1 不下载视频、不使用登录 Cookie、不绕过风控，也不处理 `EP12.5`、SP、OVA、连播或分 P 的自动推进。此类标题只进入人工复核。
@@ -58,6 +58,7 @@ anipulse anime show 1
 anipulse anime edit 1 --title "无职转生 第三季"
 anipulse anime sync 1
 anipulse anime disable 4
+anipulse anime repair-episode 1 --episode 9 --yes
 anipulse anime remove 4 --yes
 anipulse check 1
 anipulse candidate list --state pending --explain
@@ -77,6 +78,10 @@ anipulse run
 
 `candidate accept` 只事务化确认状态并创建 pending notification；下一次 `run` 或 `check` 会发送它。这样即使通知服务暂时失败也不会丢失已确认更新。
 
+候选写操作以 `Episode ID + BV 号` 为完整身份。确认某一集后，同集其余待审核候选会立即过期；旧页面或旧飞书审核入口不能拿上一集视频推进当前集。升级 migration 也会清理旧版本遗留在已完成 Episode 下的 pending candidate。
+
+如果旧版本已经把错误视频当成 EP9 推送并推进到 EP10，不要直接编辑 SQLite。先停止 scheduler、备份数据库并禁用该番剧，再执行 `anime repair-episode ANIME_ID --episode 9 --yes`；命令会删除 EP9 的错误通知记录、使其错误候选过期、删除 EP10 及更后面的派生状态，把 EP9 恢复为立即检查。错误的飞书卡片无法撤回，但数据库状态会恢复。完整命令见部署文档。
+
 如果搜索没有发现目标视频，但你已经拿到规范的 Bilibili 视频地址，可执行 `candidate accept-url ANIME_ID URL`。AniPulse 会先通过 Bilibili 详情接口校验 BV 号并保存标题、UP、时长等元数据，再把它作为当前等待集数的人工确认候选；它不接受第三方域名或任意 URL。
 
 如果当前集的待确认候选全都不对，可在先查看列表后执行 `candidate reject-all ANIME_ID --yes`。它只拒绝该 Anime 当前 Episode 的 pending candidates，并逐个记录人工反馈，不影响之后新发现的候选。
@@ -92,6 +97,8 @@ anipulse web
 ```
 
 网页 Secret 只通过 `ANIPULSE_WEB_SECRET` 提供，飞书 Secret 仍只交给 `anipulse run`。完整的域名、Caddy、systemd、管理员恢复和审核提醒部署步骤见 [`doc/web-deployment.md`](doc/web-deployment.md)。
+
+网页“规则”页可以全局维护屏蔽词，并按番剧维护信任 UP。屏蔽词会在后续检查中匹配视频标题、简介和标签并硬排除候选；信任 UP 仍必须通过番名、目标集数、时长和屏蔽词检查，不是无条件放行。
 
 ## 通知
 

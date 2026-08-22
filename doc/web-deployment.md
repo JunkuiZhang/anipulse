@@ -162,7 +162,7 @@ curl -i http://127.0.0.1:8080/healthz
 curl -I https://anime.example.com/login
 ```
 
-8080 应只出现在 `127.0.0.1`，`/healthz` 只返回固定的 `ok`。打开 `https://anime.example.com/login` 登录后，可看到 Dashboard、追番、候选、后台任务、审计和状态页面。
+8080 应只出现在 `127.0.0.1`，`/healthz` 只返回固定的 `ok`。打开 `https://anime.example.com/login` 登录后，可看到 Dashboard、卡片式追番、候选、过滤与信任规则、后台任务、审计和状态页面。
 
 网页空闲时不请求 Bilibili。点击“立即检查”“同步排期”“测试通知”或提交 B 站链接只会写入 `management_job`；`anipulse run` 在下一个 scheduler tick 领取任务。因此 scheduler 停止时任务会保持 `queued`，网页仍可查看和编辑本地数据。
 
@@ -196,6 +196,13 @@ sudo systemctl restart anipulse.service
 在审核页可以选择一个候选、将页面当时展示的候选全部拒绝，或提交规范的 B 站 HTTPS `/video/BV...` 链接。链接由 scheduler 获取真实标题、UP 和时长后保存为待确认候选，你还需要在页面上最终点一次确认。
 
 候选列表中的“屏蔽此 UP”只对当前番剧生效：它会在一个事务中记录屏蔽状态，并拒绝该 UP 在此番剧下已有的全部待审核候选；以后检测到的候选也会自动排除。操作完成后页面会显示结果提示。“信任此 UP”同样只对当前番剧生效。
+
+导航栏的“规则”页提供两类可编辑规则：
+
+- 屏蔽词是全局规则，匹配候选的标题、简介或标签后硬拒绝；新建或修改后从下一次检查开始生效，当前仍在列表中的候选可以先手工拒绝或点“立即检查”重新评估；
+- 信任 UP 按番剧生效，可以添加、改 UID/显示名称、换所属番剧或移除。候选页点“信任此 UP”创建的记录也会出现在这里；信任不绕过番名、集数、时长和屏蔽词规则。
+
+候选确认和拒绝的网页路径同时绑定 Episode ID 与 BV 号。旧审核页即使仍开在浏览器里，也不能用上一集的同 BV 号确认当前集；一集确认后，同集未选择的候选立即变成“已过期”。
 
 ## 9. 升级、回滚和日志
 
@@ -259,3 +266,29 @@ sudo journalctl -u anipulse.service -n 100 --no-pager
 ```
 
 网页服务不会替 scheduler 执行外部请求，这是刻意的 Secret 与故障隔离。
+
+### 旧版本误把上一集视频确认成当前集并推进了一集
+
+例如 EP8 视频被错误当作 EP9 推送，页面已经显示等待 EP10。先确认 Anime ID；下面以尼古喵喵 ID `1`、应恢复到 EP9 为例：
+
+```bash
+sudo systemctl stop anipulse.service
+sudo cp --preserve=mode,ownership /var/lib/anipulse/anipulse.db \
+  /var/lib/anipulse/anipulse.db.before-episode-repair
+
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime show 1
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime disable 1
+
+# 不带 --yes 会拒绝执行并显示将要从哪一集回退，可先用它复核。
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  anime repair-episode 1 --episode 9
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml \
+  anime repair-episode 1 --episode 9 --yes
+
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime show 1
+sudo -u anipulse /usr/local/bin/anipulse --config /etc/anipulse/config.toml anime enable 1
+sudo systemctl start anipulse.service
+sudo journalctl -u anipulse.service -n 100 --no-pager
+```
+
+修复是一个 SQLite 事务：删除目标集的错误通知记录、使该集 pending/confirmed 候选过期、删除更后面的派生 Episode，并把目标集恢复为 `waiting` 且立即检查。命令要求番剧先处于禁用状态，并校验当前 Episode 在操作期间没有变化。已经发到飞书的错误卡片无法撤回。

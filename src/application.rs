@@ -10,7 +10,7 @@ use crate::{
     domain::{Anime, AutoScheduleMetadata, CandidateState, NewAnime, VideoCandidate},
     error::{AppError, Result},
     provider::{BilibiliProvider, VideoSearchProvider},
-    repository::Repository,
+    repository::{EpisodeRepairSummary, Repository},
     schedule::ScheduleProvider,
 };
 
@@ -126,9 +126,17 @@ impl ApplicationService {
 
     pub async fn accept_candidate(&self, bvid: &str) -> Result<()> {
         let (candidate, _) = self.repository.candidate_context(bvid).await?;
+        self.accept_candidate_for_episode(candidate.episode_id, bvid)
+            .await
+    }
+
+    pub async fn accept_candidate_for_episode(&self, episode_id: i64, bvid: &str) -> Result<()> {
+        self.repository
+            .candidate_context_for_episode(episode_id, bvid)
+            .await?;
         self.repository
             .confirm_candidate(
-                candidate.episode_id,
+                episode_id,
                 bvid,
                 "manual_confirmation",
                 &self.config.notification.channel,
@@ -139,6 +147,12 @@ impl ApplicationService {
 
     pub async fn reject_candidate(&self, bvid: &str) -> Result<()> {
         self.repository.reject_candidate(bvid, true).await
+    }
+
+    pub async fn reject_candidate_for_episode(&self, episode_id: i64, bvid: &str) -> Result<()> {
+        self.repository
+            .reject_candidate_for_episode(episode_id, bvid, true)
+            .await
     }
 
     pub async fn reject_all_candidates(&self, anime_id: i64) -> Result<(i64, u64)> {
@@ -164,6 +178,62 @@ impl ApplicationService {
 
     pub async fn block_uploader(&self, anime_id: i64, mid: i64) -> Result<u64> {
         self.repository.block_uploader(anime_id, mid).await
+    }
+
+    pub async fn add_blocked_keyword(&self, keyword: &str) -> Result<i64> {
+        let (keyword, normalized) = validate_blocked_keyword(keyword)?;
+        self.repository
+            .add_blocked_keyword(&keyword, &normalized)
+            .await
+    }
+
+    pub async fn update_blocked_keyword(&self, id: i64, keyword: &str) -> Result<()> {
+        let (keyword, normalized) = validate_blocked_keyword(keyword)?;
+        self.repository
+            .update_blocked_keyword(id, &keyword, &normalized)
+            .await
+    }
+
+    pub async fn delete_blocked_keyword(&self, id: i64) -> Result<()> {
+        self.repository.delete_blocked_keyword(id).await
+    }
+
+    pub async fn add_trusted_uploader(&self, anime_id: i64, mid: i64, name: &str) -> Result<()> {
+        let name = validate_uploader_input(mid, name)?;
+        self.repository
+            .add_manually_trusted_uploader(anime_id, mid, &name)
+            .await
+    }
+
+    pub async fn update_trusted_uploader(
+        &self,
+        old_anime_id: i64,
+        old_mid: i64,
+        anime_id: i64,
+        mid: i64,
+        name: &str,
+    ) -> Result<()> {
+        let name = validate_uploader_input(mid, name)?;
+        self.repository
+            .update_manually_trusted_uploader(old_anime_id, old_mid, anime_id, mid, &name)
+            .await
+    }
+
+    pub async fn remove_trusted_uploader(&self, anime_id: i64, mid: i64) -> Result<()> {
+        self.repository
+            .remove_manual_uploader_trust(anime_id, mid)
+            .await
+    }
+
+    pub async fn repair_current_episode(
+        &self,
+        anime_id: i64,
+        expected_current_episode_id: i64,
+        target_episode_no: i64,
+    ) -> Result<EpisodeRepairSummary> {
+        self.repository
+            .repair_current_episode(anime_id, expected_current_episode_id, target_episode_no)
+            .await
     }
 
     pub async fn enqueue_job(
@@ -249,12 +319,20 @@ impl ApplicationService {
             .repository
             .uploader_trust(anime_id, candidate.uploader_mid)
             .await?;
+        let blocked_keywords = self
+            .repository
+            .list_blocked_keywords()
+            .await?
+            .into_iter()
+            .map(|row| row.normalized_keyword)
+            .collect::<Vec<_>>();
         let evaluation = evaluator::evaluate(
             &anime,
             &episode,
             &candidate,
             &trust,
             self.config.confirmation.trusted_confirmed_count,
+            &blocked_keywords,
         );
         self.repository
             .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
@@ -433,6 +511,41 @@ fn validate_anime_draft(request: &AnimeDraftRequest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_blocked_keyword(value: &str) -> Result<(String, String)> {
+    let keyword = value.trim().to_string();
+    if keyword.is_empty() || keyword.chars().count() > 80 {
+        return Err(AppError::InvalidInput(
+            "blocked keyword must contain between 1 and 80 characters".into(),
+        ));
+    }
+    let normalized = normalize_title(&keyword);
+    if normalized.is_empty() {
+        return Err(AppError::InvalidInput(
+            "blocked keyword must contain searchable characters".into(),
+        ));
+    }
+    Ok((keyword, normalized))
+}
+
+fn validate_uploader_input(mid: i64, value: &str) -> Result<String> {
+    if mid <= 0 {
+        return Err(AppError::InvalidInput(
+            "Bilibili uploader UID must be greater than zero".into(),
+        ));
+    }
+    let name = value.trim();
+    if name.chars().count() > 100 {
+        return Err(AppError::InvalidInput(
+            "uploader display name must not exceed 100 characters".into(),
+        ));
+    }
+    Ok(if name.is_empty() {
+        format!("UID {mid}")
+    } else {
+        name.to_string()
+    })
 }
 
 pub fn parse_bilibili_bvid(value: &str) -> Result<String> {
