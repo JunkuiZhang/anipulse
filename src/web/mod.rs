@@ -40,6 +40,7 @@ use cover_cache::{CoverAsset, CoverCache};
 
 const SESSION_COOKIE: &str = "__Host-anipulse_session";
 const APP_CSS: &str = include_str!("../../static/app.css");
+const APP_FAVICON: &str = include_str!("../../static/favicon.svg");
 
 #[derive(Clone)]
 struct WebState {
@@ -193,6 +194,8 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/static/app.css", get(stylesheet))
+        .route("/static/favicon.svg", get(favicon))
+        .route("/favicon.ico", get(favicon))
         .route("/login", get(login_page).post(login_submit))
         .merge(protected)
         .fallback(not_found)
@@ -278,6 +281,19 @@ async fn stylesheet() -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+async fn favicon() -> Response {
+    let mut response = APP_FAVICON.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=604800"),
+    );
     response
 }
 
@@ -2690,6 +2706,45 @@ mod tests {
             String::from_utf8(body.to_vec())
                 .unwrap()
                 .contains("color-scheme: light")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/static/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=604800"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("<svg"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("/static/favicon.svg")
         );
 
         drop((repository, config, auth));
