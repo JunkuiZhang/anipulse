@@ -87,6 +87,15 @@ pub struct EpisodeRepairSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct AnimeArchiveSummary {
+    pub total_episodes: i64,
+    pub removed_episodes: u64,
+    pub removed_candidates: i64,
+    pub removed_notifications: i64,
+    pub removed_jobs: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct DashboardStats {
     pub anime_count: i64,
     pub enabled_anime_count: i64,
@@ -317,11 +326,46 @@ impl Repository {
     }
 
     pub async fn list_anime(&self) -> Result<Vec<Anime>> {
+        Ok(sqlx::query_as::<_, Anime>(
+            "SELECT * FROM anime WHERE lifecycle != 'archived' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn list_all_anime(&self) -> Result<Vec<Anime>> {
         Ok(
             sqlx::query_as::<_, Anime>("SELECT * FROM anime ORDER BY id")
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn list_archived_anime(&self) -> Result<Vec<Anime>> {
+        Ok(sqlx::query_as::<_, Anime>(
+            "SELECT * FROM anime WHERE lifecycle = 'archived' ORDER BY archived_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn anime_display_number(&self, anime_id: i64) -> Result<i64> {
+        let lifecycle = sqlx::query_scalar::<_, String>("SELECT lifecycle FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if lifecycle == "archived" {
+            return Err(AppError::InvalidInput(
+                "archived anime has no active display number".into(),
+            ));
+        }
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM anime WHERE lifecycle != 'archived' AND id <= ?",
+        )
+        .bind(anime_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn has_bangumi_subject_id(&self, subject_id: i64) -> Result<bool> {
@@ -514,16 +558,239 @@ impl Repository {
     }
 
     pub async fn set_anime_enabled(&self, anime_id: i64, enabled: bool) -> Result<()> {
-        let result = sqlx::query("UPDATE anime SET enabled = ?, updated_at = ? WHERE id = ?")
-            .bind(enabled)
-            .bind(Utc::now())
-            .bind(anime_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE anime SET enabled = ?, updated_at = ? WHERE id = ? AND lifecycle = 'tracking'",
+        )
+        .bind(enabled)
+        .bind(Utc::now())
+        .bind(anime_id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(format!("anime {anime_id}")));
         }
         Ok(())
+    }
+
+    pub async fn mark_anime_released_complete(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+    ) -> Result<i64> {
+        if total_episodes.is_some_and(|value| value <= 0 || value > 10_000) {
+            return Err(AppError::InvalidInput(
+                "total episodes must be between 1 and 10000".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if anime.lifecycle == "archived" {
+            return Err(AppError::InvalidInput(
+                "archived anime cannot be marked released complete".into(),
+            ));
+        }
+        let completed_max = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(episode_no), 0) FROM episode
+               WHERE anime_id = ? AND state IN ('confirmed', 'notified')"#,
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let inferred_total = total_episodes
+            .or(anime.total_episodes)
+            .unwrap_or(completed_max);
+        if inferred_total <= 0 {
+            return Err(AppError::InvalidInput(
+                "cannot infer total episodes; enter the completed episode count".into(),
+            ));
+        }
+        if inferred_total < completed_max {
+            return Err(AppError::InvalidInput(format!(
+                "total episodes cannot be lower than completed EP{completed_max}"
+            )));
+        }
+        sqlx::query(
+            r#"DELETE FROM episode
+               WHERE anime_id = ? AND state NOT IN ('confirmed', 'notified')"#,
+        )
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM management_job
+               WHERE target_type = 'anime' AND target_id = ? AND state != 'running'"#,
+        )
+        .bind(anime_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE anime SET lifecycle = 'released_complete', enabled = 0,
+                   total_episodes = ?, released_completed_at = COALESCE(released_completed_at, ?),
+                   schedule_next_sync_at = NULL, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(inferred_total)
+        .bind(now)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(inferred_total)
+    }
+
+    pub async fn resume_anime_tracking(&self, anime_id: i64, next_episode: i64) -> Result<()> {
+        if next_episode <= 0 || next_episode > 10_000 {
+            return Err(AppError::InvalidInput(
+                "next episode must be between 1 and 10000".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let lifecycle = sqlx::query_scalar::<_, String>("SELECT lifecycle FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if lifecycle != "released_complete" {
+            return Err(AppError::InvalidInput(
+                "only a released-complete anime can resume tracking".into(),
+            ));
+        }
+        let existing = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM episode WHERE anime_id = ? AND episode_no = ?)",
+        )
+        .bind(anime_id)
+        .bind(next_episode)
+        .fetch_one(&mut *tx)
+        .await?;
+        if existing {
+            return Err(AppError::InvalidInput(
+                "the selected next episode already exists in history".into(),
+            ));
+        }
+        sqlx::query(
+            r#"INSERT INTO episode(anime_id, episode_no, state, next_check_at)
+               VALUES (?, ?, 'watching', ?)"#,
+        )
+        .bind(anime_id)
+        .bind(next_episode)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE anime SET lifecycle = 'tracking', enabled = 1,
+                   total_episodes = NULL, released_completed_at = NULL,
+                   schedule_next_sync_at = CASE WHEN auto_schedule = 1 THEN ? ELSE schedule_next_sync_at END,
+                   updated_at = ? WHERE id = ?"#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn archive_anime(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+        summary: &str,
+    ) -> Result<AnimeArchiveSummary> {
+        if total_episodes.is_some_and(|value| value <= 0 || value > 10_000) {
+            return Err(AppError::InvalidInput(
+                "total episodes must be between 1 and 10000".into(),
+            ));
+        }
+        let summary = summary.trim();
+        if summary.chars().count() > 4_000 {
+            return Err(AppError::InvalidInput(
+                "archive summary must not exceed 4000 characters".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if anime.lifecycle != "released_complete" {
+            return Err(AppError::InvalidInput(
+                "mark the anime as released complete before archiving it".into(),
+            ));
+        }
+        let completed_max = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(episode_no), 0) FROM episode
+               WHERE anime_id = ? AND state IN ('confirmed', 'notified')"#,
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let total_episodes = total_episodes
+            .or(anime.total_episodes)
+            .unwrap_or(completed_max);
+        if total_episodes <= 0 || total_episodes < completed_max {
+            return Err(AppError::InvalidInput(
+                "archive total episodes is lower than the completed history".into(),
+            ));
+        }
+        let removed_candidates = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM candidate WHERE episode_id IN (SELECT id FROM episode WHERE anime_id = ?)",
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let removed_notifications = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification WHERE episode_id IN (SELECT id FROM episode WHERE anime_id = ?)",
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let removed_episodes = sqlx::query("DELETE FROM episode WHERE anime_id = ?")
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query("DELETE FROM uploader_trust WHERE anime_id = ?")
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+        let removed_jobs = sqlx::query(
+            "DELETE FROM management_job WHERE target_type = 'anime' AND target_id = ? AND state != 'running'",
+        )
+        .bind(anime_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            r#"UPDATE anime SET lifecycle = 'archived', enabled = 0,
+                   summary = ?, total_episodes = ?, archived_at = ?,
+                   schedule_next_sync_at = NULL, schedule_sync_error = NULL, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(summary)
+        .bind(total_episodes)
+        .bind(now)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AnimeArchiveSummary {
+            total_episodes,
+            removed_episodes,
+            removed_candidates,
+            removed_notifications,
+            removed_jobs,
+        })
     }
 
     pub async fn active_episode(&self, anime_id: i64) -> Result<Episode> {
@@ -550,26 +817,36 @@ impl Repository {
         }
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let anime_exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM anime WHERE id = ?)")
-                .bind(anime_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !anime_exists {
-            return Err(AppError::NotFound(format!("anime {anime_id}")));
-        }
-        let current_episode_no = sqlx::query_scalar::<_, i64>(
-            r#"SELECT episode_no FROM episode
-               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
-               ORDER BY episode_no LIMIT 1"#,
+        let (lifecycle, total_episodes) = sqlx::query_as::<_, (String, Option<i64>)>(
+            "SELECT lifecycle, total_episodes FROM anime WHERE id = ?",
         )
         .bind(anime_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::InvalidInput("anime has no active episode".into()))?;
-        if episode_no >= current_episode_no {
+        .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if lifecycle == "archived" {
+            return Err(AppError::InvalidInput(
+                "archived anime no longer accepts episode videos".into(),
+            ));
+        }
+        let exclusive_limit = if lifecycle == "released_complete" {
+            total_episodes
+                .ok_or_else(|| AppError::InvalidInput("anime total episodes is unknown".into()))?
+                + 1
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                r#"SELECT episode_no FROM episode
+                   WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+                   ORDER BY episode_no LIMIT 1"#,
+            )
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::InvalidInput("anime has no active episode".into()))?
+        };
+        if episode_no >= exclusive_limit {
             return Err(AppError::InvalidInput(format!(
-                "historical episode must be earlier than current EP{current_episode_no}"
+                "historical episode must be earlier than EP{exclusive_limit}"
             )));
         }
         sqlx::query(
@@ -919,6 +1196,7 @@ impl Repository {
             r#"SELECT e.anime_id FROM episode e
                JOIN anime a ON a.id = e.anime_id
                WHERE a.enabled = 1
+                 AND a.lifecycle = 'tracking'
                  AND e.state IN ('waiting','watching','candidate_found','needs_manual_review')
                  AND e.next_check_at <= ?
                ORDER BY e.next_check_at LIMIT ?"#,
@@ -930,17 +1208,18 @@ impl Repository {
     }
 
     pub async fn enabled_anime_ids(&self) -> Result<Vec<i64>> {
-        Ok(
-            sqlx::query_scalar::<_, i64>("SELECT id FROM anime WHERE enabled = 1 ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?,
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM anime WHERE enabled = 1 AND lifecycle = 'tracking' ORDER BY id",
         )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn auto_schedule_due_ids(&self, limit: i64) -> Result<Vec<i64>> {
         Ok(sqlx::query_scalar::<_, i64>(
             r#"SELECT id FROM anime
                WHERE enabled = 1 AND auto_schedule = 1
+                 AND lifecycle = 'tracking'
                  AND (schedule_next_sync_at IS NULL OR schedule_next_sync_at <= ?)
                ORDER BY COALESCE(schedule_next_sync_at, created_at) LIMIT ?"#,
         )
@@ -962,7 +1241,7 @@ impl Repository {
                 bangumi_subject_id = ?, expected_weekday = ?, expected_time = ?, timezone = ?,
                 broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
                 schedule_sync_error = NULL, updated_at = ?
-               WHERE id = ? AND auto_schedule = 1"#,
+               WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
         )
         .bind(update.bangumi_subject_id)
         .bind(update.expected_weekday)
@@ -2023,13 +2302,17 @@ impl Repository {
         let next_check = now + chrono::Duration::hours(6);
         sqlx::query(
             r#"INSERT OR IGNORE INTO episode(
-                anime_id, episode_no, expected_at, state, next_check_at
-            ) VALUES (?, ?, ?, 'waiting', ?)"#,
+                   anime_id, episode_no, expected_at, state, next_check_at
+               ) SELECT ?, ?, ?, 'waiting', ?
+                 WHERE EXISTS (
+                   SELECT 1 FROM anime WHERE id = ? AND lifecycle = 'tracking'
+                 )"#,
         )
         .bind(episode.anime_id)
         .bind(episode.episode_no + 1)
         .bind(next_expected)
         .bind(next_check)
+        .bind(episode.anime_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -2045,7 +2328,7 @@ impl Repository {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE anime SET schedule_next_sync_at = ? WHERE id = ? AND auto_schedule = 1",
+            "UPDATE anime SET schedule_next_sync_at = ? WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'",
         )
         .bind(now)
         .bind(episode.anime_id)
@@ -2886,13 +3169,15 @@ impl Repository {
     }
 
     pub async fn dashboard_stats(&self) -> Result<DashboardStats> {
-        let anime_count = sqlx::query_scalar("SELECT COUNT(*) FROM anime")
-            .fetch_one(&self.pool)
-            .await?;
-        let enabled_anime_count =
-            sqlx::query_scalar("SELECT COUNT(*) FROM anime WHERE enabled = 1")
+        let anime_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM anime WHERE lifecycle != 'archived'")
                 .fetch_one(&self.pool)
                 .await?;
+        let enabled_anime_count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM anime WHERE enabled = 1 AND lifecycle = 'tracking'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let pending_candidate_count =
             sqlx::query_scalar("SELECT COUNT(*) FROM candidate WHERE state = 'pending'")
                 .fetch_one(&self.pool)
@@ -3197,6 +3482,231 @@ mod tests {
         let blocked = blocked.iter().find(|video| video.id == low_id).unwrap();
         assert!(blocked.manually_blocked);
         assert!(!blocked.is_preferred);
+    }
+
+    #[tokio::test]
+    async fn bocchi_release_completion_waits_for_manual_archive_and_compacts_runtime_data() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("bocchi-archive.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "孤独摇滚！".into(),
+                aliases: vec!["ぼっち・ざ・ろっく！".into(), "Bocchi the Rock!".into()],
+                next_episode: 12,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_680,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 328_609,
+                    broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
+                    next_sync_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        let episode_twelve = repository.active_episode(anime_id).await.unwrap();
+        let (mut video, evaluation) = candidate();
+        video.title = "孤独摇滚！ EP12".into();
+        repository
+            .upsert_candidate(
+                episode_twelve.id,
+                &video,
+                &evaluation,
+                CandidateState::Pending,
+            )
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode_twelve.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .episode_no,
+            13
+        );
+
+        assert_eq!(
+            repository
+                .mark_anime_released_complete(anime_id, Some(12))
+                .await
+                .unwrap(),
+            12
+        );
+        let released = repository.get_anime(anime_id).await.unwrap().anime;
+        assert_eq!(released.lifecycle, "released_complete");
+        assert!(!released.enabled);
+        assert_eq!(released.total_episodes, Some(12));
+        assert!(repository.active_episode(anime_id).await.is_err());
+        assert_eq!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        repository
+            .resume_anime_tracking(anime_id, 13)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .episode_no,
+            13
+        );
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .lifecycle,
+            "tracking"
+        );
+        repository
+            .mark_anime_released_complete(anime_id, Some(12))
+            .await
+            .unwrap();
+
+        repository
+            .enqueue_management_job(
+                "check_anime",
+                Some("anime"),
+                Some(&anime_id.to_string()),
+                "{}",
+                None,
+                Some("bocchi:archive:test"),
+            )
+            .await
+            .unwrap();
+        let archived = repository
+            .archive_anime(anime_id, Some(12), "乐队成长故事；已看完。")
+            .await
+            .unwrap();
+        assert_eq!(archived.total_episodes, 12);
+        assert_eq!(archived.removed_episodes, 1);
+        assert_eq!(archived.removed_candidates, 1);
+        assert_eq!(archived.removed_notifications, 1);
+        assert_eq!(archived.removed_jobs, 1);
+
+        assert!(repository.list_anime().await.unwrap().is_empty());
+        assert_eq!(repository.list_archived_anime().await.unwrap().len(), 1);
+        assert_eq!(repository.list_all_anime().await.unwrap().len(), 1);
+        let collection = repository.get_anime(anime_id).await.unwrap().anime;
+        assert_eq!(collection.lifecycle, "archived");
+        assert_eq!(collection.summary, "乐队成长故事；已看完。");
+        assert_eq!(collection.bangumi_subject_id, Some(328_609));
+        assert!(collection.archived_at.is_some());
+        assert!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repository.list_candidates(None).await.unwrap().is_empty());
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        assert!(
+            repository
+                .list_management_jobs(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_display_numbers_close_gaps_after_an_archive() {
+        let (_directory, repository, first_id, _episode) = fixture().await;
+        let add = |title: &str| NewAnime {
+            title: title.into(),
+            aliases: vec![],
+            next_episode: 1,
+            expected_at: None,
+            expected_weekday: None,
+            expected_time: None,
+            timezone: "Asia/Shanghai".into(),
+            duration_min_sec: 1_200,
+            duration_max_sec: 1_680,
+            auto_schedule: None,
+        };
+        let second_id = repository.add_anime(add("孤独摇滚！")).await.unwrap();
+        let third_id = repository.add_anime(add("轻音少女")).await.unwrap();
+        repository
+            .mark_anime_released_complete(second_id, Some(12))
+            .await
+            .unwrap();
+        repository
+            .archive_anime(second_id, Some(12), "")
+            .await
+            .unwrap();
+
+        let current = repository.list_anime().await.unwrap();
+        assert_eq!(
+            current.iter().map(|anime| anime.id).collect::<Vec<_>>(),
+            vec![first_id, third_id]
+        );
+        assert_eq!(repository.anime_display_number(first_id).await.unwrap(), 1);
+        assert_eq!(repository.anime_display_number(third_id).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn final_notification_does_not_create_a_next_episode_after_release_completion() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (video, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_anime_released_complete(anime_id, Some(8))
+            .await
+            .unwrap();
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+
+        assert!(repository.active_episode(anime_id).await.is_err());
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .lifecycle,
+            "released_complete"
+        );
+        assert_eq!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

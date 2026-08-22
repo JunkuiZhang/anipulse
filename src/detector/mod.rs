@@ -419,6 +419,11 @@ mod tests {
                 schedule_sync_at: None,
                 schedule_next_sync_at: None,
                 schedule_sync_error: None,
+                lifecycle: "tracking".into(),
+                summary: String::new(),
+                total_episodes: None,
+                released_completed_at: None,
+                archived_at: None,
             },
             aliases: vec!["尼古喵喵".into(), "ヤニねこ".into()],
         };

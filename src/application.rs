@@ -10,7 +10,7 @@ use crate::{
     domain::{Anime, AutoScheduleMetadata, CandidateState, NewAnime, VideoCandidate},
     error::{AppError, Result},
     provider::{BilibiliProvider, VideoSearchProvider},
-    repository::{EpisodeRepairSummary, Repository},
+    repository::{AnimeArchiveSummary, EpisodeRepairSummary, Repository},
     schedule::ScheduleProvider,
 };
 
@@ -103,6 +103,33 @@ impl ApplicationService {
 
     pub async fn set_anime_enabled(&self, anime_id: i64, enabled: bool) -> Result<()> {
         self.repository.set_anime_enabled(anime_id, enabled).await
+    }
+
+    pub async fn mark_anime_released_complete(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+    ) -> Result<i64> {
+        self.repository
+            .mark_anime_released_complete(anime_id, total_episodes)
+            .await
+    }
+
+    pub async fn resume_anime_tracking(&self, anime_id: i64, next_episode: i64) -> Result<()> {
+        self.repository
+            .resume_anime_tracking(anime_id, next_episode)
+            .await
+    }
+
+    pub async fn archive_anime(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+        summary: &str,
+    ) -> Result<AnimeArchiveSummary> {
+        self.repository
+            .archive_anime(anime_id, total_episodes, summary)
+            .await
     }
 
     pub async fn rename_anime(&self, anime_id: i64, title: &str) -> Result<Anime> {

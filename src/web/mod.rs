@@ -125,6 +125,13 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/disable", post(anime_disable))
         .route("/anime/{id}/check", post(anime_check))
         .route("/anime/{id}/sync", post(anime_sync))
+        .route(
+            "/anime/{id}/released-complete",
+            post(anime_released_complete),
+        )
+        .route("/anime/{id}/resume", post(anime_resume_tracking))
+        .route("/anime/{id}/archive-intent", post(anime_archive_intent))
+        .route("/anime/{id}/archive", post(anime_archive))
         .route("/anime/{id}/history/videos", post(history_video_add))
         .route(
             "/anime/{id}/history/videos/{video_id}/update",
@@ -493,14 +500,18 @@ async fn dashboard(
 
 struct AnimeListItem {
     id: i64,
+    display_no: usize,
     title: String,
     cover_url: String,
     has_cover: bool,
     cover_initial: String,
     episode: String,
+    time_label: String,
     next_check: String,
     schedule: String,
     enabled: bool,
+    released_complete: bool,
+    archived: bool,
 }
 
 #[derive(Template)]
@@ -509,38 +520,99 @@ struct AnimeListTemplate {
     username: String,
     csrf_token: String,
     items: Vec<AnimeListItem>,
+    current_selected: bool,
+    archived_selected: bool,
+    notice: String,
+}
+
+#[derive(Deserialize, Default)]
+struct AnimeListQuery {
+    view: Option<String>,
+    result: Option<String>,
 }
 
 async fn anime_list(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
+    Query(query): Query<AnimeListQuery>,
 ) -> WebResponse {
+    let archived_selected = match query.view.as_deref().unwrap_or("current") {
+        "current" => false,
+        "archived" => true,
+        _ => return Err(WebError::bad_request("无效的追番视图")),
+    };
+    let anime_rows = if archived_selected {
+        state.repository.list_archived_anime().await?
+    } else {
+        state.repository.list_anime().await?
+    };
     let mut items = Vec::new();
-    for anime in state.repository.list_anime().await? {
-        let episode = state.repository.active_episode(anime.id).await.ok();
+    for (index, anime) in anime_rows.into_iter().enumerate() {
+        let episode = if anime.lifecycle == "tracking" {
+            state.repository.active_episode(anime.id).await.ok()
+        } else {
+            None
+        };
         let cover_url = anime.bangumi_subject_id.and_then(bangumi_cover_url);
         let cover_initial = title_initial(&anime.title);
         items.push(AnimeListItem {
             id: anime.id,
+            display_no: index + 1,
             title: anime.title,
             has_cover: cover_url.is_some(),
             cover_url: cover_url.unwrap_or_default(),
             cover_initial,
-            episode: episode
-                .as_ref()
-                .map(|episode| {
-                    format!(
-                        "EP{} · {}",
-                        episode.episode_no,
-                        episode_state_label(&episode.state)
-                    )
-                })
-                .unwrap_or_else(|| "—".into()),
-            next_check: episode
-                .as_ref()
-                .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
-                .unwrap_or_else(|| "—".into()),
-            schedule: if anime.auto_schedule {
+            episode: if anime.lifecycle == "archived" {
+                anime
+                    .total_episodes
+                    .map(|total| format!("全 {total} 集 · 已收藏"))
+                    .unwrap_or_else(|| "已归档收藏".into())
+            } else if anime.lifecycle == "released_complete" {
+                anime
+                    .total_episodes
+                    .map(|total| format!("全 {total} 集 · 待看完"))
+                    .unwrap_or_else(|| "已播完 · 待看完".into())
+            } else {
+                episode
+                    .as_ref()
+                    .map(|episode| {
+                        format!(
+                            "EP{} · {}",
+                            episode.episode_no,
+                            episode_state_label(&episode.state)
+                        )
+                    })
+                    .unwrap_or_else(|| "—".into())
+            },
+            time_label: if anime.lifecycle == "archived" {
+                "归档时间".into()
+            } else {
+                "下次检查".into()
+            },
+            next_check: if anime.lifecycle == "released_complete" {
+                "已停止检查".into()
+            } else if anime.lifecycle == "archived" {
+                anime
+                    .archived_at
+                    .map(|value| format_time(Some(value), state.display_timezone))
+                    .unwrap_or_else(|| "—".into())
+            } else {
+                episode
+                    .as_ref()
+                    .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
+                    .unwrap_or_else(|| {
+                        anime
+                            .archived_at
+                            .map(|value| format_time(Some(value), state.display_timezone))
+                            .unwrap_or_else(|| "—".into())
+                    })
+            },
+            schedule: if anime.lifecycle == "archived" {
+                anime
+                    .bangumi_subject_id
+                    .map(|id| format!("收藏 · #{id}"))
+                    .unwrap_or_else(|| "收藏".into())
+            } else if anime.auto_schedule {
                 anime
                     .bangumi_subject_id
                     .map(|id| format!("自动 · #{id}"))
@@ -549,12 +621,22 @@ async fn anime_list(
                 "手工".into()
             },
             enabled: anime.enabled,
+            released_complete: anime.lifecycle == "released_complete",
+            archived: anime.lifecycle == "archived",
         });
     }
+    let notice = match query.result.as_deref() {
+        Some("archived") => "番剧已归档，运行中的集数、候选、通知和检查任务已清理。",
+        _ => "",
+    }
+    .to_string();
     render(AnimeListTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
         items,
+        current_selected: !archived_selected,
+        archived_selected,
+        notice,
     })
 }
 
@@ -770,6 +852,7 @@ struct AnimeDetailTemplate {
     username: String,
     csrf_token: String,
     id: i64,
+    display_no: i64,
     title: String,
     cover_url: String,
     has_cover: bool,
@@ -785,6 +868,29 @@ struct AnimeDetailTemplate {
     episode_id: i64,
     history: Vec<EpisodeHistoryView>,
     notice: String,
+    tracking: bool,
+    released_complete: bool,
+    lifecycle_label: String,
+    suggested_total: i64,
+    resume_episode: i64,
+}
+
+#[derive(Template)]
+#[template(path = "anime_archive_detail.html")]
+struct AnimeArchiveDetailTemplate {
+    username: String,
+    csrf_token: String,
+    id: i64,
+    title: String,
+    cover_url: String,
+    has_cover: bool,
+    cover_initial: String,
+    aliases: String,
+    summary: String,
+    has_summary: bool,
+    total_episodes: String,
+    archived_at: String,
+    bangumi: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -825,9 +931,34 @@ async fn anime_detail(
     Query(query): Query<AnimeDetailQuery>,
 ) -> WebResponse {
     let anime = state.repository.get_anime(id).await?;
-    let episode = state.repository.active_episode(id).await.ok();
     let cover_url = anime.anime.bangumi_subject_id.and_then(bangumi_cover_url);
     let cover_initial = title_initial(&anime.anime.title);
+    if anime.anime.lifecycle == "archived" {
+        return render(AnimeArchiveDetailTemplate {
+            username: identity.username,
+            csrf_token: identity.csrf_token,
+            id,
+            title: anime.anime.title,
+            has_cover: cover_url.is_some(),
+            cover_url: cover_url.unwrap_or_default(),
+            cover_initial,
+            aliases: anime.aliases.join("、"),
+            has_summary: !anime.anime.summary.is_empty(),
+            summary: anime.anime.summary,
+            total_episodes: anime
+                .anime
+                .total_episodes
+                .map(|value| format!("全 {value} 集"))
+                .unwrap_or_else(|| "未知".into()),
+            archived_at: format_time(anime.anime.archived_at, state.display_timezone),
+            bangumi: anime
+                .anime
+                .bangumi_subject_id
+                .map(|value| format!("#{value}"))
+                .unwrap_or_else(|| "未绑定".into()),
+        });
+    }
+    let episode = state.repository.active_episode(id).await.ok();
     let history = episode_history_views(
         state.repository.list_episode_videos(id).await?,
         state.config.confirmation.trusted_confirmed_count,
@@ -840,37 +971,67 @@ async fn anime_detail(
         Some("preferred-cleared") => "已恢复自动选择，将显示未屏蔽来源中评分最高的视频。",
         Some("uploader-trusted") => "已信任此 UP。",
         Some("uploader-blocked") => "已屏蔽此 UP；其视频不会再被自动展示或选为最佳。",
+        Some("released-complete") => "已标记为本季播完，并停止查找下一集。等实际看完后再归档即可。",
+        Some("tracking-resumed") => "已恢复监控，系统将从指定的下一集继续检查。",
         _ => "",
     }
     .to_string();
+    let suggested_total = anime
+        .anime
+        .total_episodes
+        .or_else(|| history.first().map(|item| item.episode_no))
+        .or_else(|| {
+            episode
+                .as_ref()
+                .map(|episode| (episode.episode_no - 1).max(1))
+        })
+        .unwrap_or(1);
+    let resume_episode = suggested_total + 1;
     render(AnimeDetailTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
         id,
+        display_no: state.repository.anime_display_number(id).await?,
         title: anime.anime.title,
         has_cover: cover_url.is_some(),
         cover_url: cover_url.unwrap_or_default(),
         cover_initial,
         aliases: anime.aliases.join("、"),
-        episode: episode
-            .as_ref()
-            .map(|episode| {
-                format!(
-                    "EP{} · {}",
-                    episode.episode_no,
-                    episode_state_label(&episode.state)
-                )
-            })
-            .unwrap_or_else(|| "—".into()),
-        expected_at: episode
-            .as_ref()
-            .and_then(|episode| episode.expected_at)
-            .map(|value| format_time(Some(value), state.display_timezone))
-            .unwrap_or_else(|| "未知".into()),
-        next_check: episode
-            .as_ref()
-            .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
-            .unwrap_or_else(|| "—".into()),
+        episode: if anime.anime.lifecycle == "released_complete" {
+            anime
+                .anime
+                .total_episodes
+                .map(|total| format!("全 {total} 集 · 已播完，待看完"))
+                .unwrap_or_else(|| "已播完 · 待看完".into())
+        } else {
+            episode
+                .as_ref()
+                .map(|episode| {
+                    format!(
+                        "EP{} · {}",
+                        episode.episode_no,
+                        episode_state_label(&episode.state)
+                    )
+                })
+                .unwrap_or_else(|| "—".into())
+        },
+        expected_at: if anime.anime.lifecycle == "released_complete" {
+            "本季已停止排期".into()
+        } else {
+            episode
+                .as_ref()
+                .and_then(|episode| episode.expected_at)
+                .map(|value| format_time(Some(value), state.display_timezone))
+                .unwrap_or_else(|| "未知".into())
+        },
+        next_check: if anime.anime.lifecycle == "released_complete" {
+            "已停止检查".into()
+        } else {
+            episode
+                .as_ref()
+                .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
+                .unwrap_or_else(|| "—".into())
+        },
         duration: format!(
             "{}–{} 分钟",
             anime.anime.duration_min_sec / 60,
@@ -886,6 +1047,17 @@ async fn anime_detail(
         episode_id: episode.as_ref().map(|episode| episode.id).unwrap_or(0),
         history,
         notice,
+        tracking: anime.anime.lifecycle == "tracking",
+        released_complete: anime.anime.lifecycle == "released_complete",
+        lifecycle_label: if anime.anime.lifecycle == "released_complete" {
+            "已播完 · 待看完".into()
+        } else if anime.anime.enabled {
+            "监控中".into()
+        } else {
+            "已暂停".into()
+        },
+        suggested_total,
+        resume_episode,
     })
 }
 
@@ -1239,6 +1411,156 @@ async fn anime_sync(
     )
     .await?;
     Ok(Redirect::to(&format!("/anime/{id}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct AnimeReleasedCompleteForm {
+    csrf_token: String,
+    total_episodes: i64,
+}
+
+async fn anime_released_complete(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<AnimeReleasedCompleteForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let total = state
+        .application
+        .mark_anime_released_complete(id, Some(form.total_episodes))
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "anime.released_complete",
+        "anime",
+        id,
+        serde_json::json!({"total_episodes": total}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{id}?result=released-complete")).into_response())
+}
+
+#[derive(Deserialize)]
+struct AnimeResumeForm {
+    csrf_token: String,
+    next_episode: i64,
+}
+
+async fn anime_resume_tracking(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<AnimeResumeForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .resume_anime_tracking(id, form.next_episode)
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "anime.tracking.resume",
+        "anime",
+        id,
+        serde_json::json!({"next_episode": form.next_episode}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{id}?result=tracking-resumed")).into_response())
+}
+
+#[derive(Template)]
+#[template(path = "anime_archive.html")]
+struct AnimeArchiveTemplate {
+    username: String,
+    csrf_token: String,
+    id: i64,
+    title: String,
+    nonce: String,
+    suggested_total: i64,
+    existing_summary: String,
+}
+
+async fn anime_archive_intent(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let anime = state.repository.get_anime(id).await?;
+    if anime.anime.lifecycle != "released_complete" {
+        return Err(WebError::bad_request("请先标记本季已播完，再归档收藏"));
+    }
+    let entity = id.to_string();
+    let nonce = state
+        .auth
+        .issue_action_nonce(&identity, "anime.archive", Some(&entity))
+        .await?;
+    render(AnimeArchiveTemplate {
+        username: identity.username,
+        csrf_token: identity.csrf_token,
+        id,
+        title: anime.anime.title,
+        nonce,
+        suggested_total: anime.anime.total_episodes.unwrap_or(1),
+        existing_summary: anime.anime.summary,
+    })
+}
+
+#[derive(Deserialize)]
+struct AnimeArchiveForm {
+    csrf_token: String,
+    nonce: String,
+    total_episodes: i64,
+    summary: String,
+    confirm_watched: Option<String>,
+}
+
+async fn anime_archive(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<AnimeArchiveForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    if form.confirm_watched.as_deref() != Some("yes") {
+        return Err(WebError::bad_request("请确认已经实际看完本季"));
+    }
+    let entity = id.to_string();
+    if !state
+        .auth
+        .consume_action_nonce(&identity, &form.nonce, "anime.archive", Some(&entity))
+        .await?
+    {
+        return Err(WebError::forbidden("归档确认已使用或过期，请重新开始"));
+    }
+    let archived = state
+        .application
+        .archive_anime(id, Some(form.total_episodes), &form.summary)
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "anime.archive",
+        "anime",
+        id,
+        serde_json::json!({
+            "total_episodes": archived.total_episodes,
+            "removed_episodes": archived.removed_episodes,
+            "removed_candidates": archived.removed_candidates,
+            "removed_notifications": archived.removed_notifications,
+            "removed_jobs": archived.removed_jobs
+        }),
+    )
+    .await?;
+    Ok(Redirect::to("/anime?view=archived&result=archived").into_response())
 }
 
 async fn anime_delete_intent(

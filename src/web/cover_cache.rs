@@ -99,7 +99,7 @@ impl CoverCache {
 
     pub async fn prune(&self, repository: &Repository) -> Result<usize> {
         let subjects = repository
-            .list_anime()
+            .list_all_anime()
             .await?
             .into_iter()
             .filter_map(|anime| anime.bangumi_subject_id)

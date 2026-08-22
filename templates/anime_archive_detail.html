@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · 归档收藏 · AniPulse{% endblock %}
+{% block content %}
+<section class="anime-detail-hero archive-detail-hero">
+  <div class="anime-cover detail-cover">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div>
+  <div class="anime-detail-content">
+    <div class="detail-title-row"><div><p class="eyebrow">ARCHIVED COLLECTION</p><h1>{{ title }}</h1></div><a class="button" href="/anime?view=archived">← 返回归档</a></div>
+    <span class="detail-status archived"><span class="status-dot"></span>已归档收藏</span>
+    <dl class="hero-meta archive-meta"><div><dt>集数</dt><dd>{{ total_episodes }}</dd></div><div><dt>归档时间</dt><dd>{{ archived_at }}</dd></div><div><dt>别名</dt><dd>{{ aliases }}</dd></div><div><dt>Bangumi</dt><dd>{{ bangumi }}</dd></div></dl>
+    <div class="archive-summary"><h2>简介与观看记录</h2>{% if has_summary %}<p>{{ summary }}</p>{% else %}<p class="muted">归档时没有填写简介或观看记录。</p>{% endif %}</div>
+  </div>
+</section>
+<section class="panel archive-note"><h2>已压缩运行数据</h2><p class="muted">候选、通知、检查任务、UP 信任和逐集运行记录已经清理；标题、别名、封面、简介与总集数仍保存在收藏中。</p></section>
+<section class="actions-grid"><form method="post" action="/anime/{{ id }}/delete-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger-ghost" type="submit">永久删除此收藏</button></form></section>
+{% endblock %}

@@ -45,6 +45,11 @@ pub struct Anime {
     pub schedule_sync_at: Option<DateTime<Utc>>,
     pub schedule_next_sync_at: Option<DateTime<Utc>>,
     pub schedule_sync_error: Option<String>,
+    pub lifecycle: String,
+    pub summary: String,
+    pub total_episodes: Option<i64>,
+    pub released_completed_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]

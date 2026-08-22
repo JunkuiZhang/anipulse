@@ -1,11 +1,21 @@
 {% extends "base.html" %}
 {% block title %}{{ title }} · AniPulse{% endblock %}
 {% block content %}
-<div class="page-heading anime-detail-heading"><div class="anime-heading-main"><div class="anime-cover cover-large">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div><div><p class="eyebrow">ANIME #{{ id }}</p><h1>{{ title }}</h1><p class="page-description">排期、检查和候选审核集中在这里管理。</p></div></div><a class="button" href="/anime">← 返回列表</a></div>
-{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
-<section class="panel details">
-  <dl><dt>别名</dt><dd>{{ aliases }}</dd><dt>当前 Episode</dt><dd>{{ episode }}</dd><dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>下次检查</dt><dd>{{ next_check }}</dd><dt>时长范围</dt><dd>{{ duration }}</dd><dt>Bangumi</dt><dd>{{ bangumi }}</dd></dl>
+<section class="anime-detail-hero">
+  <div class="anime-cover detail-cover">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div>
+  <div class="anime-detail-content">
+    <div class="detail-title-row"><div><p class="eyebrow">ANIME #{{ display_no }}</p><h1>{{ title }}</h1><p class="page-description">排期、检查和候选审核集中在这里管理。</p></div><a class="button" href="/anime">← 返回列表</a></div>
+    <span class="detail-status{% if enabled %} enabled{% endif %}{% if released_complete %} complete{% endif %}"><span class="status-dot"></span>{{ lifecycle_label }}</span>
+    <dl class="hero-meta"><div><dt>当前 Episode</dt><dd>{{ episode }}</dd></div><div><dt>预计更新</dt><dd>{{ expected_at }}</dd></div><div><dt>下次检查</dt><dd>{{ next_check }}</dd></div><div><dt>时长范围</dt><dd>{{ duration }}</dd></div><div class="meta-wide"><dt>别名</dt><dd>{{ aliases }}</dd></div><div><dt>Bangumi</dt><dd>{{ bangumi }}</dd></div></dl>
+    {% if tracking %}<div class="actions-grid hero-actions">
+      {% if episode_id > 0 %}<a class="button" href="/review/episodes/{{ episode_id }}">审核当前集</a>{% endif %}
+      <form method="post" action="/anime/{{ id }}/check"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">立即检查</button></form>
+      {% if auto_schedule %}<form method="post" action="/anime/{{ id }}/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">同步排期</button></form>{% endif %}
+      {% if enabled %}<form method="post" action="/anime/{{ id }}/disable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">暂停监控</button></form>{% else %}<form method="post" action="/anime/{{ id }}/enable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">启用监控</button></form>{% endif %}
+    </div>{% endif %}
+  </div>
 </section>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 <section class="history-section">
   <div class="section-heading">
     <div><p class="eyebrow">EPISODE LIBRARY</p><h2>往集视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
@@ -74,11 +84,12 @@
   {% endif %}
 </section>
 <section class="panel"><h2>修改标题</h2><form method="post" action="/anime/{{ id }}/title" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="title" value="{{ title }}" required maxlength="200"><button type="submit">保存并重查</button></form></section>
-<section class="actions-grid">
-  {% if episode_id > 0 %}<a class="button" href="/review/episodes/{{ episode_id }}">审核当前集</a>{% endif %}
-  <form method="post" action="/anime/{{ id }}/check"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">立即检查</button></form>
-  {% if auto_schedule %}<form method="post" action="/anime/{{ id }}/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">同步排期</button></form>{% endif %}
-  {% if enabled %}<form method="post" action="/anime/{{ id }}/disable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">暂停监控</button></form>{% else %}<form method="post" action="/anime/{{ id }}/enable"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">启用监控</button></form>{% endif %}
-  {% if !enabled %}<form method="post" action="/anime/{{ id }}/delete-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">准备永久删除</button></form>{% endif %}
-</section>
+{% if tracking %}
+<section class="panel lifecycle-panel"><div><p class="eyebrow">SEASON STATUS</p><h2>本季已经播完？</h2><p class="muted">这只会停止查找下一集，不会归档，也不会删除已经确认的视频。等你实际看完后再执行归档。</p></div><form method="post" action="/anime/{{ id }}/released-complete" class="lifecycle-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>本季总集数<input type="number" name="total_episodes" value="{{ suggested_total }}" min="1" max="10000" required></label><button type="submit">标记本季已播完</button></form></section>
+{% endif %}
+{% if released_complete %}
+<section class="panel lifecycle-panel archive-ready"><div><p class="eyebrow">READY TO ARCHIVE</p><h2>等看完以后再归档</h2><p class="muted">当前已经停止检查新集，但往集视频仍然保留。归档操作会再次要求确认“已经看完”。</p></div><form method="post" action="/anime/{{ id }}/archive-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="primary" type="submit">我看完了，准备归档</button></form></section>
+<section class="panel lifecycle-panel compact"><div><h2>标错了？</h2><p class="muted">如果还有续集，把它恢复为监控中并指定下一集。</p></div><form method="post" action="/anime/{{ id }}/resume" class="lifecycle-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>下一集<input type="number" name="next_episode" value="{{ resume_episode }}" min="1" max="10000" required></label><button type="submit">恢复监控</button></form></section>
+{% endif %}
+{% if tracking %}{% if !enabled %}<section class="actions-grid danger-actions"><form method="post" action="/anime/{{ id }}/delete-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger-ghost" type="submit">永久删除误加条目</button></form></section>{% endif %}{% endif %}
 {% endblock %}

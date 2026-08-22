@@ -1,23 +1,25 @@
 {% extends "base.html" %}
 {% block title %}追番 · AniPulse{% endblock %}
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">LIBRARY</p><h1>我的追番</h1><p class="page-description">管理更新时间、排期和当前监控状态。</p></div><a class="primary button" href="/anime/new">＋ 添加追番</a></div>
+<div class="page-heading"><div><p class="eyebrow">LIBRARY</p><h1>{% if archived_selected %}归档收藏{% else %}我的追番{% endif %}</h1><p class="page-description">{% if archived_selected %}保存已经看完的番剧、封面和观看记录。{% else %}管理更新时间、排期和当前监控状态。{% endif %}</p></div>{% if current_selected %}<a class="primary button" href="/anime/new">＋ 添加追番</a>{% endif %}</div>
+{% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
+<div class="filter" aria-label="追番视图"><a {% if current_selected %}class="selected"{% endif %} href="/anime">当前追番</a><a {% if archived_selected %}class="selected"{% endif %} href="/anime?view=archived">归档收藏</a></div>
 <div class="anime-grid">
 {% for item in items %}
   <a class="library-card" href="/anime/{{ item.id }}">
     <div class="library-cover anime-cover">
       {% if item.has_cover %}<img src="{{ item.cover_url }}" alt="{{ item.title }}封面" loading="lazy">{% else %}<span aria-hidden="true">{{ item.cover_initial }}</span>{% endif %}
       <div class="library-cover-shade"></div>
-      <span class="library-id">#{{ item.id }}</span>
-      {% if item.enabled %}<span class="library-status enabled"><span class="status-dot"></span>监控中</span>{% else %}<span class="library-status"><span class="status-dot"></span>已停用</span>{% endif %}
+      <span class="library-id">#{{ item.display_no }}</span>
+      {% if item.archived %}<span class="library-status archived"><span class="status-dot"></span>已归档</span>{% else if item.released_complete %}<span class="library-status complete"><span class="status-dot"></span>待看完</span>{% else if item.enabled %}<span class="library-status enabled"><span class="status-dot"></span>监控中</span>{% else %}<span class="library-status"><span class="status-dot"></span>已暂停</span>{% endif %}
     </div>
     <div class="library-card-body">
       <h2>{{ item.title }}</h2>
       <div class="library-episode">{{ item.episode }}</div>
-      <dl class="library-meta"><dt>下次检查</dt><dd>{{ item.next_check }}</dd><dt>排期</dt><dd>{{ item.schedule }}</dd></dl>
+      <dl class="library-meta"><dt>{{ item.time_label }}</dt><dd>{{ item.next_check }}</dd><dt>排期</dt><dd>{{ item.schedule }}</dd></dl>
     </div>
   </a>
 {% endfor %}
 </div>
-{% if items.is_empty() %}<div class="empty">还没有追番记录。</div>{% endif %}
+{% if items.is_empty() %}<div class="empty">{% if archived_selected %}还没有归档收藏。看完一部番后，可以从详情页归档。{% else %}还没有追番记录。{% endif %}</div>{% endif %}
 {% endblock %}
