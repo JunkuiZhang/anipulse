@@ -235,6 +235,8 @@ mod tests {
                     schedule_sync_at: None,
                     schedule_next_sync_at: None,
                     schedule_sync_error: None,
+                    local_episode_origin: None,
+                    bangumi_episode_origin: None,
                     lifecycle: "tracking".into(),
                     summary: String::new(),
                     total_episodes: None,

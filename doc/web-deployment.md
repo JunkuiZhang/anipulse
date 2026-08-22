@@ -169,6 +169,8 @@ curl -I https://anime.example.com/login
 
 网页空闲时不请求 Bilibili。点击“立即检查”“同步排期”“测试通知”或提交 B 站链接只会写入 `management_job`；`anipulse run` 在下一个 scheduler tick 领取任务。因此 scheduler 停止时任务会保持 `queued`，网页仍可查看和编辑本地数据。
 
+添加追番时，“特殊集数映射”可以解决站内集数和 Bangumi 章节编号不同的问题。两个起点必须同时填写，例如“站内 EP12 ↔ Bangumi EP78”；之后站内 EP14 会使用 Bangumi EP80 校准日期，同时 Bilibili 搜索仍保持 EP14。已有追番可以在详情页修改映射，保存后会自动创建排期同步任务；清空两项即恢复普通的 EP1 ↔ EP1 规则。
+
 ### 追番编号、播完与归档
 
 “我的追番”卡片左上角的 `#1`、`#2` 是当前追番列表中的显示序号，不是 SQLite 主键。删除或归档中间条目后，页面会自动连续编号；CLI、URL 和审计仍使用不会变化的数据库 ID。

@@ -5,7 +5,7 @@ use anipulse::{
     auth::{create_admin, normalize_username, reset_admin_password},
     config::AppConfig,
     detector::Detector,
-    domain::{AutoScheduleMetadata, NewAnime},
+    domain::{AutoScheduleMetadata, EpisodeNumberMapping, NewAnime},
     error::{AppError, Result},
     notification::NotificationDispatcher,
     provider::BilibiliProvider,
@@ -130,6 +130,18 @@ struct AddAnimeArgs {
     auto_schedule: bool,
     #[arg(long, requires = "auto_schedule")]
     bangumi_id: Option<i64>,
+    #[arg(
+        long,
+        requires_all = ["auto_schedule", "bangumi_episode_start"],
+        help = "first episode number used for Bilibili search in this Bangumi subject"
+    )]
+    search_episode_start: Option<i64>,
+    #[arg(
+        long,
+        requires_all = ["auto_schedule", "search_episode_start"],
+        help = "Bangumi episode number corresponding to --search-episode-start"
+    )]
+    bangumi_episode_start: Option<i64>,
     #[arg(long, help = "RFC3339 timestamp; overrides --weekday/--time")]
     expected_at: Option<String>,
     #[arg(long, help = "monday..sunday")]
@@ -449,27 +461,55 @@ async fn handle_anime(
             Tz::from_str(&args.timezone).map_err(|_| {
                 AppError::InvalidInput(format!("invalid timezone: {}", args.timezone))
             })?;
+            let episode_mapping = args
+                .search_episode_start
+                .zip(args.bangumi_episode_start)
+                .map(|(local_origin, bangumi_origin)| EpisodeNumberMapping {
+                    local_origin,
+                    bangumi_origin,
+                });
+            if let Some(mapping) = episode_mapping {
+                mapping.mapped_numbers(args.next_episode)?;
+            }
             let mut aliases = args.aliases;
             let (expected_weekday, expected_time, expected_at, auto_schedule) = if args
                 .auto_schedule
             {
                 let provider = ScheduleProvider::new(config.schedule.clone())?;
                 let catalog = provider.load_catalog().await?;
-                let resolved = provider
-                    .resolve(
-                        &catalog,
-                        &args.title,
-                        args.bangumi_id,
-                        args.next_episode,
-                        &args.timezone,
-                    )
-                    .await?;
+                let resolved = if let Some(mapping) = episode_mapping {
+                    provider
+                        .resolve_with_mapping(
+                            &catalog,
+                            &args.title,
+                            args.bangumi_id,
+                            args.next_episode,
+                            mapping,
+                            &args.timezone,
+                        )
+                        .await?
+                } else {
+                    provider
+                        .resolve(
+                            &catalog,
+                            &args.title,
+                            args.bangumi_id,
+                            args.next_episode,
+                            &args.timezone,
+                        )
+                        .await?
+                };
                 aliases.extend(resolved.aliases.iter().cloned());
+                let mapped_episode = episode_mapping
+                    .and_then(|mapping| mapping.mapped_numbers(args.next_episode).ok())
+                    .map(|(_, bangumi_episode)| format!(" / Bangumi EP{bangumi_episode}"))
+                    .unwrap_or_default();
                 println!(
-                    "matched Bangumi subject #{}: {}; EP{} expected at {}",
+                    "matched Bangumi subject #{}: {}; EP{}{} expected at {}",
                     resolved.bangumi_subject_id,
                     resolved.matched_title,
                     args.next_episode,
+                    mapped_episode,
                     resolved.expected_at.to_rfc3339()
                 );
                 (
@@ -481,6 +521,7 @@ async fn handle_anime(
                         broadcast_pattern: resolved.broadcast_pattern,
                         next_sync_at: Utc::now()
                             + chrono::Duration::seconds(config.schedule.sync_interval_secs as i64),
+                        episode_mapping,
                     }),
                 )
             } else {
@@ -564,6 +605,13 @@ async fn handle_anime(
             println!("auto schedule: {}", anime.anime.auto_schedule);
             if let Some(subject_id) = anime.anime.bangumi_subject_id {
                 println!("Bangumi subject: {subject_id}");
+            }
+            if let Some((local_origin, bangumi_origin)) = anime
+                .anime
+                .local_episode_origin
+                .zip(anime.anime.bangumi_episode_origin)
+            {
+                println!("episode mapping: search EP{local_origin} <-> Bangumi EP{bangumi_origin}");
             }
             if let Some(synced_at) = anime.anime.schedule_sync_at {
                 println!("schedule synced at: {}", synced_at.to_rfc3339());
@@ -870,6 +918,48 @@ mod tests {
                 }
             } if title == "无职转生 第三季"
         ));
+    }
+
+    #[test]
+    fn parses_optional_episode_number_mapping_as_a_pair() {
+        let cli = Cli::try_parse_from([
+            "anipulse",
+            "anime",
+            "add",
+            "--title",
+            "Re：从零开始的异世界生活 第四季",
+            "--next-episode",
+            "14",
+            "--auto-schedule",
+            "--bangumi-id",
+            "633836",
+            "--search-episode-start",
+            "12",
+            "--bangumi-episode-start",
+            "78",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Anime {
+                command: AnimeCommand::Add(ref args)
+            } if args.search_episode_start == Some(12)
+                && args.bangumi_episode_start == Some(78)
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "anipulse",
+                "anime",
+                "add",
+                "--title",
+                "Re：从零开始的异世界生活 第四季",
+                "--auto-schedule",
+                "--search-episode-start",
+                "12",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

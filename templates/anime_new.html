@@ -11,6 +11,15 @@
   <label>时区<input name="timezone" value="Asia/Shanghai" required maxlength="64"></label>
   <label class="check"><input type="checkbox" name="auto_schedule" value="yes" checked> 使用 Bangumi 自动匹配别名和播出时间</label>
   <label>Bangumi ID（可选，用于同名或多季消歧）<input type="number" name="bangumi_id" min="1"></label>
+  <details class="mapping-options">
+    <summary>特殊集数映射（可选）</summary>
+    <p class="muted">当站内搜索集数和 Bangumi 编号不同才填写。两个起点必须同时填写，后续集数会保持相同偏移。</p>
+    <div class="two-column">
+      <label>站内起始集数<input type="number" name="search_episode_start" min="1" max="10000" placeholder="例如 12"></label>
+      <label>对应 Bangumi 起始集数<input type="number" name="bangumi_episode_start" min="1" max="10000" placeholder="例如 78"></label>
+    </div>
+    <p class="field-example">例如：站内 EP12 ↔ Bangumi EP78，则站内 EP14 会按 Bangumi EP80 排期，但仍搜索“第14集”。</p>
+  </details>
   <button class="primary" type="submit">解析并预览</button>
 </form>
 </section>

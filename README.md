@@ -50,6 +50,20 @@ anipulse anime add \
 
 如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，并用 Bangumi 章节日期校准当前集；也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
 
+如果站内使用的集数与 Bangumi 条目编号不同，可以提供一组起点映射。例如站内 EP12 对应 Bangumi EP78：
+
+```bash
+anipulse anime add \
+  --title "Re：从零开始的异世界生活 第四季 夺还篇" \
+  --next-episode 14 \
+  --auto-schedule \
+  --bangumi-id 633836 \
+  --search-episode-start 12 \
+  --bangumi-episode-start 78
+```
+
+此时 Bilibili 仍搜索 EP14，排期则查询该 Bangumi 条目的第 3 个章节并校验为 EP80。网页添加页和番剧详情页也可以填写或修改同一组映射。
+
 常用命令：
 
 ```bash

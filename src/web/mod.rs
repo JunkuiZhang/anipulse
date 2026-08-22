@@ -33,6 +33,7 @@ use crate::{
     },
     auth::{AuthService, LoginOutcome, SessionIdentity},
     config::AppConfig,
+    domain::EpisodeNumberMapping,
     error::{AppError, Result},
     repository::{AuditEventRow, CandidateListRow, EpisodeVideoRow, ManagementJob, Repository},
 };
@@ -125,6 +126,7 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/disable", post(anime_disable))
         .route("/anime/{id}/check", post(anime_check))
         .route("/anime/{id}/sync", post(anime_sync))
+        .route("/anime/{id}/episode-mapping", post(anime_episode_mapping))
         .route(
             "/anime/{id}/released-complete",
             post(anime_released_complete),
@@ -701,6 +703,8 @@ struct AnimeResolveForm {
     timezone: String,
     auto_schedule: Option<String>,
     bangumi_id: Option<String>,
+    search_episode_start: Option<String>,
+    bangumi_episode_start: Option<String>,
 }
 
 fn parse_optional_bangumi_id(value: Option<&str>) -> Result<Option<i64>> {
@@ -714,6 +718,36 @@ fn parse_optional_bangumi_id(value: Option<&str>) -> Result<Option<i64>> {
         return Err(AppError::InvalidInput("Bangumi ID 必须是正整数".into()));
     }
     Ok(Some(id))
+}
+
+fn parse_episode_mapping(
+    search_episode_start: Option<&str>,
+    bangumi_episode_start: Option<&str>,
+) -> Result<Option<EpisodeNumberMapping>> {
+    let parse = |value: Option<&str>, label: &str| -> Result<Option<i64>> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let number = value
+            .parse::<i64>()
+            .map_err(|_| AppError::InvalidInput(format!("{label}必须是正整数")))?;
+        if number <= 0 {
+            return Err(AppError::InvalidInput(format!("{label}必须是正整数")));
+        }
+        Ok(Some(number))
+    };
+    let local_origin = parse(search_episode_start, "站内起始集数")?;
+    let bangumi_origin = parse(bangumi_episode_start, "Bangumi 起始集数")?;
+    match (local_origin, bangumi_origin) {
+        (None, None) => Ok(None),
+        (Some(local_origin), Some(bangumi_origin)) => Ok(Some(EpisodeNumberMapping {
+            local_origin,
+            bangumi_origin,
+        })),
+        _ => Err(AppError::InvalidInput(
+            "集数映射的两个起始集数必须同时填写".into(),
+        )),
+    }
 }
 
 async fn anime_resolve(
@@ -733,6 +767,10 @@ async fn anime_resolve(
         .ok_or_else(|| WebError::bad_request("时长超出范围"))?;
     let auto_schedule = form.auto_schedule.as_deref() == Some("yes");
     let bangumi_id = parse_optional_bangumi_id(form.bangumi_id.as_deref())?;
+    let episode_mapping = parse_episode_mapping(
+        form.search_episode_start.as_deref(),
+        form.bangumi_episode_start.as_deref(),
+    )?;
     let id = state
         .application
         .create_anime_draft(
@@ -746,6 +784,7 @@ async fn anime_resolve(
                 duration_max_sec,
                 auto_schedule,
                 bangumi_id: auto_schedule.then_some(bangumi_id).flatten(),
+                episode_mapping,
             },
         )
         .await?;
@@ -777,6 +816,8 @@ struct AnimeDraftTemplate {
     expected_at: String,
     aliases: String,
     duration: String,
+    episode_mapping: String,
+    has_episode_mapping: bool,
     has_warning: bool,
     warning: String,
 }
@@ -794,41 +835,69 @@ async fn anime_draft(
         .resolved_json
         .as_deref()
         .and_then(|value| serde_json::from_str::<AnimeDraftResolution>(value).ok());
-    let (title, matched_title, bangumi_id, next_episode, expected_at, aliases, duration, warning) =
-        if let Some(resolved) = resolved {
-            (
-                resolved.title,
-                resolved.matched_title.unwrap_or_else(|| "手工排期".into()),
-                resolved
-                    .bangumi_subject_id
-                    .map(|id| format!("#{id}"))
-                    .unwrap_or_else(|| "未绑定".into()),
-                resolved.next_episode,
-                format_time(resolved.expected_at, state.display_timezone),
-                if resolved.aliases.is_empty() {
-                    "—".into()
-                } else {
-                    resolved.aliases.join("、")
-                },
-                format!(
-                    "{}–{} 分钟",
-                    resolved.duration_min_sec / 60,
-                    resolved.duration_max_sec / 60
-                ),
-                resolved.warning.unwrap_or_default(),
-            )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                0,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
-        };
+    let (
+        title,
+        matched_title,
+        bangumi_id,
+        next_episode,
+        expected_at,
+        aliases,
+        duration,
+        episode_mapping,
+        warning,
+    ) = if let Some(resolved) = resolved {
+        let episode_mapping = resolved
+            .episode_mapping
+            .and_then(|mapping| {
+                mapping
+                    .mapped_numbers(resolved.next_episode)
+                    .ok()
+                    .map(|(_, bangumi_episode)| {
+                        format!(
+                            "站内 EP{} ↔ Bangumi EP{}；当前 EP{} ↔ EP{}",
+                            mapping.local_origin,
+                            mapping.bangumi_origin,
+                            resolved.next_episode,
+                            bangumi_episode
+                        )
+                    })
+            })
+            .unwrap_or_default();
+        (
+            resolved.title,
+            resolved.matched_title.unwrap_or_else(|| "手工排期".into()),
+            resolved
+                .bangumi_subject_id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "未绑定".into()),
+            resolved.next_episode,
+            format_time(resolved.expected_at, state.display_timezone),
+            if resolved.aliases.is_empty() {
+                "—".into()
+            } else {
+                resolved.aliases.join("、")
+            },
+            format!(
+                "{}–{} 分钟",
+                resolved.duration_min_sec / 60,
+                resolved.duration_max_sec / 60
+            ),
+            episode_mapping,
+            resolved.warning.unwrap_or_default(),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    };
     render(AnimeDraftTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
@@ -843,6 +912,8 @@ async fn anime_draft(
         expected_at,
         aliases,
         duration,
+        has_episode_mapping: !episode_mapping.is_empty(),
+        episode_mapping,
         has_warning: !warning.is_empty(),
         warning,
     })
@@ -900,6 +971,10 @@ struct AnimeDetailTemplate {
     next_check: String,
     duration: String,
     bangumi: String,
+    episode_mapping: String,
+    has_episode_mapping: bool,
+    mapping_search_start: String,
+    mapping_bangumi_start: String,
     enabled: bool,
     auto_schedule: bool,
     episode_id: i64,
@@ -1002,10 +1077,34 @@ async fn anime_detail(
         state.config.confirmation.trusted_confirmed_count,
         state.display_timezone,
     );
+    let episode_mapping = anime
+        .anime
+        .local_episode_origin
+        .zip(anime.anime.bangumi_episode_origin)
+        .map(|(local_origin, bangumi_origin)| {
+            let mapping = EpisodeNumberMapping {
+                local_origin,
+                bangumi_origin,
+            };
+            let current = episode
+                .as_ref()
+                .and_then(|episode| {
+                    mapping
+                        .mapped_numbers(episode.episode_no)
+                        .ok()
+                        .map(|(_, bangumi_episode)| {
+                            format!("；当前 EP{} ↔ EP{}", episode.episode_no, bangumi_episode)
+                        })
+                })
+                .unwrap_or_default();
+            format!("站内 EP{local_origin} ↔ Bangumi EP{bangumi_origin}{current}")
+        })
+        .unwrap_or_default();
     let video_job_enqueued = query.result.as_deref() == Some("video-enqueued");
     let notice = match query.result.as_deref() {
         Some("video-enqueued") => "视频已加入处理队列，元数据读取完成后会显示在本页。",
         Some("video-update-enqueued") => "视频地址已加入更新队列，处理成功后会替换原来源。",
+        Some("mapping-updated") => "集数映射已保存，新的 Bangumi 排期正在后台同步。",
         Some("preferred-set") => "已选择这条来源作为本集最佳视频。",
         Some("preferred-cleared") => "已恢复自动选择，将显示未屏蔽来源中评分最高的视频。",
         Some("uploader-trusted") => "已信任此 UP。",
@@ -1081,6 +1180,18 @@ async fn anime_detail(
             .bangumi_subject_id
             .map(|id| format!("#{id}"))
             .unwrap_or_else(|| "未绑定".into()),
+        has_episode_mapping: !episode_mapping.is_empty(),
+        episode_mapping,
+        mapping_search_start: anime
+            .anime
+            .local_episode_origin
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        mapping_bangumi_start: anime
+            .anime
+            .bangumi_episode_origin
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         enabled: anime.anime.enabled,
         auto_schedule: anime.anime.auto_schedule,
         episode_id: episode.as_ref().map(|episode| episode.id).unwrap_or(0),
@@ -1451,6 +1562,57 @@ async fn anime_sync(
     )
     .await?;
     Ok(Redirect::to(&format!("/anime/{id}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct AnimeEpisodeMappingForm {
+    csrf_token: String,
+    search_episode_start: Option<String>,
+    bangumi_episode_start: Option<String>,
+}
+
+async fn anime_episode_mapping(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<AnimeEpisodeMappingForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let mapping = parse_episode_mapping(
+        form.search_episode_start.as_deref(),
+        form.bangumi_episode_start.as_deref(),
+    )?;
+    state
+        .application
+        .set_episode_number_mapping(id, mapping)
+        .await?;
+    let target = id.to_string();
+    let job_id = state
+        .application
+        .enqueue_job(
+            ManagementJobKind::SyncSchedule,
+            Some("anime"),
+            Some(&target),
+            "{}",
+            Some(identity.admin_id),
+            Some(&format!("sync_schedule:{id}")),
+        )
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "anime.episode_mapping.update",
+        "anime",
+        id,
+        serde_json::json!({
+            "job_id": job_id,
+            "local_origin": mapping.map(|value| value.local_origin),
+            "bangumi_origin": mapping.map(|value| value.bangumi_origin),
+        }),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{id}?result=mapping-updated")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2933,7 +3095,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{auth::create_admin, domain::NewAnime};
+    use crate::{
+        auth::create_admin,
+        domain::{AutoScheduleMetadata, NewAnime},
+    };
 
     #[test]
     fn cookie_parser_only_reads_exact_name() {
@@ -3145,6 +3310,26 @@ mod tests {
             })
             .await
             .unwrap();
+        repository
+            .add_anime(NewAnime {
+                title: "Re：从零开始的异世界生活 第四季 夺还篇".into(),
+                aliases: Vec::new(),
+                next_episode: 14,
+                expected_at: None,
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_680,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 633_836,
+                    broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -3206,6 +3391,48 @@ mod tests {
         assert!(body.contains("正在后台读取视频信息"));
         assert!(body.contains("这项任务可能需要几分钟"));
         assert!(body.contains("href=\"/jobs\""));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/anime/2/episode-mapping")
+                    .header(header::COOKIE, &cookie_pair)
+                    .header(header::ORIGIN, "https://anime.example.com")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={}&search_episode_start=12&bangumi_episode_start=78",
+                        identity.csrf_token
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "/anime/2?result=mapping-updated"
+        );
+        let mapped = repository.get_anime(2).await.unwrap();
+        assert_eq!(mapped.anime.local_episode_origin, Some(12));
+        assert_eq!(mapped.anime.bangumi_episode_origin, Some(78));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/anime/2")
+                    .header(header::COOKIE, &cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("站内 EP12 ↔ Bangumi EP78；当前 EP14 ↔ EP80"));
+        assert!(body.contains("value=\"12\""));
+        assert!(body.contains("value=\"78\""));
 
         let response = app
             .clone()
@@ -3338,6 +3565,20 @@ mod tests {
         );
         assert!(parse_optional_bangumi_id(Some("not-an-id")).is_err());
         assert!(parse_optional_bangumi_id(Some("0")).is_err());
+    }
+
+    #[test]
+    fn episode_mapping_requires_both_positive_origins() {
+        assert_eq!(parse_episode_mapping(None, None).unwrap(), None);
+        assert_eq!(
+            parse_episode_mapping(Some("12"), Some("78")).unwrap(),
+            Some(EpisodeNumberMapping {
+                local_origin: 12,
+                bangumi_origin: 78,
+            })
+        );
+        assert!(parse_episode_mapping(Some("12"), None).is_err());
+        assert!(parse_episode_mapping(Some("0"), Some("78")).is_err());
     }
 
     async fn test_app() -> (TempDir, Repository, Arc<AppConfig>, AuthService, Router) {

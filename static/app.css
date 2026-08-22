@@ -689,6 +689,48 @@ input:focus {
 
 .stack { display: grid; gap: 16px; }
 
+.mapping-options {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(246, 248, 247, 0.72);
+}
+
+.mapping-options summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 720;
+}
+
+.mapping-options > p { margin: 9px 0 0; }
+.mapping-options .two-column { margin-top: 13px; }
+.mapping-options .field-example { color: #8d674f; font-size: 0.82rem; }
+
+.mapping-panel {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.72fr) minmax(460px, 1fr);
+  align-items: end;
+  gap: 24px;
+}
+
+.mapping-panel h2 { margin: 4px 0; }
+.mapping-panel p:last-child { margin: 0; }
+
+.mapping-form {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto minmax(150px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.mapping-form > span {
+  align-self: center;
+  margin-top: 22px;
+  color: var(--muted);
+  font-weight: 750;
+}
+
 .inline-form {
   display: flex;
   align-items: flex-end;
@@ -1384,6 +1426,7 @@ textarea:focus {
   .detail-cover { min-height: 330px; }
   .detail-title-row { display: grid; }
   .lifecycle-panel { grid-template-columns: 1fr; gap: 18px; }
+  .mapping-panel { grid-template-columns: 1fr; gap: 18px; }
 }
 
 @media (max-width: 620px) {
@@ -1471,6 +1514,9 @@ textarea:focus {
   .uploader-form { grid-template-columns: 1fr; width: 100%; }
   .rule-create-form { grid-template-columns: 1fr; }
   .history-add-form { grid-template-columns: 1fr; }
+  .mapping-form { grid-template-columns: 1fr; }
+  .mapping-form > span { display: none; }
+  .mapping-form button { width: 100%; }
   .job-progress { grid-template-columns: auto minmax(0, 1fr); }
   .job-progress .button { grid-column: 2; width: fit-content; }
   .primary-video-card { align-items: stretch; flex-direction: column; gap: 14px; }

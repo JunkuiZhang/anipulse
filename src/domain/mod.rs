@@ -45,6 +45,8 @@ pub struct Anime {
     pub schedule_sync_at: Option<DateTime<Utc>>,
     pub schedule_next_sync_at: Option<DateTime<Utc>>,
     pub schedule_sync_error: Option<String>,
+    pub local_episode_origin: Option<i64>,
+    pub bangumi_episode_origin: Option<i64>,
     pub lifecycle: String,
     pub summary: String,
     pub total_episodes: Option<i64>,
@@ -77,6 +79,42 @@ pub struct AutoScheduleMetadata {
     pub bangumi_subject_id: i64,
     pub broadcast_pattern: String,
     pub next_sync_at: DateTime<Utc>,
+    pub episode_mapping: Option<EpisodeNumberMapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeNumberMapping {
+    pub local_origin: i64,
+    pub bangumi_origin: i64,
+}
+
+impl EpisodeNumberMapping {
+    pub fn mapped_numbers(self, local_episode: i64) -> Result<(i64, i64)> {
+        if self.local_origin <= 0 || self.bangumi_origin <= 0 {
+            return Err(AppError::InvalidInput(
+                "episode mapping origins must be greater than zero".into(),
+            ));
+        }
+        if local_episode < self.local_origin {
+            return Err(AppError::InvalidInput(
+                "next episode must not be earlier than the mapped local origin".into(),
+            ));
+        }
+        let delta = local_episode
+            .checked_sub(self.local_origin)
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "next episode must not be earlier than the mapped local origin".into(),
+                )
+            })?;
+        let subject_index = delta.checked_add(1).ok_or_else(|| {
+            AppError::InvalidInput("episode mapping calculation overflowed".into())
+        })?;
+        let bangumi_episode = self.bangumi_origin.checked_add(delta).ok_or_else(|| {
+            AppError::InvalidInput("episode mapping calculation overflowed".into())
+        })?;
+        Ok((subject_index, bangumi_episode))
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::AppConfig,
     detector::{evaluator, title::normalize_title},
-    domain::{Anime, AutoScheduleMetadata, CandidateState, NewAnime, VideoCandidate},
+    domain::{
+        Anime, AutoScheduleMetadata, CandidateState, EpisodeNumberMapping, NewAnime, VideoCandidate,
+    },
     error::{AppError, Result},
     provider::{BilibiliProvider, VideoSearchProvider},
     repository::{AnimeArchiveSummary, EpisodeRepairSummary, Repository},
@@ -44,6 +46,8 @@ pub struct AnimeDraftRequest {
     pub duration_max_sec: i64,
     pub auto_schedule: bool,
     pub bangumi_id: Option<i64>,
+    #[serde(default)]
+    pub episode_mapping: Option<EpisodeNumberMapping>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +64,8 @@ pub struct AnimeDraftResolution {
     pub duration_max_sec: i64,
     pub bangumi_subject_id: Option<i64>,
     pub broadcast_pattern: Option<String>,
+    #[serde(default)]
+    pub episode_mapping: Option<EpisodeNumberMapping>,
     pub warning: Option<String>,
 }
 
@@ -80,6 +86,7 @@ impl AnimeDraftResolution {
                     bangumi_subject_id,
                     broadcast_pattern,
                     next_sync_at: Utc::now() + chrono::Duration::seconds(sync_interval_secs as i64),
+                    episode_mapping: self.episode_mapping,
                 },
             ),
         }
@@ -103,6 +110,16 @@ impl ApplicationService {
 
     pub async fn set_anime_enabled(&self, anime_id: i64, enabled: bool) -> Result<()> {
         self.repository.set_anime_enabled(anime_id, enabled).await
+    }
+
+    pub async fn set_episode_number_mapping(
+        &self,
+        anime_id: i64,
+        mapping: Option<EpisodeNumberMapping>,
+    ) -> Result<()> {
+        self.repository
+            .set_episode_number_mapping(anime_id, mapping)
+            .await
     }
 
     pub async fn mark_anime_released_complete(
@@ -477,6 +494,7 @@ impl ApplicationService {
                 duration_max_sec: request.duration_max_sec,
                 bangumi_subject_id: None,
                 broadcast_pattern: None,
+                episode_mapping: None,
                 warning: None,
             };
             self.repository
@@ -504,15 +522,28 @@ impl ApplicationService {
             .map_err(|_| AppError::InvalidInput("anime draft payload is invalid".into()))?;
         let provider = ScheduleProvider::new(self.config.schedule.clone())?;
         let catalog = provider.load_catalog().await?;
-        let resolved = provider
-            .resolve(
-                &catalog,
-                &request.title,
-                request.bangumi_id,
-                request.next_episode,
-                &request.timezone,
-            )
-            .await?;
+        let resolved = if let Some(mapping) = request.episode_mapping {
+            provider
+                .resolve_with_mapping(
+                    &catalog,
+                    &request.title,
+                    request.bangumi_id,
+                    request.next_episode,
+                    mapping,
+                    &request.timezone,
+                )
+                .await?
+        } else {
+            provider
+                .resolve(
+                    &catalog,
+                    &request.title,
+                    request.bangumi_id,
+                    request.next_episode,
+                    &request.timezone,
+                )
+                .await?
+        };
         let input = normalize_title(&request.title);
         let matched = std::iter::once(&resolved.matched_title)
             .chain(resolved.aliases.iter())
@@ -536,6 +567,7 @@ impl ApplicationService {
             duration_max_sec: request.duration_max_sec,
             bangumi_subject_id: Some(resolved.bangumi_subject_id),
             broadcast_pattern: Some(resolved.broadcast_pattern),
+            episode_mapping: request.episode_mapping,
             warning,
         };
         let json = serde_json::to_string(&resolution)
@@ -602,6 +634,14 @@ fn validate_anime_draft(request: &AnimeDraftRequest) -> Result<()> {
         return Err(AppError::InvalidInput(
             "Bangumi ID requires automatic scheduling".into(),
         ));
+    }
+    if let Some(mapping) = request.episode_mapping {
+        if !request.auto_schedule {
+            return Err(AppError::InvalidInput(
+                "episode mapping requires automatic scheduling".into(),
+            ));
+        }
+        mapping.mapped_numbers(request.next_episode)?;
     }
     Ok(())
 }

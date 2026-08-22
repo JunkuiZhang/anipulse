@@ -263,6 +263,22 @@ sudo -u anipulse /usr/local/bin/anipulse \
   --config /etc/anipulse/config.toml anime sync 1
 ```
 
+部分季度或分篇条目会延续作品总集数编号。例如站内把第四季下半篇第一集称为 EP12，而 Bangumi 条目从 EP78 开始。添加时同时提供两个起点：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml \
+  anime add \
+  --title "Re：从零开始的异世界生活 第四季 夺还篇" \
+  --next-episode 14 \
+  --auto-schedule \
+  --bangumi-id 633836 \
+  --search-episode-start 12 \
+  --bangumi-episode-start 78
+```
+
+映射会随下一集自动递增：站内 EP14 对应 Bangumi EP80，但 Bilibili 搜索仍使用 EP14。网页添加页也提供“特殊集数映射”；已有追番可在详情页修改并立即加入后台排期同步。
+
 如果数据源中没有该作品，仍可按原方式手工提供多个 `--alias`、`--weekday` 和 `--time`，但不要同时使用 `--auto-schedule`。
 
 检查结果：

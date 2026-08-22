@@ -11,9 +11,9 @@ use sqlx::{
 
 use crate::{
     domain::{
-        Anime, AnimeWithAliases, CandidateState, Episode, EpisodeState, Evaluation, NewAnime,
-        PendingNotification, PendingReviewNotification, ReviewCandidateSummary, ScheduleUpdate,
-        StoredCandidate, UploaderTrust, VideoCandidate,
+        Anime, AnimeWithAliases, CandidateState, Episode, EpisodeNumberMapping, EpisodeState,
+        Evaluation, NewAnime, PendingNotification, PendingReviewNotification,
+        ReviewCandidateSummary, ScheduleUpdate, StoredCandidate, UploaderTrust, VideoCandidate,
     },
     error::{AppError, Result},
 };
@@ -262,28 +262,47 @@ impl Repository {
         if new.duration_min_sec <= 0 || new.duration_max_sec < new.duration_min_sec {
             return Err(AppError::InvalidInput("duration range is invalid".into()));
         }
+        if let Some(mapping) = new
+            .auto_schedule
+            .as_ref()
+            .and_then(|metadata| metadata.episode_mapping)
+        {
+            mapping.mapped_numbers(new.next_episode)?;
+        }
 
         let now = Utc::now();
-        let (bangumi_subject_id, auto_schedule, broadcast_pattern, schedule_sync_at, next_sync_at) =
-            new.auto_schedule
-                .as_ref()
-                .map(|metadata| {
-                    (
-                        Some(metadata.bangumi_subject_id),
-                        true,
-                        Some(metadata.broadcast_pattern.as_str()),
-                        Some(now),
-                        Some(metadata.next_sync_at),
-                    )
-                })
-                .unwrap_or((None, false, None, None, None));
+        let (
+            bangumi_subject_id,
+            auto_schedule,
+            broadcast_pattern,
+            schedule_sync_at,
+            next_sync_at,
+            local_episode_origin,
+            bangumi_episode_origin,
+        ) = new
+            .auto_schedule
+            .as_ref()
+            .map(|metadata| {
+                let mapping = metadata.episode_mapping;
+                (
+                    Some(metadata.bangumi_subject_id),
+                    true,
+                    Some(metadata.broadcast_pattern.as_str()),
+                    Some(now),
+                    Some(metadata.next_sync_at),
+                    mapping.map(|value| value.local_origin),
+                    mapping.map(|value| value.bangumi_origin),
+                )
+            })
+            .unwrap_or((None, false, None, None, None, None, None));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
                 title, bangumi_subject_id, expected_weekday, expected_time, timezone,
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
-                auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#,
+                auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
+                local_episode_origin, bangumi_episode_origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
@@ -298,6 +317,8 @@ impl Repository {
         .bind(broadcast_pattern)
         .bind(schedule_sync_at)
         .bind(next_sync_at)
+        .bind(local_episode_origin)
+        .bind(bangumi_episode_origin)
         .execute(&mut *tx)
         .await?;
         let anime_id = result.last_insert_rowid();
@@ -601,6 +622,37 @@ impl Repository {
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(format!("anime {anime_id}")));
         }
+        Ok(())
+    }
+
+    pub async fn set_episode_number_mapping(
+        &self,
+        anime_id: i64,
+        mapping: Option<EpisodeNumberMapping>,
+    ) -> Result<()> {
+        let anime = self.get_anime(anime_id).await?;
+        if !anime.anime.auto_schedule || anime.anime.lifecycle != "tracking" {
+            return Err(AppError::InvalidInput(
+                "episode mapping requires a tracking anime with automatic scheduling".into(),
+            ));
+        }
+        let episode = self.active_episode(anime_id).await?;
+        if let Some(mapping) = mapping {
+            mapping.mapped_numbers(episode.episode_no)?;
+        }
+        let now = Utc::now();
+        sqlx::query(
+            r#"UPDATE anime SET local_episode_origin = ?, bangumi_episode_origin = ?,
+                   schedule_next_sync_at = ?, schedule_sync_error = NULL, updated_at = ?
+               WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
+        )
+        .bind(mapping.map(|value| value.local_origin))
+        .bind(mapping.map(|value| value.bangumi_origin))
+        .bind(now)
+        .bind(now)
+        .bind(anime_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3587,6 +3639,7 @@ mod tests {
                     bangumi_subject_id: 328_609,
                     broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
+                    episode_mapping: None,
                 }),
             })
             .await
@@ -3936,6 +3989,10 @@ mod tests {
                     bangumi_subject_id: 506_677,
                     broadcast_pattern: "R/2025-07-04T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now() + chrono::Duration::days(1),
+                    episode_mapping: Some(EpisodeNumberMapping {
+                        local_origin: 8,
+                        bangumi_origin: 80,
+                    }),
                 }),
             })
             .await
@@ -3961,6 +4018,8 @@ mod tests {
         let anime = repository.get_anime(anime_id).await.unwrap();
         assert!(anime.anime.auto_schedule);
         assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
+        assert_eq!(anime.anime.local_episode_origin, Some(8));
+        assert_eq!(anime.anime.bangumi_episode_origin, Some(80));
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));

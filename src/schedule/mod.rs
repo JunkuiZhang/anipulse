@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::{
     config::ScheduleConfig,
     detector::title::normalize_title,
-    domain::ScheduleUpdate,
+    domain::{EpisodeNumberMapping, ScheduleUpdate},
     error::{AppError, Result},
     repository::Repository,
 };
@@ -99,6 +99,12 @@ struct Recurrence {
     period: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EpisodeScheduleTarget {
+    local_episode: i64,
+    mapping: Option<EpisodeNumberMapping>,
+}
+
 impl ScheduleProvider {
     pub fn new(config: ScheduleConfig) -> Result<Self> {
         let client = Client::builder()
@@ -169,6 +175,29 @@ impl ScheduleProvider {
         .await
     }
 
+    pub async fn resolve_with_mapping(
+        &self,
+        catalog: &ScheduleCatalog,
+        title: &str,
+        subject_id: Option<i64>,
+        next_episode: i64,
+        episode_mapping: EpisodeNumberMapping,
+        timezone: &str,
+    ) -> Result<ResolvedSchedule> {
+        self.resolve_mapped_at(
+            catalog,
+            title,
+            subject_id,
+            EpisodeScheduleTarget {
+                local_episode: next_episode,
+                mapping: Some(episode_mapping),
+            },
+            timezone,
+            Utc::now(),
+        )
+        .await
+    }
+
     async fn resolve_at(
         &self,
         catalog: &ScheduleCatalog,
@@ -178,6 +207,30 @@ impl ScheduleProvider {
         timezone: &str,
         now: DateTime<Utc>,
     ) -> Result<ResolvedSchedule> {
+        self.resolve_mapped_at(
+            catalog,
+            title,
+            subject_id,
+            EpisodeScheduleTarget {
+                local_episode: next_episode,
+                mapping: None,
+            },
+            timezone,
+            now,
+        )
+        .await
+    }
+
+    async fn resolve_mapped_at(
+        &self,
+        catalog: &ScheduleCatalog,
+        title: &str,
+        subject_id: Option<i64>,
+        episode_target: EpisodeScheduleTarget,
+        timezone: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ResolvedSchedule> {
+        let next_episode = episode_target.local_episode;
         if next_episode <= 0 {
             return Err(AppError::Schedule(
                 "next episode must be greater than zero".into(),
@@ -195,18 +248,30 @@ impl ScheduleProvider {
         })?;
         let selected = select_broadcast(item, &self.config.preferred_site)?;
         let recurrence = parse_recurrence(&selected.pattern)?;
+        let (subject_episode_index, bangumi_episode_no) = episode_target
+            .mapping
+            .map(|mapping| mapping.mapped_numbers(next_episode))
+            .transpose()?
+            .unwrap_or((next_episode, next_episode));
         let airdate = if selected.use_episode_airdate {
-            match self.episode_airdate(bangumi_subject_id, next_episode).await {
+            match self
+                .episode_airdate(
+                    bangumi_subject_id,
+                    subject_episode_index,
+                    bangumi_episode_no,
+                )
+                .await
+            {
                 Ok(value) => value,
                 Err(error) => {
-                    warn!(bangumi_subject_id, next_episode, %error, "Bangumi episode date unavailable; using broadcast recurrence");
+                    warn!(bangumi_subject_id, next_episode, bangumi_episode_no, %error, "Bangumi episode date unavailable; using broadcast recurrence");
                     None
                 }
             }
         } else {
             None
         };
-        let expected_at = expected_at(recurrence, next_episode, airdate, now)?;
+        let expected_at = expected_at(recurrence, subject_episode_index, airdate, now)?;
         let local = expected_at.with_timezone(&timezone);
 
         Ok(ResolvedSchedule {
@@ -221,8 +286,13 @@ impl ScheduleProvider {
         })
     }
 
-    async fn episode_airdate(&self, subject_id: i64, episode_no: i64) -> Result<Option<NaiveDate>> {
-        let offset = episode_no - 1;
+    async fn episode_airdate(
+        &self,
+        subject_id: i64,
+        subject_episode_index: i64,
+        bangumi_episode_no: i64,
+    ) -> Result<Option<NaiveDate>> {
+        let offset = subject_episode_index - 1;
         let response = self
             .client
             .get(format!(
@@ -261,7 +331,7 @@ impl ScheduleProvider {
         } else {
             episode.sort
         };
-        if (returned_number - episode_no as f64).abs() > 0.01 {
+        if (returned_number - bangumi_episode_no as f64).abs() > 0.01 {
             return Ok(None);
         }
         episode
@@ -350,16 +420,43 @@ impl ScheduleSynchronizer {
             )));
         }
         let episode = self.repository.active_episode(anime_id).await?;
-        let resolved = self
-            .provider
-            .resolve(
-                catalog,
-                &anime.anime.title,
-                anime.anime.bangumi_subject_id,
-                episode.episode_no,
-                &anime.anime.timezone,
-            )
-            .await?;
+        let episode_mapping = match (
+            anime.anime.local_episode_origin,
+            anime.anime.bangumi_episode_origin,
+        ) {
+            (Some(local_origin), Some(bangumi_origin)) => Some(EpisodeNumberMapping {
+                local_origin,
+                bangumi_origin,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(AppError::Schedule(
+                    "anime has an incomplete episode number mapping".into(),
+                ));
+            }
+        };
+        let resolved = if let Some(mapping) = episode_mapping {
+            self.provider
+                .resolve_with_mapping(
+                    catalog,
+                    &anime.anime.title,
+                    anime.anime.bangumi_subject_id,
+                    episode.episode_no,
+                    mapping,
+                    &anime.anime.timezone,
+                )
+                .await?
+        } else {
+            self.provider
+                .resolve(
+                    catalog,
+                    &anime.anime.title,
+                    anime.anime.bangumi_subject_id,
+                    episode.episode_no,
+                    &anime.anime.timezone,
+                )
+                .await?
+        };
         let update = resolved
             .to_update(Utc::now() + Duration::seconds(self.config.sync_interval_secs as i64));
         self.repository
@@ -369,6 +466,7 @@ impl ScheduleSynchronizer {
             anime_id,
             bangumi_subject_id = resolved.bangumi_subject_id,
             episode = episode.episode_no,
+            bangumi_episode = episode_mapping.and_then(|mapping| mapping.mapped_numbers(episode.episode_no).ok().map(|(_, number)| number)),
             expected_at = %resolved.expected_at,
             "automatic schedule refreshed"
         );
@@ -667,6 +765,49 @@ mod tests {
         assert_eq!(requests.await.unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn mapped_episode_uses_subject_position_and_bangumi_number() {
+        assert!(
+            EpisodeNumberMapping {
+                local_origin: 12,
+                bangumi_origin: 78,
+            }
+            .mapped_numbers(11)
+            .is_err()
+        );
+        let (base_url, requests) = mapped_mock_server().await;
+        let provider = provider(&base_url);
+        let catalog = provider.load_catalog().await.unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let resolved = provider
+            .resolve_mapped_at(
+                &catalog,
+                "Re：从零开始的异世界生活 第四季 夺还篇",
+                Some(633_836),
+                EpisodeScheduleTarget {
+                    local_episode: 14,
+                    mapping: Some(EpisodeNumberMapping {
+                        local_origin: 12,
+                        bangumi_origin: 78,
+                    }),
+                },
+                "Asia/Shanghai",
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.expected_at.to_rfc3339(),
+            "2026-08-26T13:00:00+00:00"
+        );
+        assert_eq!(resolved.expected_weekday, 2);
+        assert_eq!(resolved.expected_time, "21:00");
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
     #[test]
     fn parses_supported_recurrence() {
         let recurrence = parse_recurrence("R/2026-07-03T15:00:00.000Z/P7D").unwrap();
@@ -707,7 +848,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let headers = String::from_utf8_lossy(request_headers(&request));
-                let response_body = if index == 0 {
+                let response_body: String = if index == 0 {
                     dataset(ambiguous)
                 } else {
                     assert!(headers.contains("/v0/episodes?"));
@@ -723,6 +864,42 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             expected_requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn mapped_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let response_body: String = if index == 0 {
+                    r#"{"items":[{
+                        "title":"Re:ゼロから始める異世界生活 4th season 奪還編",
+                        "titleTranslate":{"zh-Hans":["Re：从零开始的异世界生活 第四季 夺还篇"]},
+                        "type":"tv",
+                        "begin":"2026-08-12T13:00:00.000Z",
+                        "broadcast":"R/2026-08-12T13:00:00.000Z/P7D",
+                        "sites":[{"site":"bangumi","id":"633836"}]
+                    }]}"#
+                        .into()
+                } else {
+                    assert!(headers.contains("/v0/episodes?"));
+                    assert!(headers.contains("subject_id=633836"));
+                    assert!(headers.contains("offset=2"));
+                    r#"{"data":[{"airdate":"2026-08-26","sort":80,"ep":80}]}"#.into()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            2
         });
         (format!("http://{address}"), task)
     }
