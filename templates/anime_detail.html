@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ title }} · AniPulse{% endblock %}
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">ANIME #{{ id }}</p><h1>{{ title }}</h1></div><a class="button" href="/anime">返回列表</a></div>
+<div class="page-heading anime-detail-heading"><div class="anime-heading-main"><div class="anime-cover cover-large">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div><div><p class="eyebrow">ANIME #{{ id }}</p><h1>{{ title }}</h1><p class="page-description">排期、检查和候选审核集中在这里管理。</p></div></div><a class="button" href="/anime">← 返回列表</a></div>
 <section class="panel details">
   <dl><dt>别名</dt><dd>{{ aliases }}</dd><dt>当前 Episode</dt><dd>{{ episode }}</dd><dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>下次检查</dt><dd>{{ next_check }}</dd><dt>时长范围</dt><dd>{{ duration }}</dd><dt>Bangumi</dt><dd>{{ bangumi }}</dd></dl>
 </section>

@@ -8,7 +8,7 @@
   {% for item in items %}
   <tr>
     <td data-label="ID"><span class="table-id">#{{ item.id }}</span></td>
-    <td data-label="标题"><a class="title-link" href="/anime/{{ item.id }}">{{ item.title }}</a></td>
+    <td data-label="标题"><div class="anime-title-cell"><div class="anime-cover cover-small">{% if item.has_cover %}<img src="{{ item.cover_url }}" alt="" loading="lazy" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ item.cover_initial }}</span>{% endif %}</div><a class="title-link" href="/anime/{{ item.id }}">{{ item.title }}</a></div></td>
     <td data-label="当前集"><span class="episode-label">{{ item.episode }}</span></td><td data-label="下次检查" class="table-time">{{ item.next_check }}</td><td data-label="排期">{{ item.schedule }}</td>
     <td data-label="状态">{% if item.enabled %}<span class="badge success"><span class="status-dot"></span>启用</span>{% else %}<span class="badge"><span class="status-dot"></span>停用</span>{% endif %}</td>
   </tr>

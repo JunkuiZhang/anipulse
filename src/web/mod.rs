@@ -170,7 +170,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     insert_header(
         headers,
         "content-security-policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://i0.hdslb.com https://i1.hdslb.com https://i2.hdslb.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://api.bgm.tv https://lain.bgm.tv https://i0.hdslb.com https://i1.hdslb.com https://i2.hdslb.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     );
     insert_header(headers, "x-content-type-options", "nosniff");
     insert_header(
@@ -224,10 +224,9 @@ async fn stylesheet() -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/css; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response
 }
 
@@ -358,6 +357,9 @@ async fn dashboard(
 struct AnimeListItem {
     id: i64,
     title: String,
+    cover_url: String,
+    has_cover: bool,
+    cover_initial: String,
     episode: String,
     next_check: String,
     schedule: String,
@@ -379,9 +381,14 @@ async fn anime_list(
     let mut items = Vec::new();
     for anime in state.repository.list_anime().await? {
         let episode = state.repository.active_episode(anime.id).await.ok();
+        let cover_url = anime.bangumi_subject_id.and_then(bangumi_cover_url);
+        let cover_initial = title_initial(&anime.title);
         items.push(AnimeListItem {
             id: anime.id,
             title: anime.title,
+            has_cover: cover_url.is_some(),
+            cover_url: cover_url.unwrap_or_default(),
+            cover_initial,
             episode: episode
                 .as_ref()
                 .map(|episode| {
@@ -613,6 +620,9 @@ struct AnimeDetailTemplate {
     csrf_token: String,
     id: i64,
     title: String,
+    cover_url: String,
+    has_cover: bool,
+    cover_initial: String,
     aliases: String,
     episode: String,
     expected_at: String,
@@ -631,11 +641,16 @@ async fn anime_detail(
 ) -> WebResponse {
     let anime = state.repository.get_anime(id).await?;
     let episode = state.repository.active_episode(id).await.ok();
+    let cover_url = anime.anime.bangumi_subject_id.and_then(bangumi_cover_url);
+    let cover_initial = title_initial(&anime.anime.title);
     render(AnimeDetailTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
         id,
         title: anime.anime.title,
+        has_cover: cover_url.is_some(),
+        cover_url: cover_url.unwrap_or_default(),
+        cover_initial,
         aliases: anime.aliases.join("、"),
         episode: episode
             .as_ref()
@@ -1646,6 +1661,20 @@ fn canonical_bilibili_url(bvid: &str) -> Option<String> {
         .map(|bvid| format!("https://www.bilibili.com/video/{bvid}"))
 }
 
+fn bangumi_cover_url(subject_id: i64) -> Option<String> {
+    (subject_id > 0)
+        .then(|| format!("https://api.bgm.tv/v0/subjects/{subject_id}/image?type=medium"))
+}
+
+fn title_initial(title: &str) -> String {
+    title
+        .trim()
+        .chars()
+        .next()
+        .map(|character| character.to_string())
+        .unwrap_or_else(|| "番".into())
+}
+
 fn clean_bilibili_title(value: &str) -> String {
     let mut cleaned = String::with_capacity(value.len());
     let mut inside_tag = false;
@@ -1855,6 +1884,17 @@ mod tests {
         assert!(canonical_bilibili_url("not-a-bvid").is_none());
     }
 
+    #[test]
+    fn bangumi_cover_uses_official_subject_image_endpoint() {
+        assert_eq!(
+            bangumi_cover_url(622206).as_deref(),
+            Some("https://api.bgm.tv/v0/subjects/622206/image?type=medium")
+        );
+        assert!(bangumi_cover_url(0).is_none());
+        assert_eq!(title_initial("  恶女不才"), "恶");
+        assert_eq!(title_initial("  "), "番");
+    }
+
     #[tokio::test]
     async fn router_requires_auth_and_sets_security_headers() {
         let (_directory, repository, config, auth, app) = test_app().await;
@@ -1883,8 +1923,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().contains_key("content-security-policy"));
+        let content_security_policy = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap();
+        assert!(content_security_policy.contains("https://api.bgm.tv"));
+        assert!(content_security_policy.contains("https://lain.bgm.tv"));
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/static/app.css?v=light-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("color-scheme: light")
+        );
 
         drop((repository, config, auth));
     }
