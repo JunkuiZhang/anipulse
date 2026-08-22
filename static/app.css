@@ -1123,6 +1123,36 @@ input:focus {
 
 .history-add-form input { margin: 5px 0 0; }
 
+.job-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 14px;
+  border: 1px solid rgba(63, 123, 102, 0.2);
+  border-radius: 14px;
+  background: rgba(231, 242, 237, 0.72);
+  color: #345e51;
+}
+
+.job-progress strong { display: block; color: #284b41; }
+.job-progress p { margin-top: 2px; font-size: 0.88rem; color: #627b73; }
+
+.job-progress-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #4c9279;
+  box-shadow: 0 0 0 0 rgba(76, 146, 121, 0.34);
+  animation: job-progress-pulse 1.8s ease-out infinite;
+}
+
+@keyframes job-progress-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(76, 146, 121, 0.34); }
+  70%, 100% { box-shadow: 0 0 0 8px rgba(76, 146, 121, 0); }
+}
+
 .episode-history-list {
   display: grid;
   gap: 16px;
@@ -1441,6 +1471,8 @@ textarea:focus {
   .uploader-form { grid-template-columns: 1fr; width: 100%; }
   .rule-create-form { grid-template-columns: 1fr; }
   .history-add-form { grid-template-columns: 1fr; }
+  .job-progress { grid-template-columns: auto minmax(0, 1fr); }
+  .job-progress .button { grid-column: 2; width: fit-content; }
   .primary-video-card { align-items: stretch; flex-direction: column; gap: 14px; }
   .primary-video-card > .button { width: 100%; text-align: center; }
   .video-source-item { grid-template-columns: 1fr; }
@@ -1453,5 +1485,6 @@ textarea:focus {
   *, *::before, *::after {
     scroll-behavior: auto !important;
     transition: none !important;
+    animation: none !important;
   }
 }

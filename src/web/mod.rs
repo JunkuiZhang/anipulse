@@ -905,6 +905,7 @@ struct AnimeDetailTemplate {
     episode_id: i64,
     history: Vec<EpisodeHistoryView>,
     notice: String,
+    video_job_enqueued: bool,
     tracking: bool,
     released_complete: bool,
     lifecycle_label: String,
@@ -1001,6 +1002,7 @@ async fn anime_detail(
         state.config.confirmation.trusted_confirmed_count,
         state.display_timezone,
     );
+    let video_job_enqueued = query.result.as_deref() == Some("video-enqueued");
     let notice = match query.result.as_deref() {
         Some("video-enqueued") => "视频已加入处理队列，元数据读取完成后会显示在本页。",
         Some("video-update-enqueued") => "视频地址已加入更新队列，处理成功后会替换原来源。",
@@ -1084,6 +1086,7 @@ async fn anime_detail(
         episode_id: episode.as_ref().map(|episode| episode.id).unwrap_or(0),
         history,
         notice,
+        video_job_enqueued,
         tracking: anime.anime.lifecycle == "tracking",
         released_complete: anime.anime.lifecycle == "released_complete",
         lifecycle_label: if anime.anime.lifecycle == "released_complete" {
@@ -3185,6 +3188,24 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("&#60;script&#62;alert(1)&#60;/script&#62;"));
         assert!(!body.contains("<script>alert(1)</script>"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/anime/1?result=video-enqueued")
+                    .header(header::COOKIE, &cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("正在后台读取视频信息"));
+        assert!(body.contains("这项任务可能需要几分钟"));
+        assert!(body.contains("href=\"/jobs\""));
 
         let response = app
             .clone()

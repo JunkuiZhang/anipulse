@@ -28,6 +28,13 @@
       <label>Bilibili 视频地址<input type="url" name="url" placeholder="https://www.bilibili.com/video/BV..." required></label>
       <button class="primary" type="submit">读取并添加</button>
     </form>
+    {% if video_job_enqueued %}
+    <div class="job-progress" role="status" aria-live="polite">
+      <span class="job-progress-indicator" aria-hidden="true"></span>
+      <div><strong>正在后台读取视频信息</strong><p>这项任务可能需要几分钟；完成后刷新本页即可看到新的视频来源。</p></div>
+      <a class="button" href="/jobs">查看任务</a>
+    </div>
+    {% endif %}
   </section>
   {% if history.is_empty() %}
   <section class="panel empty-state"><h3>还没有往集视频</h3><p class="muted">当前集确认并完成推送后会自动收录，也可以在上方手动补录。</p></section>
