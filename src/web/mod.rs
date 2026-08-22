@@ -565,7 +565,20 @@ struct AnimeResolveForm {
     duration_max: i64,
     timezone: String,
     auto_schedule: Option<String>,
-    bangumi_id: Option<i64>,
+    bangumi_id: Option<String>,
+}
+
+fn parse_optional_bangumi_id(value: Option<&str>) -> Result<Option<i64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let id = value
+        .parse::<i64>()
+        .map_err(|_| AppError::InvalidInput("Bangumi ID 必须是正整数".into()))?;
+    if id <= 0 {
+        return Err(AppError::InvalidInput("Bangumi ID 必须是正整数".into()));
+    }
+    Ok(Some(id))
 }
 
 async fn anime_resolve(
@@ -584,6 +597,7 @@ async fn anime_resolve(
         .checked_mul(60)
         .ok_or_else(|| WebError::bad_request("时长超出范围"))?;
     let auto_schedule = form.auto_schedule.as_deref() == Some("yes");
+    let bangumi_id = parse_optional_bangumi_id(form.bangumi_id.as_deref())?;
     let id = state
         .application
         .create_anime_draft(
@@ -596,7 +610,7 @@ async fn anime_resolve(
                 duration_min_sec,
                 duration_max_sec,
                 auto_schedule,
-                bangumi_id: auto_schedule.then_some(form.bangumi_id).flatten(),
+                bangumi_id: auto_schedule.then_some(bangumi_id).flatten(),
             },
         )
         .await?;
@@ -2851,6 +2865,32 @@ mod tests {
             ),
             "/candidates?state=pending&result=uploader-trusted"
         );
+    }
+
+    #[test]
+    fn empty_bangumi_id_is_treated_as_an_omitted_optional_field() {
+        let form: AnimeResolveForm = serde_json::from_value(serde_json::json!({
+            "csrf_token": "token",
+            "title": "测试番剧",
+            "next_episode": 1,
+            "duration_min": 20,
+            "duration_max": 30,
+            "timezone": "Asia/Shanghai",
+            "auto_schedule": "yes",
+            "bangumi_id": ""
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parse_optional_bangumi_id(form.bangumi_id.as_deref()).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_bangumi_id(Some(" 622206 ")).unwrap(),
+            Some(622_206)
+        );
+        assert!(parse_optional_bangumi_id(Some("not-an-id")).is_err());
+        assert!(parse_optional_bangumi_id(Some("0")).is_err());
     }
 
     async fn test_app() -> (TempDir, Repository, Arc<AppConfig>, AuthService, Router) {
