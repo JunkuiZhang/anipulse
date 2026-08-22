@@ -109,6 +109,16 @@ pub struct DashboardStats {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct UpcomingReleaseRow {
+    pub anime_id: i64,
+    pub title: String,
+    pub bangumi_subject_id: Option<i64>,
+    pub enabled: bool,
+    pub episode_no: i64,
+    pub expected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct ManagementJob {
     pub id: i64,
     pub kind: String,
@@ -345,6 +355,28 @@ impl Repository {
         Ok(sqlx::query_as::<_, Anime>(
             "SELECT * FROM anime WHERE lifecycle = 'archived' ORDER BY archived_at DESC, id DESC",
         )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn upcoming_releases(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<UpcomingReleaseRow>> {
+        Ok(sqlx::query_as::<_, UpcomingReleaseRow>(
+            r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id, a.enabled,
+                      e.episode_no, e.expected_at
+               FROM anime a
+               JOIN episode e ON e.anime_id = a.id
+               WHERE a.lifecycle = 'tracking'
+                 AND e.state NOT IN ('notified', 'confirmed')
+                 AND e.expected_at >= ?
+                 AND e.expected_at < ?
+               ORDER BY e.expected_at, a.id"#,
+        )
+        .bind(from)
+        .bind(until)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -3345,6 +3377,57 @@ mod tests {
             .unwrap();
         let episode = repository.active_episode(anime_id).await.unwrap();
         (directory, repository, anime_id, episode)
+    }
+
+    #[tokio::test]
+    async fn upcoming_releases_are_ordered_windowed_and_keep_paused_schedules() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("upcoming.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let now = Utc::now();
+        let add = |title: &str, expected_at| NewAnime {
+            title: title.into(),
+            aliases: Vec::new(),
+            next_episode: 1,
+            expected_at: Some(expected_at),
+            expected_weekday: None,
+            expected_time: None,
+            timezone: "Asia/Shanghai".into(),
+            duration_min_sec: 1_200,
+            duration_max_sec: 1_800,
+            auto_schedule: None,
+        };
+
+        let later = repository
+            .add_anime(add("两天后", now + chrono::Duration::days(2)))
+            .await
+            .unwrap();
+        let paused = repository
+            .add_anime(add("明天", now + chrono::Duration::days(1)))
+            .await
+            .unwrap();
+        repository.set_anime_enabled(paused, false).await.unwrap();
+        repository
+            .add_anime(add("窗口外", now + chrono::Duration::days(8)))
+            .await
+            .unwrap();
+        let completed = repository
+            .add_anime(add("已经播完", now + chrono::Duration::days(3)))
+            .await
+            .unwrap();
+        repository
+            .mark_anime_released_complete(completed, Some(1))
+            .await
+            .unwrap();
+
+        let releases = repository
+            .upcoming_releases(now, now + chrono::Duration::days(7))
+            .await
+            .unwrap();
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].anime_id, paused);
+        assert!(!releases[0].enabled);
+        assert_eq!(releases[1].anime_id, later);
     }
 
     fn candidate() -> (VideoCandidate, Evaluation) {

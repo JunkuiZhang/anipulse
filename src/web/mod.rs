@@ -15,7 +15,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use tower_http::{
@@ -476,6 +476,19 @@ struct DashboardTemplate {
     failed_job_count: i64,
     scheduler_status: String,
     provider_status: String,
+    upcoming: Vec<UpcomingReleaseView>,
+}
+
+struct UpcomingReleaseView {
+    anime_id: i64,
+    title: String,
+    cover_url: String,
+    has_cover: bool,
+    cover_initial: String,
+    episode: String,
+    day: String,
+    time: String,
+    enabled: bool,
 }
 
 async fn dashboard(
@@ -483,6 +496,32 @@ async fn dashboard(
     Extension(identity): Extension<SessionIdentity>,
 ) -> WebResponse {
     let stats = state.repository.dashboard_stats().await?;
+    let now = Utc::now();
+    let upcoming = state
+        .repository
+        .upcoming_releases(now, now + chrono::Duration::days(7))
+        .await?
+        .into_iter()
+        .map(|release| {
+            let local = release.expected_at.with_timezone(&state.display_timezone);
+            let cover_url = release.bangumi_subject_id.and_then(bangumi_cover_url);
+            UpcomingReleaseView {
+                anime_id: release.anime_id,
+                cover_initial: title_initial(&release.title),
+                title: release.title,
+                has_cover: cover_url.is_some(),
+                cover_url: cover_url.unwrap_or_default(),
+                episode: format!("EP{}", release.episode_no),
+                day: format!(
+                    "{} · {}",
+                    local.format("%m月%d日"),
+                    chinese_weekday(local.weekday())
+                ),
+                time: local.format("%H:%M").to_string(),
+                enabled: release.enabled,
+            }
+        })
+        .collect();
     render(DashboardTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
@@ -495,6 +534,7 @@ async fn dashboard(
         failed_job_count: stats.failed_job_count,
         scheduler_status: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
         provider_status: provider_status(stats.provider_backoff_until, state.display_timezone),
+        upcoming,
     })
 }
 
@@ -507,7 +547,7 @@ struct AnimeListItem {
     cover_initial: String,
     episode: String,
     time_label: String,
-    next_check: String,
+    time_value: String,
     schedule: String,
     enabled: bool,
     released_complete: bool,
@@ -586,11 +626,13 @@ async fn anime_list(
             },
             time_label: if anime.lifecycle == "archived" {
                 "归档时间".into()
+            } else if anime.lifecycle == "released_complete" {
+                "更新状态".into()
             } else {
-                "下次检查".into()
+                "预计更新".into()
             },
-            next_check: if anime.lifecycle == "released_complete" {
-                "已停止检查".into()
+            time_value: if anime.lifecycle == "released_complete" {
+                "本季已播完".into()
             } else if anime.lifecycle == "archived" {
                 anime
                     .archived_at
@@ -599,13 +641,8 @@ async fn anime_list(
             } else {
                 episode
                     .as_ref()
-                    .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
-                    .unwrap_or_else(|| {
-                        anime
-                            .archived_at
-                            .map(|value| format_time(Some(value), state.display_timezone))
-                            .unwrap_or_else(|| "—".into())
-                    })
+                    .map(|episode| format_time(episode.expected_at, state.display_timezone))
+                    .unwrap_or_else(|| "—".into())
             },
             schedule: if anime.lifecycle == "archived" {
                 anime
@@ -2784,6 +2821,18 @@ fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "—".into())
+}
+
+fn chinese_weekday(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Mon => "周一",
+        Weekday::Tue => "周二",
+        Weekday::Wed => "周三",
+        Weekday::Thu => "周四",
+        Weekday::Fri => "周五",
+        Weekday::Sat => "周六",
+        Weekday::Sun => "周日",
+    }
 }
 
 type WebResult<T> = std::result::Result<T, WebError>;

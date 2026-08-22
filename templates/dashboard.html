@@ -2,9 +2,29 @@
 {% block title %}概览 · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading">
-  <div><p class="eyebrow">DASHBOARD</p><h1>监控概览</h1></div>
+  <div><p class="eyebrow">NEXT 7 DAYS</p><h1>未来一周</h1><p class="page-description">按预计更新时间排列，实际更新以检测结果为准。</p></div>
   <a class="primary button" href="/anime/new">添加追番</a>
 </div>
+{% if !upcoming.is_empty() %}
+<section class="upcoming-grid" aria-label="未来一周预计更新">
+{% for item in upcoming %}
+  <a class="upcoming-card" href="/anime/{{ item.anime_id }}">
+    <div class="upcoming-cover anime-cover">
+      {% if item.has_cover %}<img src="{{ item.cover_url }}" alt="{{ item.title }}封面" loading="lazy">{% else %}<span aria-hidden="true">{{ item.cover_initial }}</span>{% endif %}
+    </div>
+    <div class="upcoming-main">
+      <div class="upcoming-date"><strong>{{ item.day }}</strong><span>{{ item.time }}</span></div>
+      <h2>{{ item.title }}</h2>
+      <div class="upcoming-meta"><span>{{ item.episode }} · 预计更新</span>{% if !item.enabled %}<span class="paused-label">监控已暂停</span>{% endif %}</div>
+    </div>
+  </a>
+{% endfor %}
+</section>
+{% else %}
+<div class="empty upcoming-empty">未来 7 天暂无已知排期。</div>
+{% endif %}
+
+<div class="section-title dashboard-monitor-title"><div><p class="eyebrow">MONITOR</p><h2>监控概览</h2></div><a href="/anime">查看全部追番 →</a></div>
 <section class="stats-grid">
   <article><span>追番</span><strong>{{ anime_count }}</strong><small>{{ enabled_anime_count }} 个启用</small></article>
   <article><span>待审核候选</span><strong>{{ pending_candidate_count }}</strong><small><a href="/candidates">前往处理</a></small></article>
