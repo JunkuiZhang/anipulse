@@ -16,18 +16,6 @@
   </div>
 </section>
 {% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
-{% if auto_schedule %}
-<section class="panel mapping-panel">
-  <div><p class="eyebrow">EPISODE MAPPING</p><h2>集数映射</h2><p class="muted">仅在站内集数和 Bangumi 编号不同的时候填写。清空两项可恢复普通的 EP1 ↔ EP1 排期。</p></div>
-  <form method="post" action="/anime/{{ id }}/episode-mapping" class="mapping-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>站内起始集数<input type="number" name="search_episode_start" min="1" max="10000" value="{{ mapping_search_start }}" placeholder="例如 12"></label>
-    <span aria-hidden="true">↔</span>
-    <label>Bangumi 起始集数<input type="number" name="bangumi_episode_start" min="1" max="10000" value="{{ mapping_bangumi_start }}" placeholder="例如 78"></label>
-    <button type="submit">保存并同步排期</button>
-  </form>
-</section>
-{% endif %}
 <section class="history-section">
   <div class="section-heading">
     <div><p class="eyebrow">EPISODE LIBRARY</p><h2>往集视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
@@ -102,7 +90,23 @@
   </div>
   {% endif %}
 </section>
-<section class="panel"><h2>修改标题</h2><form method="post" action="/anime/{{ id }}/title" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="title" value="{{ title }}" required maxlength="200"><button type="submit">保存并重查</button></form></section>
+<section class="panel detail-settings-panel">
+  <h2>修改标题</h2>
+  <form method="post" action="/anime/{{ id }}/title" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="title" value="{{ title }}" required maxlength="200"><button type="submit">保存并重查</button></form>
+  {% if auto_schedule %}
+  <details class="mapping-options detail-mapping-options">
+    <summary>集数映射{% if has_episode_mapping %} · {{ episode_mapping }}{% endif %}</summary>
+    <p class="muted">仅在站内集数和 Bangumi 编号不同的时候填写。清空两项可恢复普通的 EP1 ↔ EP1 排期。</p>
+    <form method="post" action="/anime/{{ id }}/episode-mapping" class="mapping-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>站内起始集数<input type="number" name="search_episode_start" min="1" max="10000" value="{{ mapping_search_start }}" placeholder="例如 12"></label>
+      <span aria-hidden="true">↔</span>
+      <label>Bangumi 起始集数<input type="number" name="bangumi_episode_start" min="1" max="10000" value="{{ mapping_bangumi_start }}" placeholder="例如 78"></label>
+      <button type="submit">保存并同步排期</button>
+    </form>
+  </details>
+  {% endif %}
+</section>
 {% if tracking %}
 <section class="panel lifecycle-panel"><div><p class="eyebrow">SEASON STATUS</p><h2>本季已经播完？</h2><p class="muted">这只会停止查找下一集，不会归档，也不会删除已经确认的视频。等你实际看完后再执行归档。</p></div><form method="post" action="/anime/{{ id }}/released-complete" class="lifecycle-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>本季总集数<input type="number" name="total_episodes" value="{{ suggested_total }}" min="1" max="10000" required></label><button type="submit">标记本季已播完</button></form></section>
 {% endif %}

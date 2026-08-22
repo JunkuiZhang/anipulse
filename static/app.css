@@ -707,15 +707,14 @@ input:focus {
 .mapping-options .two-column { margin-top: 13px; }
 .mapping-options .field-example { color: #8d674f; font-size: 0.82rem; }
 
-.mapping-panel {
-  display: grid;
-  grid-template-columns: minmax(230px, 0.72fr) minmax(460px, 1fr);
-  align-items: end;
-  gap: 24px;
+.detail-settings-panel > h2 { margin-bottom: 12px; }
+
+.detail-mapping-options {
+  margin-top: 18px;
+  border-color: var(--line-strong);
 }
 
-.mapping-panel h2 { margin: 4px 0; }
-.mapping-panel p:last-child { margin: 0; }
+.detail-mapping-options > p { margin-bottom: 13px; }
 
 .mapping-form {
   display: grid;
@@ -1426,7 +1425,6 @@ textarea:focus {
   .detail-cover { min-height: 330px; }
   .detail-title-row { display: grid; }
   .lifecycle-panel { grid-template-columns: 1fr; gap: 18px; }
-  .mapping-panel { grid-template-columns: 1fr; gap: 18px; }
 }
 
 @media (max-width: 620px) {
