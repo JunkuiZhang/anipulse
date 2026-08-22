@@ -340,6 +340,72 @@ impl ApplicationService {
         Ok(bvid)
     }
 
+    pub async fn import_episode_video_url(
+        &self,
+        anime_id: i64,
+        episode_id: i64,
+        replace_video_id: Option<i64>,
+        input: &str,
+    ) -> Result<String> {
+        let bvid = parse_bilibili_bvid(input)?;
+        let anime = self.repository.get_anime(anime_id).await?;
+        let episode = self.repository.episode(episode_id).await?;
+        if episode.anime_id != anime_id
+            || !matches!(episode.state.as_str(), "confirmed" | "notified")
+        {
+            return Err(AppError::InvalidInput(
+                "the episode is not part of this anime's completed history".into(),
+            ));
+        }
+        let now = Utc::now();
+        let seed = VideoCandidate {
+            bvid: bvid.clone(),
+            title: bvid.clone(),
+            description: None,
+            uploader_mid: 0,
+            uploader_name: "unknown".into(),
+            duration_sec: 0,
+            published_at: now,
+            url: format!("https://www.bilibili.com/video/{bvid}"),
+            tags: Vec::new(),
+            page_count: None,
+            discovered_at: now,
+            enriched: false,
+        };
+        let provider =
+            BilibiliProvider::new(self.config.bilibili.clone(), self.repository.clone())?;
+        let candidate = provider.enrich(&seed).await?;
+        let trust = self
+            .repository
+            .uploader_trust(anime_id, candidate.uploader_mid)
+            .await?;
+        let blocked_keywords = self
+            .repository
+            .list_blocked_keywords()
+            .await?
+            .into_iter()
+            .map(|row| row.normalized_keyword)
+            .collect::<Vec<_>>();
+        let evaluation = evaluator::evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &trust,
+            self.config.confirmation.trusted_confirmed_count,
+            &blocked_keywords,
+        );
+        self.repository
+            .upsert_episode_video(
+                anime_id,
+                episode_id,
+                replace_video_id,
+                &candidate,
+                i64::from(evaluation.score),
+            )
+            .await?;
+        Ok(bvid)
+    }
+
     pub async fn create_anime_draft(
         &self,
         admin_id: i64,

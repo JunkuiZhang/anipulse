@@ -34,7 +34,7 @@ use crate::{
     auth::{AuthService, LoginOutcome, SessionIdentity},
     config::AppConfig,
     error::{AppError, Result},
-    repository::{AuditEventRow, CandidateListRow, ManagementJob, Repository},
+    repository::{AuditEventRow, CandidateListRow, EpisodeVideoRow, ManagementJob, Repository},
 };
 use cover_cache::{CoverAsset, CoverCache};
 
@@ -124,6 +124,19 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/disable", post(anime_disable))
         .route("/anime/{id}/check", post(anime_check))
         .route("/anime/{id}/sync", post(anime_sync))
+        .route("/anime/{id}/history/videos", post(history_video_add))
+        .route(
+            "/anime/{id}/history/videos/{video_id}/update",
+            post(history_video_update),
+        )
+        .route(
+            "/anime/{id}/history/episodes/{episode_id}/videos/{video_id}/prefer",
+            post(history_video_prefer),
+        )
+        .route(
+            "/anime/{id}/history/episodes/{episode_id}/preferred/clear",
+            post(history_video_preferred_clear),
+        )
         .route("/anime/{id}/delete-intent", post(anime_delete_intent))
         .route("/anime/{id}/delete", post(anime_delete))
         .route("/covers/{subject_id}", get(cover_image))
@@ -740,17 +753,66 @@ struct AnimeDetailTemplate {
     enabled: bool,
     auto_schedule: bool,
     episode_id: i64,
+    history: Vec<EpisodeHistoryView>,
+    notice: String,
+}
+
+#[derive(Deserialize, Default)]
+struct AnimeDetailQuery {
+    result: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EpisodeVideoView {
+    id: i64,
+    bvid: String,
+    title: String,
+    uploader_mid: i64,
+    uploader_name: String,
+    duration: String,
+    score: i64,
+    url: String,
+    preferred: bool,
+    blocked: bool,
+    trusted: bool,
+    trust_label: String,
+    updated_at: String,
+}
+
+struct EpisodeHistoryView {
+    episode_id: i64,
+    episode_no: i64,
+    primary: EpisodeVideoView,
+    has_primary: bool,
+    has_explicit_preferred: bool,
+    videos: Vec<EpisodeVideoView>,
 }
 
 async fn anime_detail(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
     Path(id): Path<i64>,
+    Query(query): Query<AnimeDetailQuery>,
 ) -> WebResponse {
     let anime = state.repository.get_anime(id).await?;
     let episode = state.repository.active_episode(id).await.ok();
     let cover_url = anime.anime.bangumi_subject_id.and_then(bangumi_cover_url);
     let cover_initial = title_initial(&anime.anime.title);
+    let history = episode_history_views(
+        state.repository.list_episode_videos(id).await?,
+        state.config.confirmation.trusted_confirmed_count,
+        state.display_timezone,
+    );
+    let notice = match query.result.as_deref() {
+        Some("video-enqueued") => "视频已加入处理队列，元数据读取完成后会显示在本页。",
+        Some("video-update-enqueued") => "视频地址已加入更新队列，处理成功后会替换原来源。",
+        Some("preferred-set") => "已选择这条来源作为本集最佳视频。",
+        Some("preferred-cleared") => "已恢复自动选择，将显示未屏蔽来源中评分最高的视频。",
+        Some("uploader-trusted") => "已信任此 UP。",
+        Some("uploader-blocked") => "已屏蔽此 UP；其视频不会再被自动展示或选为最佳。",
+        _ => "",
+    }
+    .to_string();
     render(AnimeDetailTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
@@ -792,7 +854,223 @@ async fn anime_detail(
         enabled: anime.anime.enabled,
         auto_schedule: anime.anime.auto_schedule,
         episode_id: episode.as_ref().map(|episode| episode.id).unwrap_or(0),
+        history,
+        notice,
     })
+}
+
+fn episode_history_views(
+    rows: Vec<EpisodeVideoRow>,
+    trusted_confirmed_count: i64,
+    timezone: Tz,
+) -> Vec<EpisodeHistoryView> {
+    let mut groups: Vec<(i64, i64, Vec<EpisodeVideoView>)> = Vec::new();
+    for row in rows {
+        let trusted = !row.manually_blocked
+            && (row.manually_trusted
+                || (row.confirmed_count >= trusted_confirmed_count && row.rejected_count == 0));
+        let trust_label = if row.manually_blocked {
+            "已屏蔽"
+        } else if row.manually_trusted {
+            "手动信任"
+        } else if trusted {
+            "自动信任"
+        } else {
+            "未信任"
+        };
+        let video = EpisodeVideoView {
+            id: row.id,
+            bvid: row.bvid.clone(),
+            title: clean_bilibili_title(&row.title),
+            uploader_mid: row.uploader_mid,
+            uploader_name: row.uploader_name,
+            duration: format_duration(row.duration_sec),
+            score: row.score,
+            url: canonical_bilibili_url(&row.bvid).unwrap_or_default(),
+            preferred: row.is_preferred,
+            blocked: row.manually_blocked,
+            trusted,
+            trust_label: trust_label.into(),
+            updated_at: format_time(Some(row.updated_at), timezone),
+        };
+        if let Some((_, _, videos)) = groups
+            .iter_mut()
+            .find(|(_, episode_no, _)| *episode_no == row.episode_no)
+        {
+            videos.push(video);
+        } else {
+            groups.push((row.episode_id, row.episode_no, vec![video]));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(episode_id, episode_no, videos)| {
+            let explicit = videos
+                .iter()
+                .find(|video| video.preferred && !video.blocked)
+                .cloned();
+            let primary = explicit
+                .clone()
+                .or_else(|| videos.iter().find(|video| !video.blocked).cloned());
+            EpisodeHistoryView {
+                episode_id,
+                episode_no,
+                has_primary: primary.is_some(),
+                primary: primary.unwrap_or_default(),
+                has_explicit_preferred: explicit.is_some(),
+                videos,
+            }
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct HistoryVideoAddForm {
+    csrf_token: String,
+    episode_no: i64,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct HistoryVideoUpdateForm {
+    csrf_token: String,
+    url: String,
+}
+
+async fn history_video_add(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(anime_id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<HistoryVideoAddForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let bvid = parse_bilibili_bvid(&form.url)?;
+    let episode = state
+        .repository
+        .ensure_historical_episode(anime_id, form.episode_no)
+        .await?;
+    let payload = serde_json::to_string(&serde_json::json!({
+        "purpose": "episode_video",
+        "episode_id": episode.id,
+        "url": form.url
+    }))
+    .map_err(|_| WebError::internal())?;
+    let job_id = state
+        .application
+        .enqueue_job(
+            ManagementJobKind::AcceptBilibiliUrl,
+            Some("anime"),
+            Some(&anime_id.to_string()),
+            &payload,
+            Some(identity.admin_id),
+            Some(&format!("episode_video:add:{}:{bvid}", episode.id)),
+        )
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "episode_video.add.enqueue",
+        "management_job",
+        job_id,
+        serde_json::json!({"anime_id": anime_id, "episode_id": episode.id, "bvid": bvid}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{anime_id}?result=video-enqueued")).into_response())
+}
+
+async fn history_video_update(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, video_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<HistoryVideoUpdateForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let bvid = parse_bilibili_bvid(&form.url)?;
+    let video = state
+        .repository
+        .list_episode_videos(anime_id)
+        .await?
+        .into_iter()
+        .find(|video| video.id == video_id)
+        .ok_or_else(|| WebError::not_found("未找到这个历史视频"))?;
+    let payload = serde_json::to_string(&serde_json::json!({
+        "purpose": "episode_video",
+        "episode_id": video.episode_id,
+        "video_id": video_id,
+        "url": form.url
+    }))
+    .map_err(|_| WebError::internal())?;
+    let job_id = state
+        .application
+        .enqueue_job(
+            ManagementJobKind::AcceptBilibiliUrl,
+            Some("anime"),
+            Some(&anime_id.to_string()),
+            &payload,
+            Some(identity.admin_id),
+            Some(&format!("episode_video:update:{video_id}:{bvid}")),
+        )
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "episode_video.update.enqueue",
+        "management_job",
+        job_id,
+        serde_json::json!({"anime_id": anime_id, "video_id": video_id, "bvid": bvid}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{anime_id}?result=video-update-enqueued")).into_response())
+}
+
+async fn history_video_prefer(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, episode_id, video_id)): Path<(i64, i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .repository
+        .set_episode_video_preferred(anime_id, episode_id, Some(video_id))
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "episode_video.prefer",
+        "episode_video",
+        video_id,
+        serde_json::json!({"anime_id": anime_id, "episode_id": episode_id}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{anime_id}?result=preferred-set")).into_response())
+}
+
+async fn history_video_preferred_clear(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, episode_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .repository
+        .set_episode_video_preferred(anime_id, episode_id, None)
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "episode_video.preferred.clear",
+        "episode",
+        episode_id,
+        serde_json::json!({"anime_id": anime_id}),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{anime_id}?result=preferred-cleared")).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1447,12 +1725,34 @@ async fn candidate_accept(
     Ok(Redirect::to("/candidates?state=pending").into_response())
 }
 
+#[derive(Deserialize)]
+struct UploaderActionForm {
+    csrf_token: String,
+    return_to: Option<String>,
+}
+
+fn uploader_action_redirect(
+    anime_id: i64,
+    return_to: Option<&str>,
+    result: &str,
+    changed: Option<u64>,
+) -> String {
+    let detail_path = format!("/anime/{anime_id}");
+    if return_to == Some(detail_path.as_str()) {
+        format!("{detail_path}?result={result}")
+    } else if let Some(changed) = changed {
+        format!("/candidates?state=pending&result={result}&changed={changed}")
+    } else {
+        format!("/candidates?state=pending&result={result}")
+    }
+}
+
 async fn uploader_trust(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
     Path((anime_id, mid)): Path<(i64, i64)>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<UploaderActionForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
     state
@@ -1468,7 +1768,13 @@ async fn uploader_trust(
         serde_json::json!({}),
     )
     .await?;
-    Ok(Redirect::to("/candidates?state=pending&result=uploader-trusted").into_response())
+    Ok(Redirect::to(&uploader_action_redirect(
+        anime_id,
+        form.return_to.as_deref(),
+        "uploader-trusted",
+        None,
+    ))
+    .into_response())
 }
 
 async fn uploader_block(
@@ -1476,7 +1782,7 @@ async fn uploader_block(
     Extension(identity): Extension<SessionIdentity>,
     Path((anime_id, mid)): Path<(i64, i64)>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<UploaderActionForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
     let rejected = state.application.block_uploader(anime_id, mid).await?;
@@ -1489,8 +1795,11 @@ async fn uploader_block(
         serde_json::json!({"rejected_candidates": rejected}),
     )
     .await?;
-    Ok(Redirect::to(&format!(
-        "/candidates?state=pending&result=uploader-blocked&changed={rejected}"
+    Ok(Redirect::to(&uploader_action_redirect(
+        anime_id,
+        form.return_to.as_deref(),
+        "uploader-blocked",
+        Some(rejected),
     ))
     .into_response())
 }
@@ -2479,6 +2788,68 @@ mod tests {
         assert_eq!(
             format_time(Some(value), chrono_tz::Asia::Shanghai),
             "2026-08-21 21:25:20"
+        );
+    }
+
+    #[test]
+    fn episode_history_uses_explicit_choice_then_highest_unblocked_score() {
+        let row = |id: i64, score: i64, preferred: bool, blocked: bool| EpisodeVideoRow {
+            id,
+            episode_id: 70,
+            episode_no: 7,
+            bvid: format!("BVhistory{id:04}"),
+            title: format!("episode seven source {id}"),
+            uploader_mid: id + 100,
+            uploader_name: format!("up {id}"),
+            duration_sec: 1_400,
+            score,
+            is_preferred: preferred,
+            updated_at: Utc::now(),
+            confirmed_count: 0,
+            rejected_count: 0,
+            manually_trusted: false,
+            manually_blocked: blocked,
+        };
+
+        let automatic = episode_history_views(
+            vec![row(2, 90, false, false), row(1, 40, false, false)],
+            2,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(automatic[0].primary.id, 2);
+        assert!(!automatic[0].has_explicit_preferred);
+
+        let explicit = episode_history_views(
+            vec![row(1, 40, true, false), row(2, 90, false, false)],
+            2,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(explicit[0].primary.id, 1);
+        assert!(explicit[0].has_explicit_preferred);
+
+        let blocked_choice = episode_history_views(
+            vec![row(1, 100, true, true), row(2, 90, false, false)],
+            2,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(blocked_choice[0].primary.id, 2);
+        assert!(!blocked_choice[0].has_explicit_preferred);
+    }
+
+    #[test]
+    fn uploader_return_path_is_limited_to_the_current_anime_detail() {
+        assert_eq!(
+            uploader_action_redirect(1, Some("/anime/1"), "uploader-trusted", None),
+            "/anime/1?result=uploader-trusted"
+        );
+        assert_eq!(
+            uploader_action_redirect(
+                1,
+                Some("https://example.com/steal"),
+                "uploader-trusted",
+                None,
+            ),
+            "/candidates?state=pending&result=uploader-trusted"
         );
     }
 

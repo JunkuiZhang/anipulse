@@ -120,9 +120,16 @@ async fn execute_management_job(
                 .get("episode_id")
                 .and_then(serde_json::Value::as_i64)
                 .ok_or_else(|| AppError::InvalidInput("job payload has no episode ID".into()))?;
-            application
-                .import_bilibili_url_for_episode(anime_id, episode_id, url)
-                .await?;
+            if payload.get("purpose").and_then(serde_json::Value::as_str) == Some("episode_video") {
+                let replace_video_id = payload.get("video_id").and_then(serde_json::Value::as_i64);
+                application
+                    .import_episode_video_url(anime_id, episode_id, replace_video_id, url)
+                    .await?;
+            } else {
+                application
+                    .import_bilibili_url_for_episode(anime_id, episode_id, url)
+                    .await?;
+            }
             Ok(())
         }
         "resolve_anime_draft" => {

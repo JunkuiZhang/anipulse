@@ -2,6 +2,6 @@ mod sqlite;
 
 pub use sqlite::{
     AnimeDraftRow, AuditEventRow, AuthenticatedSession, BlockedKeywordRow, CandidateListRow,
-    DashboardStats, EpisodeRepairSummary, ManagementJob, PendingSourceAlert, Repository,
-    TrustedUploaderRow, WebAdmin,
+    DashboardStats, EpisodeRepairSummary, EpisodeVideoRow, ManagementJob, PendingSourceAlert,
+    Repository, TrustedUploaderRow, WebAdmin,
 };

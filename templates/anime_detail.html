@@ -2,8 +2,76 @@
 {% block title %}{{ title }} · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading anime-detail-heading"><div class="anime-heading-main"><div class="anime-cover cover-large">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div><div><p class="eyebrow">ANIME #{{ id }}</p><h1>{{ title }}</h1><p class="page-description">排期、检查和候选审核集中在这里管理。</p></div></div><a class="button" href="/anime">← 返回列表</a></div>
+{% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 <section class="panel details">
   <dl><dt>别名</dt><dd>{{ aliases }}</dd><dt>当前 Episode</dt><dd>{{ episode }}</dd><dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>下次检查</dt><dd>{{ next_check }}</dd><dt>时长范围</dt><dd>{{ duration }}</dd><dt>Bangumi</dt><dd>{{ bangumi }}</dd></dl>
+</section>
+<section class="history-section">
+  <div class="section-heading">
+    <div><p class="eyebrow">EPISODE LIBRARY</p><h2>往集视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
+  </div>
+  <section class="panel history-add-panel">
+    <div><h3>添加以前集数的视频</h3><p class="muted">适合补录开始监控前的集数，或为同一集增加备用来源。</p></div>
+    <form method="post" action="/anime/{{ id }}/history/videos" class="history-add-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>集数<input type="number" name="episode_no" min="1" max="10000" placeholder="例如 8" required></label>
+      <label>Bilibili 视频地址<input type="url" name="url" placeholder="https://www.bilibili.com/video/BV..." required></label>
+      <button class="primary" type="submit">读取并添加</button>
+    </form>
+  </section>
+  {% if history.is_empty() %}
+  <section class="panel empty-state"><h3>还没有往集视频</h3><p class="muted">当前集确认并完成推送后会自动收录，也可以在上方手动补录。</p></section>
+  {% else %}
+  <div class="episode-history-list">
+    {% for item in history %}
+    <article class="panel episode-history-card">
+      <header class="episode-history-header">
+        <div><span class="episode-kicker">EP{{ item.episode_no }}</span><h3>第 {{ item.episode_no }} 集</h3></div>
+        {% if item.has_explicit_preferred %}<span class="badge success">已选择最佳</span>{% else %}<span class="badge">自动选择最高分</span>{% endif %}
+      </header>
+      {% if item.has_primary %}
+      <div class="primary-video-card">
+        <div class="primary-video-main">
+          <div class="video-title-row"><a href="{{ item.primary.url }}" target="_blank" rel="noopener noreferrer">{{ item.primary.title }}</a><span class="score-pill">{{ item.primary.score }} 分</span></div>
+          <p class="candidate-meta">UP {{ item.primary.uploader_name }} · {{ item.primary.duration }} · {{ item.primary.trust_label }}</p>
+          <p class="muted video-bvid">{{ item.primary.bvid }}</p>
+        </div>
+        <a class="button primary" href="{{ item.primary.url }}" target="_blank" rel="noopener noreferrer">观看视频 ↗</a>
+      </div>
+      {% else %}
+      <div class="history-warning">本集所有来源的 UP 均已屏蔽，暂不展示观看入口。</div>
+      {% endif %}
+      <details class="video-source-manager">
+        <summary>管理全部 {{ item.videos.len() }} 个来源</summary>
+        <div class="video-source-list">
+          {% for video in item.videos %}
+          <article class="video-source-item{% if video.blocked %} source-blocked{% endif %}">
+            <div class="video-source-copy">
+              <div class="video-title-row"><a href="{{ video.url }}" target="_blank" rel="noopener noreferrer">{{ video.title }}</a>{% if video.preferred %}<span class="badge success">最佳</span>{% endif %}</div>
+              <p class="candidate-meta">UP {{ video.uploader_name }} · {{ video.duration }} · 评分 {{ video.score }} · {{ video.trust_label }}</p>
+              <p class="muted video-bvid">{{ video.bvid }} · 更新于 {{ video.updated_at }}</p>
+            </div>
+            <div class="video-source-actions">
+              {% if !video.blocked %}
+                {% if !video.preferred %}<form method="post" action="/anime/{{ id }}/history/episodes/{{ item.episode_id }}/videos/{{ video.id }}/prefer"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">选为最佳</button></form>{% endif %}
+                {% if !video.trusted %}<form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button type="submit">信任此 UP</button></form>{% endif %}
+                <form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/block"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button class="danger-ghost" type="submit">屏蔽此 UP</button></form>
+              {% endif %}
+            </div>
+            <form method="post" action="/anime/{{ id }}/history/videos/{{ video.id }}/update" class="video-update-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <label>视频失效时替换地址<input type="url" name="url" value="{{ video.url }}" required></label>
+              <button type="submit">更新来源</button>
+            </form>
+          </article>
+          {% endfor %}
+        </div>
+        {% if item.has_explicit_preferred %}<form method="post" action="/anime/{{ id }}/history/episodes/{{ item.episode_id }}/preferred/clear" class="preferred-clear-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">恢复自动选择最高分</button></form>{% endif %}
+      </details>
+    </article>
+    {% endfor %}
+  </div>
+  {% endif %}
 </section>
 <section class="panel"><h2>修改标题</h2><form method="post" action="/anime/{{ id }}/title" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="title" value="{{ title }}" required maxlength="200"><button type="submit">保存并重查</button></form></section>
 <section class="actions-grid">

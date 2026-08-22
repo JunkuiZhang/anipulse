@@ -43,6 +43,25 @@ pub struct CandidateListRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct EpisodeVideoRow {
+    pub id: i64,
+    pub episode_id: i64,
+    pub episode_no: i64,
+    pub bvid: String,
+    pub title: String,
+    pub uploader_mid: i64,
+    pub uploader_name: String,
+    pub duration_sec: i64,
+    pub score: i64,
+    pub is_preferred: bool,
+    pub updated_at: DateTime<Utc>,
+    pub confirmed_count: i64,
+    pub rejected_count: i64,
+    pub manually_trusted: bool,
+    pub manually_blocked: bool,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct BlockedKeywordRow {
     pub id: i64,
     pub keyword: String,
@@ -519,6 +538,267 @@ impl Repository {
         .ok_or_else(|| AppError::NotFound(format!("active episode for anime {anime_id}")))
     }
 
+    pub async fn ensure_historical_episode(
+        &self,
+        anime_id: i64,
+        episode_no: i64,
+    ) -> Result<Episode> {
+        if episode_no <= 0 || episode_no > 10_000 {
+            return Err(AppError::InvalidInput(
+                "episode must be between 1 and 10000".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let anime_exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM anime WHERE id = ?)")
+                .bind(anime_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !anime_exists {
+            return Err(AppError::NotFound(format!("anime {anime_id}")));
+        }
+        let current_episode_no = sqlx::query_scalar::<_, i64>(
+            r#"SELECT episode_no FROM episode
+               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+               ORDER BY episode_no LIMIT 1"#,
+        )
+        .bind(anime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("anime has no active episode".into()))?;
+        if episode_no >= current_episode_no {
+            return Err(AppError::InvalidInput(format!(
+                "historical episode must be earlier than current EP{current_episode_no}"
+            )));
+        }
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO episode(
+                   anime_id, episode_no, state, next_check_at, confirmed_at, notified_at
+               ) VALUES (?, ?, 'notified', ?, ?, ?)"#,
+        )
+        .bind(anime_id)
+        .bind(episode_no)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let episode = sqlx::query_as::<_, Episode>(
+            "SELECT * FROM episode WHERE anime_id = ? AND episode_no = ?",
+        )
+        .bind(anime_id)
+        .bind(episode_no)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !matches!(episode.state.as_str(), "confirmed" | "notified") {
+            return Err(AppError::InvalidInput(
+                "episode is still active and cannot be added to history".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(episode)
+    }
+
+    pub async fn list_episode_videos(&self, anime_id: i64) -> Result<Vec<EpisodeVideoRow>> {
+        Ok(sqlx::query_as::<_, EpisodeVideoRow>(
+            r#"SELECT ev.id, ev.episode_id, e.episode_no, ev.bvid, ev.title,
+                      ev.uploader_mid, ev.uploader_name, ev.duration_sec, ev.score,
+                      ev.is_preferred, ev.updated_at,
+                      COALESCE(ut.confirmed_count, 0) AS confirmed_count,
+                      COALESCE(ut.rejected_count, 0) AS rejected_count,
+                      COALESCE(ut.manually_trusted, 0) AS manually_trusted,
+                      COALESCE(ut.manually_blocked, 0) AS manually_blocked
+               FROM episode_video ev
+               JOIN episode e ON e.id = ev.episode_id
+               LEFT JOIN uploader_trust ut
+                 ON ut.anime_id = e.anime_id AND ut.uploader_mid = ev.uploader_mid
+               WHERE e.anime_id = ?
+               ORDER BY e.episode_no DESC, ev.is_preferred DESC, ev.score DESC,
+                        ev.updated_at DESC, ev.id ASC"#,
+        )
+        .bind(anime_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn upsert_episode_video(
+        &self,
+        anime_id: i64,
+        episode_id: i64,
+        replace_video_id: Option<i64>,
+        candidate: &VideoCandidate,
+        score: i64,
+    ) -> Result<i64> {
+        if candidate.uploader_mid <= 0 {
+            return Err(AppError::InvalidInput(
+                "video uploader information is unavailable".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM episode WHERE id = ? AND anime_id = ?",
+        )
+        .bind(episode_id)
+        .bind(anime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("episode {episode_id}")))?;
+        if !matches!(state.as_str(), "confirmed" | "notified") {
+            return Err(AppError::InvalidInput(
+                "only completed episodes can be added to video history".into(),
+            ));
+        }
+
+        let video_id = if let Some(video_id) = replace_video_id {
+            let existing_episode_id =
+                sqlx::query_scalar::<_, i64>("SELECT episode_id FROM episode_video WHERE id = ?")
+                    .bind(video_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound(format!("episode video {video_id}")))?;
+            if existing_episode_id != episode_id {
+                return Err(AppError::InvalidInput(
+                    "video does not belong to this episode".into(),
+                ));
+            }
+            let duplicate = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM episode_video WHERE episode_id = ? AND bvid = ? AND id != ?",
+            )
+            .bind(episode_id)
+            .bind(&candidate.bvid)
+            .bind(video_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if duplicate.is_some() {
+                return Err(AppError::InvalidInput(
+                    "this Bilibili video is already saved for the episode".into(),
+                ));
+            }
+            sqlx::query(
+                r#"UPDATE episode_video SET bvid = ?, title = ?, uploader_mid = ?,
+                       uploader_name = ?, duration_sec = ?, score = ?, updated_at = ?
+                   WHERE id = ?"#,
+            )
+            .bind(&candidate.bvid)
+            .bind(&candidate.title)
+            .bind(candidate.uploader_mid)
+            .bind(&candidate.uploader_name)
+            .bind(candidate.duration_sec)
+            .bind(score)
+            .bind(now)
+            .bind(video_id)
+            .execute(&mut *tx)
+            .await?;
+            video_id
+        } else {
+            sqlx::query(
+                r#"INSERT INTO episode_video(
+                       episode_id, bvid, title, uploader_mid, uploader_name,
+                       duration_sec, score, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(episode_id, bvid) DO UPDATE SET
+                       title = excluded.title,
+                       uploader_mid = excluded.uploader_mid,
+                       uploader_name = excluded.uploader_name,
+                       duration_sec = excluded.duration_sec,
+                       score = excluded.score,
+                       updated_at = excluded.updated_at"#,
+            )
+            .bind(episode_id)
+            .bind(&candidate.bvid)
+            .bind(&candidate.title)
+            .bind(candidate.uploader_mid)
+            .bind(&candidate.uploader_name)
+            .bind(candidate.duration_sec)
+            .bind(score)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM episode_video WHERE episode_id = ? AND bvid = ?",
+            )
+            .bind(episode_id)
+            .bind(&candidate.bvid)
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        sqlx::query(
+            r#"UPDATE episode_video SET is_preferred = 0
+               WHERE id = ? AND EXISTS (
+                   SELECT 1
+                   FROM episode e
+                   JOIN uploader_trust ut
+                     ON ut.anime_id = e.anime_id
+                    AND ut.uploader_mid = episode_video.uploader_mid
+                   WHERE e.id = episode_video.episode_id
+                     AND ut.manually_blocked = 1
+               )"#,
+        )
+        .bind(video_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(video_id)
+    }
+
+    pub async fn set_episode_video_preferred(
+        &self,
+        anime_id: i64,
+        episode_id: i64,
+        video_id: Option<i64>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let owner = sqlx::query_scalar::<_, i64>("SELECT anime_id FROM episode WHERE id = ?")
+            .bind(episode_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("episode {episode_id}")))?;
+        if owner != anime_id {
+            return Err(AppError::InvalidInput(
+                "episode does not belong to this anime".into(),
+            ));
+        }
+        if let Some(video_id) = video_id {
+            let blocked = sqlx::query_scalar::<_, bool>(
+                r#"SELECT COALESCE(ut.manually_blocked, 0)
+                   FROM episode_video ev
+                   JOIN episode e ON e.id = ev.episode_id
+                   LEFT JOIN uploader_trust ut
+                     ON ut.anime_id = e.anime_id AND ut.uploader_mid = ev.uploader_mid
+                   WHERE ev.id = ? AND ev.episode_id = ?"#,
+            )
+            .bind(video_id)
+            .bind(episode_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("episode video {video_id}")))?;
+            if blocked {
+                return Err(AppError::InvalidInput(
+                    "a blocked uploader cannot be selected as best video".into(),
+                ));
+            }
+        }
+        sqlx::query("UPDATE episode_video SET is_preferred = 0 WHERE episode_id = ?")
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(video_id) = video_id {
+            sqlx::query(
+                "UPDATE episode_video SET is_preferred = 1, updated_at = ? WHERE id = ? AND episode_id = ?",
+            )
+            .bind(Utc::now())
+            .bind(video_id)
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn repair_current_episode(
         &self,
         anime_id: i64,
@@ -583,6 +863,10 @@ impl Repository {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        sqlx::query("DELETE FROM episode_video WHERE episode_id = ?")
+            .bind(target.id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE review_notification SET status = 'cancelled' WHERE episode_id = ? AND status = 'pending'",
         )
@@ -1078,15 +1362,23 @@ impl Repository {
         blocked: bool,
     ) -> Result<()> {
         let uploader_name = sqlx::query_scalar::<_, String>(
-            r#"SELECT c.uploader_name
-               FROM candidate c JOIN episode e ON e.id = c.episode_id
-               WHERE e.anime_id = ? AND c.uploader_mid = ?
-               ORDER BY c.last_seen_at DESC LIMIT 1"#,
+            r#"SELECT uploader_name FROM (
+                   SELECT c.uploader_name, c.last_seen_at AS seen_at
+                   FROM candidate c JOIN episode e ON e.id = c.episode_id
+                   WHERE e.anime_id = ? AND c.uploader_mid = ?
+                   UNION ALL
+                   SELECT ev.uploader_name, ev.updated_at AS seen_at
+                   FROM episode_video ev JOIN episode e ON e.id = ev.episode_id
+                   WHERE e.anime_id = ? AND ev.uploader_mid = ?
+               ) ORDER BY seen_at DESC LIMIT 1"#,
         )
+        .bind(anime_id)
+        .bind(mid)
         .bind(anime_id)
         .bind(mid)
         .fetch_optional(&self.pool)
         .await?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"INSERT INTO uploader_trust(
                 anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
@@ -1101,8 +1393,21 @@ impl Repository {
         .bind(uploader_name)
         .bind(trusted)
         .bind(blocked)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if blocked {
+            sqlx::query(
+                r#"UPDATE episode_video SET is_preferred = 0
+                   WHERE uploader_mid = ? AND episode_id IN (
+                       SELECT id FROM episode WHERE anime_id = ?
+                   )"#,
+            )
+            .bind(mid)
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1117,11 +1422,18 @@ impl Repository {
             return Err(AppError::NotFound(format!("anime {anime_id}")));
         }
         let uploader_name = sqlx::query_scalar::<_, String>(
-            r#"SELECT c.uploader_name
-               FROM candidate c JOIN episode e ON e.id = c.episode_id
-               WHERE e.anime_id = ? AND c.uploader_mid = ?
-               ORDER BY c.last_seen_at DESC LIMIT 1"#,
+            r#"SELECT uploader_name FROM (
+                   SELECT c.uploader_name, c.last_seen_at AS seen_at
+                   FROM candidate c JOIN episode e ON e.id = c.episode_id
+                   WHERE e.anime_id = ? AND c.uploader_mid = ?
+                   UNION ALL
+                   SELECT ev.uploader_name, ev.updated_at AS seen_at
+                   FROM episode_video ev JOIN episode e ON e.id = ev.episode_id
+                   WHERE e.anime_id = ? AND ev.uploader_mid = ?
+               ) ORDER BY seen_at DESC LIMIT 1"#,
         )
+        .bind(anime_id)
+        .bind(mid)
         .bind(anime_id)
         .bind(mid)
         .fetch_optional(&mut *tx)
@@ -1150,6 +1462,16 @@ impl Repository {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        sqlx::query(
+            r#"UPDATE episode_video SET is_preferred = 0
+               WHERE uploader_mid = ? AND episode_id IN (
+                   SELECT id FROM episode WHERE anime_id = ?
+               )"#,
+        )
+        .bind(mid)
+        .bind(anime_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             r#"UPDATE episode SET state = 'watching'
                WHERE anime_id = ? AND state IN ('candidate_found','needs_manual_review')
@@ -1244,6 +1566,31 @@ impl Repository {
             .bind(episode_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("UPDATE episode_video SET is_preferred = 0 WHERE episode_id = ?")
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO episode_video(
+                   episode_id, bvid, title, uploader_mid, uploader_name,
+                   duration_sec, score, is_preferred, created_at, updated_at
+               )
+               SELECT episode_id, bvid, title, uploader_mid, uploader_name,
+                      duration_sec, score, 1, first_seen_at, ?
+               FROM candidate WHERE id = ?
+               ON CONFLICT(episode_id, bvid) DO UPDATE SET
+                   title = excluded.title,
+                   uploader_mid = excluded.uploader_mid,
+                   uploader_name = excluded.uploader_name,
+                   duration_sec = excluded.duration_sec,
+                   score = excluded.score,
+                   is_preferred = 1,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(now)
+        .bind(candidate_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             r#"INSERT OR IGNORE INTO notification(
                 episode_id, candidate_id, channel, confirmation_reason, status, created_at
@@ -2782,6 +3129,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trust.confirmed_count, 1);
+        let videos = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].bvid, candidate.bvid);
+        assert!(videos[0].is_preferred);
+    }
+
+    #[tokio::test]
+    async fn historical_video_library_supports_ranking_preference_replacement_and_blocking() {
+        let (_directory, repository, anime_id, current_episode) = fixture().await;
+        assert!(
+            repository
+                .ensure_historical_episode(anime_id, current_episode.episode_no)
+                .await
+                .is_err()
+        );
+        let historical = repository
+            .ensure_historical_episode(anime_id, 7)
+            .await
+            .unwrap();
+        assert_eq!(historical.state, "notified");
+
+        let (low, _) = candidate();
+        let low_id = repository
+            .upsert_episode_video(anime_id, historical.id, None, &low, 40)
+            .await
+            .unwrap();
+        let mut high = low.clone();
+        high.bvid = "BVhistory002".into();
+        high.title = "Silent Witch EP07 high score".into();
+        high.uploader_mid = 200;
+        high.uploader_name = "high score up".into();
+        high.url = "https://www.bilibili.com/video/BVhistory002".into();
+        repository
+            .upsert_episode_video(anime_id, historical.id, None, &high, 90)
+            .await
+            .unwrap();
+
+        let ranked = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(ranked[0].bvid, high.bvid);
+        assert!(!ranked[0].is_preferred);
+        repository
+            .set_episode_video_preferred(anime_id, historical.id, Some(low_id))
+            .await
+            .unwrap();
+        let preferred = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(preferred[0].id, low_id);
+        assert!(preferred[0].is_preferred);
+
+        let mut replacement = low.clone();
+        replacement.bvid = "BVreplace003".into();
+        replacement.title = "replacement".into();
+        repository
+            .upsert_episode_video(anime_id, historical.id, Some(low_id), &replacement, 55)
+            .await
+            .unwrap();
+        let replaced = repository.list_episode_videos(anime_id).await.unwrap();
+        let replaced = replaced.iter().find(|video| video.id == low_id).unwrap();
+        assert_eq!(replaced.bvid, replacement.bvid);
+        assert!(replaced.is_preferred);
+
+        repository
+            .block_uploader(anime_id, replacement.uploader_mid)
+            .await
+            .unwrap();
+        let blocked = repository.list_episode_videos(anime_id).await.unwrap();
+        let blocked = blocked.iter().find(|video| video.id == low_id).unwrap();
+        assert!(blocked.manually_blocked);
+        assert!(!blocked.is_preferred);
     }
 
     #[tokio::test]
@@ -3162,6 +3577,13 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         assert!(repository.list_candidates(None).await.unwrap().is_empty());
+        assert!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(repository.pending_notifications().await.unwrap().is_empty());
         let trust = repository
             .uploader_trust(anime_id, candidate.uploader_mid)

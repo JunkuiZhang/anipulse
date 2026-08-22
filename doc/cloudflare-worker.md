@@ -17,7 +17,7 @@ Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不
 - 域名的 DNS Zone 已托管在 Cloudflare；
 - 准备一个没有被其他服务占用的子域名，例如 `bgm-proxy.example.com`；
 - 阿里云 ECS 有稳定的公网出口 IPv4 或 IPv6；
-- 部署电脑有 Node.js 20 或更高版本。Node 只用于运行 Wrangler，不需要安装到 ECS。
+- 如果选择命令行部署，部署电脑需有 Node.js 20 或更高版本。完全通过 Cloudflare 网页部署时不需要 Node.js，也不需要在 ECS 安装任何 Cloudflare 工具。
 
 可以从阿里云控制台确认实例公网 IP。若实例通过 NAT 网关出站，应填写 NAT 网关的出口 IP，而不是实例内网地址。
 
@@ -25,7 +25,56 @@ Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不
 
 Workers Free 当前包含每天 100,000 次请求，对个人 AniPulse 足够使用；具体额度以 Cloudflare 的 [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/) 为准。
 
-## 2. 本地测试 Worker
+## 2. 完全通过 Cloudflare Dashboard 部署
+
+下面的流程不需要在本地安装 Wrangler，适合直接在 Cloudflare 网页完成。
+
+### 2.1 创建 Worker
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)；
+2. 打开 **Workers & Pages**；
+3. 选择 **Create application → Create Worker**。新版界面也可能显示为 **Start with Hello World**；
+4. 名称填写 `anipulse-bangumi-proxy`，然后点击 **Deploy**；
+5. 首次部署完成后，点击 **Edit code**；
+6. 删除编辑器里的示例代码，将 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 的完整内容粘贴进去；
+7. 点击右上角 **Deploy**。
+
+这里必须粘贴整个文件，不能只复制其中的 `fetch` 函数。Worker 依赖同一文件里的路由白名单、缓存和错误处理代码。
+
+### 2.2 设置 Variables and Secrets
+
+进入这个 Worker 的 **Settings → Variables and Secrets**，依次添加：
+
+| 名称 | 类型 | 是否必需 | 值 |
+|---|---|---:|---|
+| `ALLOWED_CLIENT_IPS` | Secret | 是 | ECS 或 NAT 网关的实际公网出口 IP；多个地址用英文逗号分隔 |
+| `UPSTREAM_USER_AGENT` | Secret | 是 | 例如 `你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted via Cloudflare Worker)` |
+| `CACHE_VERSION` | Text | 否 | 初次可填 `v1`，需要绕过旧缓存时改成 `v2` |
+
+保存后按界面提示重新部署。不要把实际公网 IP、User-Agent 身份或 Secret 写入 Git、截图或公开文档。
+
+如果 ECS 通过 NAT 网关出站，`ALLOWED_CLIENT_IPS` 必须填 NAT 网关的出口 IP。可在 ECS 上用 Cloudflare 的 trace 页面确认 Worker 实际看到的地址：
+
+```bash
+curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep '^ip='
+```
+
+Worker 未配置 `ALLOWED_CLIENT_IPS` 时会返回 HTTP 503；访问地址不在名单中时返回 HTTP 403。这是刻意的 fail-closed 设计。
+
+### 2.3 绑定自定义域名
+
+1. 打开 Worker 的 **Settings → Domains & Routes**；
+2. 选择 **Add → Custom Domain**；
+3. 输入一个未被占用的子域名，例如 `bgm-proxy.example.com`；
+4. 确认添加，等待 Cloudflare 自动创建 DNS 记录和 TLS 证书。
+
+不要再手工给这个子域名添加指向 ECS 的 A/AAAA/CNAME 记录；它的源站就是 Worker。如果已经存在同名 DNS 记录，先确认没有其他服务使用，再删除冲突记录后重试。
+
+网页编辑器的 Preview 请求通常来自 Cloudflare 或你的本机，而不是 ECS，因此配置 IP 白名单后 Preview 返回 403 是正常的。最终验证应从 ECS 执行本文第 6 节的命令。
+
+Cloudflare 官方参考：[Dashboard 创建 Worker](https://developers.cloudflare.com/workers/get-started/dashboard/)、[Secrets](https://developers.cloudflare.com/workers/configuration/secrets/) 和 [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)。
+
+## 3. 本地测试 Worker（可选）
 
 进入 Worker 目录：
 
@@ -50,7 +99,7 @@ npm run dev
 
 本地请求来自 `127.0.0.1` 或 `::1`，示例 allowlist 已包含它们。
 
-## 3. 登录并部署
+## 4. 使用 Wrangler 部署（可选）
 
 ```bash
 cd deploy/cloudflare-worker
@@ -69,8 +118,10 @@ npx wrangler@latest secret put ALLOWED_CLIENT_IPS
 输入示例：
 
 ```text
-47.120.50.146,2001:db8::10
+203.0.113.10,2001:db8::10
 ```
+
+`203.0.113.10` 和 `2001:db8::10` 都是文档保留地址，只用于演示；部署时应在 Secret 中填写自己的实际出口地址，不要提交到仓库。
 
 再设置 Bangumi 要求的可识别 User-Agent：
 
@@ -86,7 +137,7 @@ npx wrangler@latest secret put UPSTREAM_USER_AGENT
 
 Worker 没有配置 `ALLOWED_CLIENT_IPS` 时会 fail closed，所有请求返回 HTTP 503；IP 不在名单中时返回 HTTP 403。
 
-## 4. 绑定自定义域名
+## 5. 为 Wrangler 部署绑定自定义域名
 
 进入 Cloudflare Dashboard：
 
@@ -100,7 +151,7 @@ Cloudflare 会为该子域名创建 DNS 记录和 TLS 证书。这个子域名�
 
 Cloudflare 官方也建议生产 Worker 使用 [Custom Domain 或 Route](https://developers.cloudflare.com/workers/configuration/routing/)，而不是把 `workers.dev` 当作正式入口。
 
-## 5. 从阿里云验证
+## 6. 从阿里云验证
 
 以下命令必须在 ECS 上执行，因为本机 IP 默认不在 allowlist 中。
 
@@ -145,7 +196,7 @@ grep -iE 'content-type|x-anipulse-proxy-cache' /tmp/anipulse-worker-cover.header
 
 第一次通常显示 `X-AniPulse-Proxy-Cache: MISS`，同一 Cloudflare 节点的后续请求应显示 `HIT`。Cloudflare Cache API 是按边缘节点缓存，因此换网络或换地区后首次请求仍可能是 `MISS`。
 
-## 6. 修改 AniPulse 配置
+## 7. 修改 AniPulse 配置
 
 先备份配置：
 
@@ -186,7 +237,7 @@ sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
 
 如果封面之前一直是占位图，成功请求后会写入 `/var/lib/anipulse/covers`。浏览器随后继续通过 AniPulse 自己的 `/covers/{subject_id}` 读取服务器本地缓存，不会直接访问 Worker。
 
-## 7. 缓存策略
+## 8. 缓存策略
 
 Worker 使用以下边缘缓存时间：
 
@@ -200,7 +251,7 @@ Worker 使用以下边缘缓存时间：
 
 需要立即绕过旧 Worker 缓存时，在 Worker 的 Variables and Secrets 中添加或修改普通变量 `CACHE_VERSION`，例如从 `v1` 改为 `v2`。新版本会使用新的 cache key，不需要修改 AniPulse URL。
 
-## 8. 故障排查
+## 9. 故障排查
 
 ### HTTP 403
 
