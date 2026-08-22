@@ -71,7 +71,7 @@ dangerous_allow_public_bind = false
 
 `public_url` 必须和浏览器实际访问的 origin 完全一致，包括非默认端口。生产环境必须是 HTTPS；不要为了省略反向代理而把 `development_mode` 或 `dangerous_allow_public_bind` 打开。
 
-`timezone` 是网页统一使用的 IANA 时区。数据库仍以 UTC 保存时间，网页展示时才转换，因此修改它不需要迁移数据库。中国大陆通常使用 `Asia/Shanghai`；例如数据库中的 `2026-08-21 13:25:20 UTC` 会显示为 `2026-08-21 21:25:20 Asia/Shanghai`。
+`timezone` 是网页统一使用的 IANA 时区。数据库仍以 UTC 保存时间，网页展示时才转换，因此修改它不需要迁移数据库。中国大陆通常使用 `Asia/Shanghai`；例如数据库中的 `2026-08-21 13:25:20 UTC` 会显示为 `2026-08-21 21:25:20`，页面不会在每个时间后面重复显示时区名称。
 
 `cover_cache_dir = "covers"` 会把 Bangumi 封面保存到 `/var/lib/anipulse/covers`（相对路径以 systemd 的 `WorkingDirectory` 为基准）。第一次显示某张封面时由网页进程下载，服务器缓存 7 天；图片 API 失败时会并行尝试从 Bangumi 官方条目页发现封面，上游临时不可用时则继续返回已经存在的旧图。浏览器收到 `Cache-Control: private, max-age=86400` 和 ETag，会缓存 1 天，过期后通常只向 AniPulse 做条件校验，不会再次下载完整图片。缓存单图上限为 5 MiB，只接受常见位图格式；下载失败占位图不缓存，刷新页面即可重试。
 

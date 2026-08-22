@@ -2117,11 +2117,10 @@ fn episode_state_label(state: &str) -> &str {
 fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     value
         .map(|value| {
-            format!(
-                "{} {}",
-                value.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S"),
-                timezone.name()
-            )
+            value
+                .with_timezone(&timezone)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
         })
         .unwrap_or_else(|| "—".into())
 }
@@ -2479,7 +2478,7 @@ mod tests {
 
         assert_eq!(
             format_time(Some(value), chrono_tz::Asia::Shanghai),
-            "2026-08-21 21:25:20 Asia/Shanghai"
+            "2026-08-21 21:25:20"
         );
     }
 
