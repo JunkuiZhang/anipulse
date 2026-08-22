@@ -56,6 +56,7 @@ sudo install -m 0644 deploy/anipulse-web.service /etc/systemd/system/anipulse-we
 bind = "127.0.0.1:8080"
 public_url = "https://anime.example.com"
 cover_cache_dir = "covers"
+timezone = "Asia/Shanghai"
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
 session_idle_secs = 7200
 session_absolute_secs = 86400
@@ -69,6 +70,8 @@ dangerous_allow_public_bind = false
 ```
 
 `public_url` 必须和浏览器实际访问的 origin 完全一致，包括非默认端口。生产环境必须是 HTTPS；不要为了省略反向代理而把 `development_mode` 或 `dangerous_allow_public_bind` 打开。
+
+`timezone` 是网页统一使用的 IANA 时区。数据库仍以 UTC 保存时间，网页展示时才转换，因此修改它不需要迁移数据库。中国大陆通常使用 `Asia/Shanghai`；例如数据库中的 `2026-08-21 13:25:20 UTC` 会显示为 `2026-08-21 21:25:20 Asia/Shanghai`。
 
 `cover_cache_dir = "covers"` 会把 Bangumi 封面保存到 `/var/lib/anipulse/covers`（相对路径以 systemd 的 `WorkingDirectory` 为基准）。第一次显示某张封面时由网页进程下载，服务器缓存 7 天；图片 API 失败时会并行尝试从 Bangumi 官方条目页发现封面，上游临时不可用时则继续返回已经存在的旧图。浏览器收到 `Cache-Control: private, max-age=86400` 和 ETag，会缓存 1 天，过期后通常只向 AniPulse 做条件校验，不会再次下载完整图片。缓存单图上限为 5 MiB，只接受常见位图格式；下载失败占位图不缓存，刷新页面即可重试。
 
@@ -249,10 +252,29 @@ sudo tail -f /var/log/caddy/anipulse-access.log
 
 ```bash
 sudo journalctl -u anipulse-web.service -n 100 --no-pager \
-  | grep -E 'cover unavailable|cover refresh'
+  | grep -E 'cover unavailable|cover refresh|622206'
 ```
 
-服务器至少需要能够通过 HTTPS 访问 `api.bgm.tv`，或者同时访问 `bgm.tv` 与 `lain.bgm.tv`。成功一次后图片会写入本地缓存，之后即使上游暂时失败也会继续显示旧图。
+把下面的 subject ID 和 User-Agent 换成你的实际值，并且必须以运行服务的 `anipulse` 用户测试：
+
+```bash
+sudo -u anipulse curl -I -L --max-time 20 \
+  -A 'your-name/AniPulse/0.1 (personal self-hosted)' \
+  'https://api.bgm.tv/v0/subjects/622206/image?type=medium'
+
+sudo -u anipulse curl -I -L --max-time 20 \
+  -A 'your-name/AniPulse/0.1 (personal self-hosted)' \
+  'https://bgm.tv/subject/622206'
+
+getent ahostsv4 api.bgm.tv bgm.tv lain.bgm.tv
+sudo -u anipulse test -w /var/lib/anipulse/covers && echo 'cover cache writable'
+```
+
+第一条请求会重定向到 `lain.bgm.tv`，因此服务器需要能够通过 HTTPS 访问 `api.bgm.tv`、`bgm.tv` 和 `lain.bgm.tv`。如果 curl 超时或连接失败，问题在服务器的出站网络、DNS 或到 Bangumi 的链路；这与浏览器缓存无关。如果 curl 成功但网页仍失败，以 journal 中的具体错误为准，并检查缓存目录权限。成功一次后图片会写入本地缓存，之后即使上游暂时失败也会继续显示旧图。修复后可重启网页服务并刷新：
+
+```bash
+sudo systemctl restart anipulse-web.service
+```
 
 ### 飞书卡片按钮打不开
 

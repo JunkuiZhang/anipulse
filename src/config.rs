@@ -144,6 +144,10 @@ impl AppConfig {
                 "web.cover_cache_dir must not be empty".into(),
             ));
         }
+        self.web
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| AppError::Config("web.timezone must be a valid IANA timezone".into()))?;
         if self.scheduler.tick_secs == 0
             || self.scheduler.due_batch_size <= 0
             || self.scheduler.management_job_batch_size <= 0
@@ -329,6 +333,7 @@ pub struct WebConfig {
     pub bind: String,
     pub public_url: String,
     pub cover_cache_dir: String,
+    pub timezone: String,
     pub trusted_proxy_cidrs: Vec<IpNet>,
     pub session_idle_secs: i64,
     pub session_absolute_secs: i64,
@@ -347,6 +352,7 @@ impl Default for WebConfig {
             bind: "127.0.0.1:8080".into(),
             public_url: "https://localhost".into(),
             cover_cache_dir: "covers".into(),
+            timezone: "Asia/Shanghai".into(),
             trusted_proxy_cidrs: vec![
                 "127.0.0.1/32".parse().expect("valid loopback network"),
                 "::1/128".parse().expect("valid loopback network"),
@@ -392,5 +398,14 @@ mod tests {
         config.web.bind = "127.0.0.1:8080".into();
         config.web.public_url = "https://anime.example.com/panel".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_web_display_timezone() {
+        let mut config = AppConfig::default();
+        config.web.timezone = "Asia/Not-A-Real-City".into();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("web.timezone"));
     }
 }

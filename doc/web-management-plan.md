@@ -380,6 +380,8 @@ V1 不接收飞书卡片 action callback，也不订阅私聊文本消息。直�
 [web]
 bind = "127.0.0.1:8080"
 public_url = "https://anime.example.com"
+cover_cache_dir = "covers"
+timezone = "Asia/Shanghai"
 trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
 session_idle_secs = 7200
 session_absolute_secs = 86400

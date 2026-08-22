@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -47,6 +48,7 @@ struct WebState {
     auth: AuthService,
     config: Arc<AppConfig>,
     public_origin: String,
+    display_timezone: Tz,
     cover_cache: CoverCache,
 }
 
@@ -56,12 +58,18 @@ pub async fn serve(repository: Repository, config: Arc<AppConfig>) -> Result<()>
     cover_cache.initialize(&repository).await?;
     let auth = AuthService::from_env(repository.clone(), config.web.clone()).await?;
     let public_origin = origin_of(&config.web.public_url)?;
+    let display_timezone = config
+        .web
+        .timezone
+        .parse::<Tz>()
+        .map_err(|_| AppError::Config("web.timezone is invalid".into()))?;
     let state = WebState {
         application: ApplicationService::new(repository.clone(), config.clone()),
         repository: repository.clone(),
         auth,
         config: config.clone(),
         public_origin,
+        display_timezone,
         cover_cache: cover_cache.clone(),
     };
     spawn_web_cleanup(repository.clone(), cover_cache);
@@ -401,7 +409,10 @@ async fn login_submit(
         LoginOutcome::Blocked(until) => render_with_status(
             LoginTemplate {
                 initialized: true,
-                message: format!("登录尝试过多，请在 {} 后重试", format_time(Some(until))),
+                message: format!(
+                    "登录尝试过多，请在 {} 后重试",
+                    format_time(Some(until), state.display_timezone)
+                ),
             },
             StatusCode::TOO_MANY_REQUESTS,
         ),
@@ -446,8 +457,8 @@ async fn dashboard(
         failed_notification_count: stats.failed_notification_count,
         queued_job_count: stats.queued_job_count,
         failed_job_count: stats.failed_job_count,
-        scheduler_status: heartbeat_status(stats.scheduler_heartbeat),
-        provider_status: provider_status(stats.provider_backoff_until),
+        scheduler_status: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
+        provider_status: provider_status(stats.provider_backoff_until, state.display_timezone),
     })
 }
 
@@ -498,7 +509,7 @@ async fn anime_list(
                 .unwrap_or_else(|| "—".into()),
             next_check: episode
                 .as_ref()
-                .map(|episode| format_time(Some(episode.next_check_at)))
+                .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
                 .unwrap_or_else(|| "—".into()),
             schedule: if anime.auto_schedule {
                 anime
@@ -631,7 +642,7 @@ async fn anime_draft(
                     .map(|id| format!("#{id}"))
                     .unwrap_or_else(|| "未绑定".into()),
                 resolved.next_episode,
-                format_time(resolved.expected_at),
+                format_time(resolved.expected_at, state.display_timezone),
                 if resolved.aliases.is_empty() {
                     "—".into()
                 } else {
@@ -762,11 +773,11 @@ async fn anime_detail(
         expected_at: episode
             .as_ref()
             .and_then(|episode| episode.expected_at)
-            .map(|value| format_time(Some(value)))
+            .map(|value| format_time(Some(value), state.display_timezone))
             .unwrap_or_else(|| "未知".into()),
         next_check: episode
             .as_ref()
-            .map(|episode| format_time(Some(episode.next_check_at)))
+            .map(|episode| format_time(Some(episode.next_check_at), state.display_timezone))
             .unwrap_or_else(|| "—".into()),
         duration: format!(
             "{}–{} 分钟",
@@ -1721,7 +1732,7 @@ async fn job_list(
         .list_management_jobs(100)
         .await?
         .into_iter()
-        .map(job_view)
+        .map(|job| job_view(job, state.display_timezone))
         .collect();
     render(JobTemplate {
         username: identity.username,
@@ -1730,13 +1741,13 @@ async fn job_list(
     })
 }
 
-fn job_view(job: ManagementJob) -> JobView {
+fn job_view(job: ManagementJob, timezone: Tz) -> JobView {
     JobView {
         id: job.id,
         kind: job.kind,
         target: job.target_id.unwrap_or_else(|| "—".into()),
         state: job.state,
-        created_at: format_time(Some(job.created_at)),
+        created_at: format_time(Some(job.created_at), timezone),
         error: job.error.unwrap_or_default(),
     }
 }
@@ -1765,7 +1776,7 @@ async fn audit_list(
         .list_audit_events(100)
         .await?
         .into_iter()
-        .map(audit_view)
+        .map(|event| audit_view(event, state.display_timezone))
         .collect();
     render(AuditTemplate {
         username: identity.username,
@@ -1774,9 +1785,9 @@ async fn audit_list(
     })
 }
 
-fn audit_view(event: AuditEventRow) -> AuditView {
+fn audit_view(event: AuditEventRow, timezone: Tz) -> AuditView {
     AuditView {
-        created_at: format_time(Some(event.created_at)),
+        created_at: format_time(Some(event.created_at), timezone),
         actor: event
             .actor_admin_id
             .map(|id| format!("{} #{id}", event.actor_type))
@@ -1801,6 +1812,7 @@ struct SettingsTemplate {
     notification_provider: String,
     schedule_source: String,
     public_url: String,
+    timezone: String,
 }
 
 async fn settings_status(
@@ -1811,11 +1823,12 @@ async fn settings_status(
     render(SettingsTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
-        scheduler: heartbeat_status(stats.scheduler_heartbeat),
-        provider: provider_status(stats.provider_backoff_until),
+        scheduler: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
+        provider: provider_status(stats.provider_backoff_until, state.display_timezone),
         notification_provider: state.config.notification.provider.clone(),
         schedule_source: state.config.schedule.bangumi_data_url.clone(),
         public_url: state.config.web.public_url.clone(),
+        timezone: state.config.web.timezone.clone(),
     })
 }
 
@@ -2010,19 +2023,21 @@ fn clear_session_redirect(state: &WebState) -> Response {
     response
 }
 
-fn heartbeat_status(value: Option<DateTime<Utc>>) -> String {
+fn heartbeat_status(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     match value {
         Some(value) if value + chrono::Duration::minutes(2) > Utc::now() => {
-            format!("正常 · {}", format_time(Some(value)))
+            format!("正常 · {}", format_time(Some(value), timezone))
         }
-        Some(value) => format!("已停止或延迟 · {}", format_time(Some(value))),
+        Some(value) => format!("已停止或延迟 · {}", format_time(Some(value), timezone)),
         None => "尚无心跳".into(),
     }
 }
 
-fn provider_status(value: Option<DateTime<Utc>>) -> String {
+fn provider_status(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     match value {
-        Some(value) if value > Utc::now() => format!("退避至 {}", format_time(Some(value))),
+        Some(value) if value > Utc::now() => {
+            format!("退避至 {}", format_time(Some(value), timezone))
+        }
         _ => "可用".into(),
     }
 }
@@ -2099,9 +2114,15 @@ fn episode_state_label(state: &str) -> &str {
     }
 }
 
-fn format_time(value: Option<DateTime<Utc>>) -> String {
+fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     value
-        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .map(|value| {
+            format!(
+                "{} {}",
+                value.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S"),
+                timezone.name()
+            )
+        })
         .unwrap_or_else(|| "—".into())
 }
 
@@ -2450,6 +2471,18 @@ mod tests {
         assert!(!repository.get_anime(1).await.unwrap().anime.enabled);
     }
 
+    #[test]
+    fn web_times_are_rendered_in_the_configured_timezone() {
+        let value = DateTime::parse_from_rfc3339("2026-08-21T13:25:20Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            format_time(Some(value), chrono_tz::Asia::Shanghai),
+            "2026-08-21 21:25:20 Asia/Shanghai"
+        );
+    }
+
     async fn test_app() -> (TempDir, Repository, Arc<AppConfig>, AuthService, Router) {
         let directory = TempDir::new().unwrap();
         let database = directory.path().join("test.db");
@@ -2469,6 +2502,7 @@ mod tests {
             auth: auth.clone(),
             config: config.clone(),
             public_origin: origin_of(&config.web.public_url).unwrap(),
+            display_timezone: config.web.timezone.parse().unwrap(),
             cover_cache: CoverCache::new(&config).unwrap(),
         };
         let app = build_router(state, &config);
