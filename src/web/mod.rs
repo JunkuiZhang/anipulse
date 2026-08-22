@@ -814,6 +814,8 @@ struct AnimeDraftTemplate {
     bangumi_id: String,
     next_episode: i64,
     expected_at: String,
+    schedule_source: String,
+    schedule_confidence: String,
     aliases: String,
     duration: String,
     episode_mapping: String,
@@ -841,6 +843,8 @@ async fn anime_draft(
         bangumi_id,
         next_episode,
         expected_at,
+        schedule_source,
+        schedule_confidence,
         aliases,
         duration,
         episode_mapping,
@@ -872,6 +876,16 @@ async fn anime_draft(
                 .unwrap_or_else(|| "未绑定".into()),
             resolved.next_episode,
             format_time(resolved.expected_at, state.display_timezone),
+            resolved
+                .schedule_source
+                .as_deref()
+                .map(schedule_source_label)
+                .unwrap_or_else(|| "手工排期".into()),
+            resolved
+                .schedule_confidence
+                .as_deref()
+                .map(schedule_confidence_label)
+                .unwrap_or_else(|| "—".into()),
             if resolved.aliases.is_empty() {
                 "—".into()
             } else {
@@ -896,6 +910,8 @@ async fn anime_draft(
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
+            String::new(),
         )
     };
     render(AnimeDraftTemplate {
@@ -910,6 +926,8 @@ async fn anime_draft(
         bangumi_id,
         next_episode,
         expected_at,
+        schedule_source,
+        schedule_confidence,
         aliases,
         duration,
         has_episode_mapping: !episode_mapping.is_empty(),
@@ -968,6 +986,10 @@ struct AnimeDetailTemplate {
     aliases: String,
     episode: String,
     expected_at: String,
+    schedule_source: String,
+    schedule_confidence: String,
+    schedule_warning: String,
+    has_schedule_warning: bool,
     next_check: String,
     duration: String,
     bangumi: String,
@@ -1162,6 +1184,26 @@ async fn anime_detail(
                 .map(|value| format_time(Some(value), state.display_timezone))
                 .unwrap_or_else(|| "未知".into())
         },
+        schedule_source: anime
+            .anime
+            .schedule_source
+            .as_deref()
+            .map(schedule_source_label)
+            .unwrap_or_else(|| {
+                if anime.anime.auto_schedule {
+                    "未知".into()
+                } else {
+                    "手工排期".into()
+                }
+            }),
+        schedule_confidence: anime
+            .anime
+            .schedule_confidence
+            .as_deref()
+            .map(schedule_confidence_label)
+            .unwrap_or_else(|| "—".into()),
+        has_schedule_warning: anime.anime.schedule_warning.is_some(),
+        schedule_warning: anime.anime.schedule_warning.unwrap_or_default(),
         next_check: if anime.anime.lifecycle == "released_complete" {
             "已停止检查".into()
         } else {
@@ -2977,6 +3019,30 @@ fn episode_state_label(state: &str) -> &str {
     }
 }
 
+fn schedule_source_label(source: &str) -> String {
+    match source {
+        "bilibili" => "Bilibili".into(),
+        "unext" => "U-NEXT".into(),
+        "danime" => "d Anime".into(),
+        "abema" => "ABEMA".into(),
+        "gamer" => "巴哈姆特动画疯".into(),
+        "gamer_hk" => "巴哈姆特动画疯（香港）".into(),
+        "bangumi-data" => "bangumi-data 默认时段".into(),
+        "unknown" => "未知".into(),
+        value => value.to_string(),
+    }
+}
+
+fn schedule_confidence_label(confidence: &str) -> String {
+    match confidence {
+        "calibrated" => "章节日期 + 网络时段校准".into(),
+        "stale" => "保留上次校准值".into(),
+        "estimated" => "估算".into(),
+        "unavailable" => "时间不可用".into(),
+        value => value.to_string(),
+    }
+}
+
 fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     value
         .map(|value| {
@@ -3326,6 +3392,9 @@ mod tests {
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
                     episode_mapping: None,
+                    schedule_source: "unext".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
                 }),
             })
             .await

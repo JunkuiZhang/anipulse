@@ -65,6 +65,12 @@ pub struct AnimeDraftResolution {
     pub bangumi_subject_id: Option<i64>,
     pub broadcast_pattern: Option<String>,
     #[serde(default)]
+    pub schedule_source: Option<String>,
+    #[serde(default)]
+    pub schedule_confidence: Option<String>,
+    #[serde(default)]
+    pub schedule_warning: Option<String>,
+    #[serde(default)]
     pub episode_mapping: Option<EpisodeNumberMapping>,
     pub warning: Option<String>,
 }
@@ -85,6 +91,11 @@ impl AnimeDraftResolution {
                 |(bangumi_subject_id, broadcast_pattern)| AutoScheduleMetadata {
                     bangumi_subject_id,
                     broadcast_pattern,
+                    schedule_source: self.schedule_source.unwrap_or_else(|| "unknown".into()),
+                    schedule_confidence: self
+                        .schedule_confidence
+                        .unwrap_or_else(|| "estimated".into()),
+                    schedule_warning: self.schedule_warning,
                     next_sync_at: Utc::now() + chrono::Duration::seconds(sync_interval_secs as i64),
                     episode_mapping: self.episode_mapping,
                 },
@@ -494,6 +505,9 @@ impl ApplicationService {
                 duration_max_sec: request.duration_max_sec,
                 bangumi_subject_id: None,
                 broadcast_pattern: None,
+                schedule_source: None,
+                schedule_confidence: None,
+                schedule_warning: None,
                 episode_mapping: None,
                 warning: None,
             };
@@ -548,27 +562,35 @@ impl ApplicationService {
         let matched = std::iter::once(&resolved.matched_title)
             .chain(resolved.aliases.iter())
             .any(|value| normalize_title(value) == input);
-        let warning = (!matched).then(|| {
+        let title_warning = (!matched).then(|| {
             format!(
                 "输入标题与 Bangumi #{} 的标题差异较大，请确认没有选错季度或作品。",
                 resolved.bangumi_subject_id
             )
         });
+        let warning = [title_warning, resolved.schedule_warning.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
         let resolution = AnimeDraftResolution {
             title: request.title,
             matched_title: Some(resolved.matched_title),
             aliases: resolved.aliases,
             next_episode: request.next_episode,
-            expected_at: Some(resolved.expected_at),
-            expected_weekday: Some(resolved.expected_weekday),
-            expected_time: Some(resolved.expected_time),
+            expected_at: resolved.expected_at,
+            expected_weekday: resolved.expected_weekday,
+            expected_time: resolved.expected_time,
             timezone: resolved.timezone,
             duration_min_sec: request.duration_min_sec,
             duration_max_sec: request.duration_max_sec,
             bangumi_subject_id: Some(resolved.bangumi_subject_id),
             broadcast_pattern: Some(resolved.broadcast_pattern),
+            schedule_source: Some(resolved.schedule_source),
+            schedule_confidence: Some(resolved.schedule_confidence),
+            schedule_warning: resolved.schedule_warning,
             episode_mapping: request.episode_mapping,
-            warning,
+            warning: (!warning.is_empty()).then_some(warning),
         };
         let json = serde_json::to_string(&resolution)
             .map_err(|_| AppError::InvalidInput("cannot encode anime draft result".into()))?;

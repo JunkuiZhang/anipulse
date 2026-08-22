@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration as StdDuration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration as StdDuration,
+};
 
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, TimeZone, Utc};
 use chrono_tz::{Asia::Tokyo, Tz};
@@ -33,11 +36,15 @@ pub struct ResolvedSchedule {
     pub bangumi_subject_id: i64,
     pub matched_title: String,
     pub aliases: Vec<String>,
-    pub expected_at: DateTime<Utc>,
-    pub expected_weekday: i64,
-    pub expected_time: String,
+    pub expected_at: Option<DateTime<Utc>>,
+    pub expected_weekday: Option<i64>,
+    pub expected_time: Option<String>,
     pub timezone: String,
     pub broadcast_pattern: String,
+    pub schedule_source: String,
+    pub schedule_confidence: String,
+    pub schedule_warning: Option<String>,
+    source_health_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +104,19 @@ struct BangumiEpisode {
 struct Recurrence {
     anchor: DateTime<Utc>,
     period: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastSourceKind {
+    Stream,
+    Catalog,
+}
+
+struct ExpectedSchedule {
+    expected_at: Option<DateTime<Utc>>,
+    confidence: &'static str,
+    warning: Option<String>,
+    health_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -246,43 +266,88 @@ impl ScheduleProvider {
                 item.title
             ))
         })?;
-        let selected = select_broadcast(item, &self.config.preferred_site)?;
+        let selected = select_broadcast(item, &self.config)?;
         let recurrence = parse_recurrence(&selected.pattern)?;
         let (subject_episode_index, bangumi_episode_no) = episode_target
             .mapping
             .map(|mapping| mapping.mapped_numbers(next_episode))
             .transpose()?
             .unwrap_or((next_episode, next_episode));
-        let airdate = if selected.use_episode_airdate {
+        let bangumi_origin_episode = episode_target
+            .mapping
+            .map(|mapping| mapping.bangumi_origin)
+            .unwrap_or(1);
+        let mut source_health_error = None;
+        let target_airdate = match self
+            .episode_airdate(
+                bangumi_subject_id,
+                subject_episode_index,
+                bangumi_episode_no,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(bangumi_subject_id, next_episode, bangumi_episode_no, %error, "Bangumi episode date unavailable; using a lower-confidence schedule");
+                source_health_error = Some(error.to_string());
+                None
+            }
+        };
+        let origin_airdate = if subject_episode_index == 1 {
+            target_airdate
+        } else if target_airdate.is_some() {
             match self
-                .episode_airdate(
-                    bangumi_subject_id,
-                    subject_episode_index,
-                    bangumi_episode_no,
-                )
+                .episode_airdate(bangumi_subject_id, 1, bangumi_origin_episode)
                 .await
             {
                 Ok(value) => value,
                 Err(error) => {
-                    warn!(bangumi_subject_id, next_episode, bangumi_episode_no, %error, "Bangumi episode date unavailable; using broadcast recurrence");
+                    warn!(bangumi_subject_id, bangumi_origin_episode, %error, "Bangumi season origin date unavailable; using a lower-confidence schedule");
+                    source_health_error = Some(error.to_string());
                     None
                 }
             }
         } else {
             None
         };
-        let expected_at = expected_at(recurrence, subject_episode_index, airdate, now)?;
-        let local = expected_at.with_timezone(&timezone);
+        let expected = expected_at(
+            recurrence,
+            subject_episode_index,
+            target_airdate,
+            origin_airdate,
+            selected.kind,
+            match selected.kind {
+                BroadcastSourceKind::Stream => self.config.max_stream_offset_days,
+                BroadcastSourceKind::Catalog => self.config.max_catalog_offset_days,
+            },
+            now,
+        )?;
+        let local = expected
+            .expected_at
+            .map(|expected_at| expected_at.with_timezone(&timezone));
+        let schedule_warning = merge_warnings(
+            expected.warning,
+            source_health_error
+                .as_ref()
+                .map(|error| format!("Bangumi 章节日期请求失败：{error}")),
+        );
+        let source_health_error = expected.health_error.or(source_health_error);
 
         Ok(ResolvedSchedule {
             bangumi_subject_id,
             matched_title: item.title.clone(),
             aliases: item_aliases(item),
-            expected_at,
-            expected_weekday: i64::from(local.weekday().num_days_from_monday()),
-            expected_time: local.format("%H:%M").to_string(),
+            expected_at: expected.expected_at,
+            expected_weekday: local
+                .as_ref()
+                .map(|value| i64::from(value.weekday().num_days_from_monday())),
+            expected_time: local.map(|value| value.format("%H:%M").to_string()),
             timezone: timezone.name().to_string(),
             broadcast_pattern: selected.pattern,
+            schedule_source: selected.source,
+            schedule_confidence: expected.confidence.into(),
+            schedule_warning,
+            source_health_error,
         })
     }
 
@@ -457,8 +522,39 @@ impl ScheduleSynchronizer {
                 )
                 .await?
         };
-        let update = resolved
+        let mut update = resolved
             .to_update(Utc::now() + Duration::seconds(self.config.sync_interval_secs as i64));
+        if resolved.source_health_error.is_some()
+            && resolved.schedule_confidence == "estimated"
+            && anime.anime.schedule_confidence.as_deref() == Some("calibrated")
+            && episode.expected_at.is_some()
+        {
+            update.expected_at = episode.expected_at;
+            update.expected_weekday = anime.anime.expected_weekday;
+            update.expected_time.clone_from(&anime.anime.expected_time);
+            if let Some(source) = &anime.anime.schedule_source {
+                update.schedule_source.clone_from(source);
+            }
+            update.schedule_confidence = "stale".into();
+            update.schedule_warning = Some(format!(
+                "Bangumi 章节日期暂时不可用，已保留上次校准时间。{}",
+                resolved.schedule_warning.as_deref().unwrap_or_default()
+            ));
+        }
+        let schedule_health_source = format!("bangumi-schedule:{}", resolved.bangumi_subject_id);
+        if let Some(error) = &resolved.source_health_error {
+            self.repository
+                .record_source_failure(
+                    &schedule_health_source,
+                    error,
+                    SOURCE_ALERT_FAILURE_THRESHOLD,
+                )
+                .await?;
+        } else {
+            self.repository
+                .record_source_success(&schedule_health_source)
+                .await?;
+        }
         self.repository
             .apply_schedule_update(anime_id, &update)
             .await?;
@@ -467,7 +563,9 @@ impl ScheduleSynchronizer {
             bangumi_subject_id = resolved.bangumi_subject_id,
             episode = episode.episode_no,
             bangumi_episode = episode_mapping.and_then(|mapping| mapping.mapped_numbers(episode.episode_no).ok().map(|(_, number)| number)),
-            expected_at = %resolved.expected_at,
+            expected_at = ?update.expected_at,
+            schedule_source = %update.schedule_source,
+            schedule_confidence = %update.schedule_confidence,
             "automatic schedule refreshed"
         );
         Ok(())
@@ -494,6 +592,9 @@ impl ResolvedSchedule {
             expected_time: self.expected_time.clone(),
             timezone: self.timezone.clone(),
             broadcast_pattern: self.broadcast_pattern.clone(),
+            schedule_source: self.schedule_source.clone(),
+            schedule_confidence: self.schedule_confidence.clone(),
+            schedule_warning: self.schedule_warning.clone(),
             next_sync_at,
         }
     }
@@ -501,7 +602,8 @@ impl ResolvedSchedule {
 
 struct SelectedBroadcast {
     pattern: String,
-    use_episode_airdate: bool,
+    source: String,
+    kind: BroadcastSourceKind,
 }
 
 fn match_item<'a>(
@@ -583,42 +685,44 @@ fn item_aliases(item: &BangumiDataItem) -> Vec<String> {
     aliases
 }
 
-fn select_broadcast(item: &BangumiDataItem, preferred_site: &str) -> Result<SelectedBroadcast> {
+fn select_broadcast(item: &BangumiDataItem, config: &ScheduleConfig) -> Result<SelectedBroadcast> {
     let item_pattern = item
         .broadcast
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| fallback_weekly_pattern(&item.begin));
-    if let Some(site) = item.sites.iter().find(|site| {
-        site.site == preferred_site
-            && (site
-                .broadcast
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || site
-                    .begin
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()))
-    }) {
+    let mut seen = HashSet::new();
+    for preferred_site in std::iter::once(config.preferred_site.as_str())
+        .chain(config.stream_site_priority.iter().map(String::as_str))
+        .filter(|site| seen.insert((*site).to_string()))
+    {
+        let Some(site) = item.sites.iter().find(|site| site.site == preferred_site) else {
+            continue;
+        };
         let pattern = site
             .broadcast
             .clone()
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| {
                 site.begin
                     .as_deref()
+                    .filter(|value| !value.trim().is_empty())
                     .and_then(|begin| site_pattern_from_item(begin, item_pattern.as_deref()))
-            })
-            .ok_or_else(|| AppError::Schedule("preferred site has no usable schedule".into()))?;
-        return Ok(SelectedBroadcast {
-            pattern,
-            use_episode_airdate: true,
-        });
+            });
+        if let Some(pattern) = pattern {
+            return Ok(SelectedBroadcast {
+                pattern,
+                source: site.site.clone(),
+                kind: BroadcastSourceKind::Stream,
+            });
+        }
     }
     item_pattern
         .map(|pattern| SelectedBroadcast {
             pattern,
-            use_episode_airdate: true,
+            source: "bangumi-data".into(),
+            kind: BroadcastSourceKind::Catalog,
         })
         .ok_or_else(|| AppError::Schedule(format!("'{}' has no broadcast time", item.title)))
 }
@@ -669,10 +773,12 @@ fn parse_recurrence(pattern: &str) -> Result<Recurrence> {
 fn expected_at(
     recurrence: Recurrence,
     episode_no: i64,
-    airdate: Option<NaiveDate>,
+    target_airdate: Option<NaiveDate>,
+    origin_airdate: Option<NaiveDate>,
+    source_kind: BroadcastSourceKind,
+    maximum_offset_days: i64,
     now: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
-    let has_exact_airdate = airdate.is_some();
+) -> Result<ExpectedSchedule> {
     let steps = episode_no - 1;
     let period_seconds = recurrence.period.num_seconds();
     let projected =
@@ -680,19 +786,53 @@ fn expected_at(
             + Duration::seconds(period_seconds.checked_mul(steps).ok_or_else(|| {
                 AppError::Schedule("episode schedule calculation overflowed".into())
             })?);
-    let mut expected = if let Some(airdate) = airdate {
-        let tokyo_time = projected.with_timezone(&Tokyo).time();
-        let local = airdate.and_time(tokyo_time);
-        match Tokyo.from_local_datetime(&local) {
+    if let (Some(target_airdate), Some(origin_airdate)) = (target_airdate, origin_airdate) {
+        let source_anchor = recurrence.anchor.with_timezone(&Tokyo);
+        let source_day_offset = (source_anchor.date_naive() - origin_airdate).num_days();
+        if source_day_offset.abs() > maximum_offset_days {
+            let warning = format!(
+                "排期来源与 Bangumi 首集日期相差 {source_day_offset} 天，超过 {maximum_offset_days} 天安全阈值；已隐藏预计时间并继续检查 B 站。"
+            );
+            return Ok(ExpectedSchedule {
+                expected_at: None,
+                confidence: "unavailable",
+                warning: Some(warning.clone()),
+                health_error: Some(warning),
+            });
+        }
+        let expected_date = target_airdate
+            .checked_add_signed(Duration::days(source_day_offset))
+            .ok_or_else(|| AppError::Schedule("episode date calculation overflowed".into()))?;
+        let local = expected_date.and_time(source_anchor.time());
+        let expected_at = match Tokyo.from_local_datetime(&local) {
             LocalResult::Single(value) => value.with_timezone(&Utc),
             LocalResult::Ambiguous(first, _) => first.with_timezone(&Utc),
-            LocalResult::None => projected,
-        }
-    } else {
-        projected
-    };
+            LocalResult::None => {
+                return Err(AppError::Schedule(
+                    "episode time does not exist in Asia/Tokyo".into(),
+                ));
+            }
+        };
+        let (confidence, warning) = match source_kind {
+            BroadcastSourceKind::Stream => ("calibrated", None),
+            BroadcastSourceKind::Catalog => (
+                "estimated",
+                Some(
+                    "未找到受信网络平台排期，暂用 bangumi-data 默认播出时段；它可能不是网络最早更新时间。"
+                        .into(),
+                ),
+            ),
+        };
+        return Ok(ExpectedSchedule {
+            expected_at: Some(expected_at),
+            confidence,
+            warning,
+            health_error: None,
+        });
+    }
 
-    if !has_exact_airdate && expected < now - Duration::days(14) {
+    let mut expected = projected;
+    if expected < now - Duration::days(14) {
         let threshold = now - Duration::hours(6);
         if recurrence.anchor < threshold {
             let elapsed = (threshold - recurrence.anchor).num_seconds();
@@ -705,7 +845,24 @@ fn expected_at(
             expected = recurrence.anchor;
         }
     }
-    Ok(expected)
+    Ok(ExpectedSchedule {
+        expected_at: Some(expected),
+        confidence: "estimated",
+        warning: Some(
+            "Bangumi 缺少目标集或本季首集日期，当前时间仅按周播周期递推；连播、停播或先行配信可能导致偏差。"
+                .into(),
+        ),
+        health_error: None,
+    })
+}
+
+fn merge_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) if first != second => Some(format!("{first} {second}")),
+        (Some(first), _) => Some(first),
+        (_, Some(second)) => Some(second),
+        (None, None) => None,
+    }
 }
 
 fn safe_request_error(error: reqwest::Error, context: &str) -> AppError {
@@ -721,12 +878,14 @@ fn safe_request_error(error: reqwest::Error, context: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
     use super::*;
+    use crate::domain::{AutoScheduleMetadata, NewAnime};
 
     #[tokio::test]
     async fn resolves_aliases_and_episode_airdate() {
@@ -744,12 +903,14 @@ mod tests {
         assert_eq!(resolved.matched_title, "サイレント・ウィッチ");
         assert!(resolved.aliases.iter().any(|alias| alias == "Silent Witch"));
         assert_eq!(
-            resolved.expected_at.to_rfc3339(),
-            "2026-08-21T15:00:00+00:00"
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-08-22T15:00:00+00:00"
         );
-        assert_eq!(resolved.expected_weekday, 4);
-        assert_eq!(resolved.expected_time, "23:00");
-        assert_eq!(requests.await.unwrap(), 2);
+        assert_eq!(resolved.expected_weekday, Some(5));
+        assert_eq!(resolved.expected_time.as_deref(), Some("23:00"));
+        assert_eq!(resolved.schedule_source, "unext");
+        assert_eq!(resolved.schedule_confidence, "calibrated");
+        assert_eq!(requests.await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -763,6 +924,75 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("--bangumi-id"));
         assert_eq!(requests.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_preserves_last_calibrated_time_during_episode_api_outage() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("schedule-outage.db");
+        let repository = Repository::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let previous = DateTime::parse_from_rfc3339("2026-08-22T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "沉默魔女".into(),
+                aliases: vec![],
+                next_episode: 8,
+                expected_at: Some(previous),
+                expected_weekday: Some(5),
+                expected_time: Some("23:00".into()),
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_800,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 501_000,
+                    broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
+                    schedule_source: "unext".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        let (base_url, requests) = degraded_mock_server().await;
+        let config = ScheduleConfig {
+            bangumi_data_url: format!("{base_url}/data.json"),
+            bangumi_api_base_url: base_url,
+            preferred_site: "bilibili".into(),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        };
+
+        ScheduleSynchronizer::new(repository.clone(), config)
+            .unwrap()
+            .sync_now(anime_id)
+            .await
+            .unwrap();
+
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        assert_eq!(anime.anime.schedule_confidence.as_deref(), Some("stale"));
+        assert_eq!(anime.anime.schedule_source.as_deref(), Some("unext"));
+        assert!(
+            anime
+                .anime
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("已保留上次校准时间"))
+        );
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .expected_at,
+            Some(previous)
+        );
+        assert_eq!(requests.await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -800,12 +1030,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            resolved.expected_at.to_rfc3339(),
+            resolved.expected_at.unwrap().to_rfc3339(),
             "2026-08-26T13:00:00+00:00"
         );
-        assert_eq!(resolved.expected_weekday, 2);
-        assert_eq!(resolved.expected_time, "21:00");
-        assert_eq!(requests.await.unwrap(), 2);
+        assert_eq!(resolved.expected_weekday, Some(2));
+        assert_eq!(resolved.expected_time.as_deref(), Some("21:00"));
+        assert_eq!(resolved.schedule_source, "unext");
+        assert_eq!(resolved.schedule_confidence, "calibrated");
+        assert_eq!(requests.await.unwrap(), 3);
     }
 
     #[test]
@@ -819,13 +1051,106 @@ mod tests {
     fn exact_historical_airdate_is_not_rolled_forward() {
         let recurrence = parse_recurrence("R/2025-07-04T10:03:00.000Z/P7D").unwrap();
         let airdate = NaiveDate::from_ymd_opt(2025, 8, 22).unwrap();
+        let origin = NaiveDate::from_ymd_opt(2025, 7, 4).unwrap();
         let now = DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
 
-        let expected = expected_at(recurrence, 8, Some(airdate), now).unwrap();
+        let expected = expected_at(
+            recurrence,
+            8,
+            Some(airdate),
+            Some(origin),
+            BroadcastSourceKind::Stream,
+            14,
+            now,
+        )
+        .unwrap();
 
-        assert_eq!(expected.to_rfc3339(), "2025-08-22T10:03:00+00:00");
+        assert_eq!(
+            expected.expected_at.unwrap().to_rfc3339(),
+            "2025-08-22T10:03:00+00:00"
+        );
+    }
+
+    #[test]
+    fn network_midnight_is_applied_to_the_episode_airdate() {
+        let recurrence = parse_recurrence("R/2026-07-04T15:00:00.000Z/P7D").unwrap();
+        let target = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let origin = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let expected = expected_at(
+            recurrence,
+            9,
+            Some(target),
+            Some(origin),
+            BroadcastSourceKind::Stream,
+            14,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            expected.expected_at.unwrap().to_rfc3339(),
+            "2026-08-22T15:00:00+00:00"
+        );
+        assert_eq!(expected.confidence, "calibrated");
+        assert!(expected.warning.is_none());
+    }
+
+    #[test]
+    fn earlier_network_window_preserves_the_source_date_offset() {
+        let recurrence = parse_recurrence("R/2026-06-25T15:00:00.000Z/P7D").unwrap();
+        let target = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let origin = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let expected = expected_at(
+            recurrence,
+            9,
+            Some(target),
+            Some(origin),
+            BroadcastSourceKind::Stream,
+            14,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            expected.expected_at.unwrap().to_rfc3339(),
+            "2026-08-20T15:00:00+00:00"
+        );
+        assert_eq!(expected.confidence, "calibrated");
+    }
+
+    #[test]
+    fn conflicting_catalog_schedule_is_hidden_instead_of_fabricated() {
+        let recurrence = parse_recurrence("R/2026-07-08T20:30:00.000Z/P7D").unwrap();
+        let target = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let origin = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let expected = expected_at(
+            recurrence,
+            9,
+            Some(target),
+            Some(origin),
+            BroadcastSourceKind::Catalog,
+            1,
+            now,
+        )
+        .unwrap();
+
+        assert!(expected.expected_at.is_none());
+        assert_eq!(expected.confidence, "unavailable");
+        assert!(expected.health_error.is_some());
     }
 
     fn provider(base_url: &str) -> ScheduleProvider {
@@ -842,7 +1167,7 @@ mod tests {
     async fn mock_server(ambiguous: bool) -> (String, tokio::task::JoinHandle<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let expected_requests = if ambiguous { 1 } else { 2 };
+        let expected_requests = if ambiguous { 1 } else { 3 };
         let task = tokio::spawn(async move {
             for index in 0..expected_requests {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -850,11 +1175,16 @@ mod tests {
                 let headers = String::from_utf8_lossy(request_headers(&request));
                 let response_body: String = if index == 0 {
                     dataset(ambiguous)
-                } else {
+                } else if index == 1 {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=501000"));
                     assert!(headers.contains("offset=7"));
                     r#"{"data":[{"airdate":"2026-08-22","sort":8,"ep":8}]}"#.into()
+                } else {
+                    assert!(headers.contains("/v0/episodes?"));
+                    assert!(headers.contains("subject_id=501000"));
+                    assert!(headers.contains("offset=0"));
+                    r#"{"data":[{"airdate":"2026-07-04","sort":1,"ep":1}]}"#.into()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -872,7 +1202,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            for index in 0..2 {
+            for index in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let headers = String::from_utf8_lossy(request_headers(&request));
@@ -883,17 +1213,55 @@ mod tests {
                         "type":"tv",
                         "begin":"2026-08-12T13:00:00.000Z",
                         "broadcast":"R/2026-08-12T13:00:00.000Z/P7D",
-                        "sites":[{"site":"bangumi","id":"633836"}]
+                        "sites":[
+                            {"site":"bangumi","id":"633836"},
+                            {"site":"unext","begin":"2026-08-12T13:00:00.000Z"}
+                        ]
                     }]}"#
                         .into()
-                } else {
+                } else if index == 1 {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=633836"));
                     assert!(headers.contains("offset=2"));
                     r#"{"data":[{"airdate":"2026-08-26","sort":80,"ep":80}]}"#.into()
+                } else {
+                    assert!(headers.contains("/v0/episodes?"));
+                    assert!(headers.contains("subject_id=633836"));
+                    assert!(headers.contains("offset=0"));
+                    r#"{"data":[{"airdate":"2026-08-12","sort":78,"ep":78}]}"#.into()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            3
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn degraded_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let (status, response_body) = if index == 0 {
+                    ("200 OK", dataset(false))
+                } else {
+                    assert!(headers.contains("/v0/episodes?"));
+                    assert!(headers.contains("subject_id=501000"));
+                    (
+                        "504 Gateway Timeout",
+                        r#"{"error":"upstream timeout"}"#.into(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 );
@@ -924,7 +1292,10 @@ mod tests {
                 "type":"tv",
                 "begin":"2026-07-03T15:00:00.000Z",
                 "broadcast":"R/2026-07-03T15:00:00.000Z/P7D",
-                "sites":[{{"site":"bangumi","id":"501000"}}]
+                "sites":[
+                    {{"site":"bangumi","id":"501000"}},
+                    {{"site":"unext","begin":"2026-07-04T15:00:00.000Z"}}
+                ]
             }}{duplicate}]}}"#
         )
     }

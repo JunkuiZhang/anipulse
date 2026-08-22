@@ -197,6 +197,8 @@ RUST_LOG=info
 
 Bilibili Web API 不是本项目可控制的稳定接口。所有 endpoint、WBI 签名、响应字段和错误码映射集中在 `src/provider/bilibili.rs`；如果接口变化，应只修改 Provider。Provider 优先读取公开聚合搜索中的 video 分组，在响应不可用时才尝试 WBI 搜索；`code=0` 但只含 `v_voucher` 会被识别为软风控，不再误报成“0 条结果”。遇到 HTTP 429、HTTP/Bilibili 412、软风控或异常响应时，AniPulse 不会高频重试。
 
-自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知；同步失败时保留已有排期并退避重试。`bangumi-data` 连续两次读取失败时，AniPulse 会通过当前通知通道发送一次数据源异常告警；同一轮故障不会重复打扰，恢复后会再发送一次恢复通知。Bangumi 章节 API 超时但周播递推仍可用时不算数据源故障。
+自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。AniPulse 把 Bangumi 单集日期当作日期锚点，并优先用 `bangumi-data` 中可信网络平台的时段校准跨日、网络先行和电视/网络时间差；服务器不会直接访问这些平台的网站。无法安全对齐时会隐藏预计时间而不是拼出一个错误的精确值，Bilibili 检查仍继续。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知。
+
+`bangumi-data` 或同一条目的章节日期连续两次异常时，AniPulse 会通过当前通知通道发送一次数据源告警；同一轮故障不会重复打扰，恢复后会再发送一次恢复通知。详情页和 `anime show` 会显示排期来源、校准状态和降级原因。配置含义、升级步骤与冲突处理见 [`doc/deployment.md`](doc/deployment.md)。
 
 国内服务器无法稳定直连这些元数据服务时，可以部署项目自带的专用 [Cloudflare Worker 转发服务](doc/cloudflare-worker.md)。它只开放 AniPulse 所需的固定只读路由、限制服务器出口 IP、在 Worker 内跟随封面重定向并分层缓存，不会成为开放代理。

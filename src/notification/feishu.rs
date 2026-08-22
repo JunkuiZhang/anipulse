@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use url::Url;
 
-use super::Notifier;
+use super::{Notifier, source_alert_label};
 use crate::{
     domain::{PendingNotification, PendingReviewNotification},
     error::{AppError, Result},
@@ -283,6 +283,7 @@ pub(super) fn review_card(event: &PendingReviewNotification) -> Value {
 }
 
 pub(super) fn source_alert_card(event: &PendingSourceAlert) -> Value {
+    let source = source_alert_label(&event.source);
     let (template, title, content, note) = match event.alert_state.as_str() {
         "failure_pending" => {
             let failed_at = event
@@ -298,12 +299,12 @@ pub(super) fn source_alert_card(event: &PendingSourceAlert) -> Value {
                 "⚠️ AniPulse 数据源异常",
                 format!(
                     "**数据源：** {}\n**连续失败：** {} 次\n**首次失败：** {}\n**最近错误：** {}",
-                    escape_lark_markdown(&event.source),
+                    escape_lark_markdown(&source),
                     event.consecutive_failures,
                     failed_at,
                     error
                 ),
-                "现有排期和 B 站检查会继续运行，但自动排期暂不刷新。",
+                "B 站检查会继续运行；预计时间会保留、降级或隐藏，直到数据恢复。",
             )
         }
         "recovery_pending" => (
@@ -311,15 +312,15 @@ pub(super) fn source_alert_card(event: &PendingSourceAlert) -> Value {
             "✅ AniPulse 数据源已恢复",
             format!(
                 "**数据源：** {}\n**恢复时间：** {}",
-                escape_lark_markdown(&event.source),
+                escape_lark_markdown(&source),
                 event.last_checked_at.to_rfc3339()
             ),
-            "自动排期刷新已恢复正常。",
+            "自动排期校准已恢复正常。",
         ),
         _ => (
             "grey",
             "AniPulse 数据源状态",
-            format!("**数据源：** {}", escape_lark_markdown(&event.source)),
+            format!("**数据源：** {}", escape_lark_markdown(&source)),
             "收到了一条无法识别的数据源状态。",
         ),
     };

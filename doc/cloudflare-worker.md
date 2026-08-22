@@ -2,6 +2,8 @@
 
 这个方案不替换 AniPulse 的排期来源：排期仍然来自 `bangumi-data`，章节日期和封面仍然来自 Bangumi。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
+新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 U-NEXT、d Anime、ABEMA 或动画疯等网络时段。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
+
 ```text
 阿里云 AniPulse
   └── https://bgm-proxy.example.com
@@ -184,6 +186,13 @@ curl -fsS \
   'https://bgm-proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=1&offset=8'
 ```
 
+排期校准会分别读取目标集和本季起始集，因此也要确认 `offset=0` 可用。Worker 允许的是经过校验的任意非负 `offset`，不是只放行某一个集数：
+
+```bash
+curl -fsS \
+  'https://bgm-proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=1&offset=0'
+```
+
 检查封面。Worker 必须直接返回 `image/*`，而不是将客户端重定向到 `lain.bgm.tv`：
 
 ```bash
@@ -210,6 +219,10 @@ sudo cp -a /etc/anipulse/config.toml /etc/anipulse/config.toml.before-worker
 [schedule]
 bangumi_data_url = "https://bgm-proxy.example.com/data.json"
 bangumi_api_base_url = "https://bgm-proxy.example.com/bangumi"
+preferred_site = "bilibili"
+stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+max_stream_offset_days = 14
+max_catalog_offset_days = 1
 ```
 
 `bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加 `/v0/episodes` 和封面路径。
@@ -250,6 +263,21 @@ Worker 使用以下边缘缓存时间：
 封面下载到 AniPulse 服务器后，还有现有的 7 天服务器缓存和浏览器条件缓存。删除番剧时，AniPulse 会按现有清理逻辑删除不再被数据库引用的本地封面；Cloudflare 上的匿名公共封面缓存会在 TTL 到期后自然淘汰。
 
 需要立即绕过旧 Worker 缓存时，在 Worker 的 Variables and Secrets 中添加或修改普通变量 `CACHE_VERSION`，例如从 `v1` 改为 `v2`。新版本会使用新的 cache key，不需要修改 AniPulse URL。
+
+### 更新 Worker
+
+本次“电视/网络排期校准”没有增加 Worker 路由：如果当前 Worker 已经来自本仓库，并且上面的 `offset=0` 与目标集请求都成功，只升级 AniPulse 二进制即可，不必重新部署 Worker。
+
+以后仓库中的 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 有更新时，可完全通过网页升级：
+
+1. 打开 Cloudflare Dashboard → **Workers & Pages** → `anipulse-bangumi-proxy`；
+2. 先在 **Settings → Variables and Secrets** 确认 `ALLOWED_CLIENT_IPS` 和 `UPSTREAM_USER_AGENT` 仍存在；不要把它们复制进源代码；
+3. 点击 **Edit code**，用仓库中 `src/index.js` 的完整内容替换旧代码；
+4. 点击 **Deploy**；域名、Secret 和现有变量会保留；
+5. 如果路由/解析逻辑改变或怀疑命中了旧缓存，把 `CACHE_VERSION` 从例如 `v1` 改成 `v2`，然后再次部署；
+6. 回到 ECS，依次验证 `/healthz`、`/data.json`、两个章节 offset 和封面，再重启 AniPulse 两个服务。
+
+更新前可把网页编辑器中的旧代码保存到本地作为回滚副本。若新版本异常，重新粘贴旧代码并 Deploy；不要在文档、Git、截图或聊天记录中暴露实际出口 IP 与 Secret。
 
 ## 9. 故障排查
 

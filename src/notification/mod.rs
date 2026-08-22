@@ -17,6 +17,13 @@ use crate::{
 use feishu::FeishuWebhookNotifier;
 use feishu_app::FeishuAppNotifier;
 
+fn source_alert_label(source: &str) -> String {
+    source
+        .strip_prefix("bangumi-schedule:")
+        .map(|subject_id| format!("Bangumi #{subject_id} 章节排期"))
+        .unwrap_or_else(|| source.to_string())
+}
+
 #[async_trait]
 trait Notifier: Send + Sync {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()>;
@@ -167,12 +174,13 @@ impl Notifier for ServerChanNotifier {
     }
 
     async fn notify_source_alert(&self, event: &PendingSourceAlert) -> Result<()> {
+        let source = source_alert_label(&event.source);
         let (title, body) = match event.alert_state.as_str() {
             "failure_pending" => (
                 "⚠️ AniPulse 数据源异常",
                 format!(
-                    "{} 已连续失败 {} 次。\n\n首次失败：{}\n\n最近错误：{}\n\n现有排期和 B 站检查会继续运行，但自动排期暂不刷新。",
-                    event.source,
+                    "{} 已连续失败 {} 次。\n\n首次失败：{}\n\n最近错误：{}\n\nB 站检查会继续运行；预计时间会保留、降级或隐藏，直到数据恢复。",
+                    source,
                     event.consecutive_failures,
                     event
                         .first_failed_at
@@ -184,8 +192,8 @@ impl Notifier for ServerChanNotifier {
             "recovery_pending" => (
                 "✅ AniPulse 数据源已恢复",
                 format!(
-                    "{} 已恢复访问，自动排期刷新恢复正常。\n\n恢复时间：{}",
-                    event.source,
+                    "{} 已恢复访问，自动排期校准恢复正常。\n\n恢复时间：{}",
+                    source,
                     event.last_checked_at.to_rfc3339()
                 ),
             ),

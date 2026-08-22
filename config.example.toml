@@ -47,7 +47,14 @@ review_grace_secs = 3600
 # 国内服务器可按 doc/cloudflare-worker.md 改成自己的 Worker 地址。
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
+# 这里只选择 bangumi-data 里的排期元数据，服务器不会访问这些平台的网站。
 preferred_site = "bilibili"
+# preferred_site 没有具体时刻时，按顺序选可信网络平台的 begin/broadcast。
+stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+# 网络先行/延后可能跨日或跨周；默认最多接受与 Bangumi 首集日期相差 14 天。
+max_stream_offset_days = 14
+# 默认目录时间不是明确网络来源，只允许很小的日期偏差，避免生成错误的精确时间。
+max_catalog_offset_days = 1
 sync_interval_secs = 86400
 failure_retry_secs = 900
 request_timeout_secs = 30

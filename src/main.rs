@@ -505,20 +505,31 @@ async fn handle_anime(
                     .map(|(_, bangumi_episode)| format!(" / Bangumi EP{bangumi_episode}"))
                     .unwrap_or_default();
                 println!(
-                    "matched Bangumi subject #{}: {}; EP{}{} expected at {}",
+                    "matched Bangumi subject #{}: {}; EP{}{} expected at {} ({}, {})",
                     resolved.bangumi_subject_id,
                     resolved.matched_title,
                     args.next_episode,
                     mapped_episode,
-                    resolved.expected_at.to_rfc3339()
+                    resolved
+                        .expected_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".into()),
+                    resolved.schedule_source,
+                    resolved.schedule_confidence,
                 );
+                if let Some(warning) = &resolved.schedule_warning {
+                    println!("schedule warning: {warning}");
+                }
                 (
-                    Some(resolved.expected_weekday),
-                    Some(resolved.expected_time.clone()),
-                    Some(resolved.expected_at),
+                    resolved.expected_weekday,
+                    resolved.expected_time.clone(),
+                    resolved.expected_at,
                     Some(AutoScheduleMetadata {
                         bangumi_subject_id: resolved.bangumi_subject_id,
                         broadcast_pattern: resolved.broadcast_pattern,
+                        schedule_source: resolved.schedule_source,
+                        schedule_confidence: resolved.schedule_confidence,
+                        schedule_warning: resolved.schedule_warning,
                         next_sync_at: Utc::now()
                             + chrono::Duration::seconds(config.schedule.sync_interval_secs as i64),
                         episode_mapping,
@@ -618,6 +629,15 @@ async fn handle_anime(
             }
             if let Some(error) = &anime.anime.schedule_sync_error {
                 println!("schedule sync error: {error}");
+            }
+            if let Some(source) = &anime.anime.schedule_source {
+                println!("schedule source: {source}");
+            }
+            if let Some(confidence) = &anime.anime.schedule_confidence {
+                println!("schedule confidence: {confidence}");
+            }
+            if let Some(warning) = &anime.anime.schedule_warning {
+                println!("schedule warning: {warning}");
             }
             println!(
                 "duration: {}-{} seconds",

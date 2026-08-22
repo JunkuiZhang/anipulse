@@ -277,6 +277,9 @@ impl Repository {
             broadcast_pattern,
             schedule_sync_at,
             next_sync_at,
+            schedule_source,
+            schedule_confidence,
+            schedule_warning,
             local_episode_origin,
             bangumi_episode_origin,
         ) = new
@@ -290,19 +293,23 @@ impl Repository {
                     Some(metadata.broadcast_pattern.as_str()),
                     Some(now),
                     Some(metadata.next_sync_at),
+                    Some(metadata.schedule_source.as_str()),
+                    Some(metadata.schedule_confidence.as_str()),
+                    metadata.schedule_warning.as_deref(),
                     mapping.map(|value| value.local_origin),
                     mapping.map(|value| value.bangumi_origin),
                 )
             })
-            .unwrap_or((None, false, None, None, None, None, None));
+            .unwrap_or((None, false, None, None, None, None, None, None, None, None));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
                 title, bangumi_subject_id, expected_weekday, expected_time, timezone,
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
                 auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
+                schedule_source, schedule_confidence, schedule_warning,
                 local_episode_origin, bangumi_episode_origin
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
@@ -317,6 +324,9 @@ impl Repository {
         .bind(broadcast_pattern)
         .bind(schedule_sync_at)
         .bind(next_sync_at)
+        .bind(schedule_source)
+        .bind(schedule_confidence)
+        .bind(schedule_warning)
         .bind(local_episode_origin)
         .bind(bangumi_episode_origin)
         .execute(&mut *tx)
@@ -1324,6 +1334,7 @@ impl Repository {
             r#"UPDATE anime SET
                 bangumi_subject_id = ?, expected_weekday = ?, expected_time = ?, timezone = ?,
                 broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
+                schedule_source = ?, schedule_confidence = ?, schedule_warning = ?,
                 schedule_sync_error = NULL, updated_at = ?
                WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
         )
@@ -1334,6 +1345,9 @@ impl Repository {
         .bind(&update.broadcast_pattern)
         .bind(now)
         .bind(update.next_sync_at)
+        .bind(&update.schedule_source)
+        .bind(&update.schedule_confidence)
+        .bind(update.schedule_warning.as_deref())
         .bind(now)
         .bind(anime_id)
         .execute(&mut *tx)
@@ -3640,6 +3654,9 @@ mod tests {
                     broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
                     episode_mapping: None,
+                    schedule_source: "unext".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
                 }),
             })
             .await
@@ -3993,6 +4010,9 @@ mod tests {
                         local_origin: 8,
                         bangumi_origin: 80,
                     }),
+                    schedule_source: "unext".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
                 }),
             })
             .await
@@ -4004,11 +4024,14 @@ mod tests {
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
                     aliases: vec!["沉默魔女".into(), "サイレント・ウィッチ".into()],
-                    expected_at: updated_expected,
-                    expected_weekday: 5,
-                    expected_time: "00:00".into(),
+                    expected_at: Some(updated_expected),
+                    expected_weekday: Some(5),
+                    expected_time: Some("00:00".into()),
                     timezone: "Asia/Shanghai".into(),
                     broadcast_pattern: "R/2025-07-05T16:00:00Z/P7D".into(),
+                    schedule_source: "abema".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
                     next_sync_at: Utc::now() + chrono::Duration::days(1),
                 },
             )
@@ -4020,9 +4043,51 @@ mod tests {
         assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
         assert_eq!(anime.anime.local_episode_origin, Some(8));
         assert_eq!(anime.anime.bangumi_episode_origin, Some(80));
+        assert_eq!(anime.anime.schedule_source.as_deref(), Some("abema"));
+        assert_eq!(
+            anime.anime.schedule_confidence.as_deref(),
+            Some("calibrated")
+        );
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));
+
+        repository
+            .apply_schedule_update(
+                anime_id,
+                &ScheduleUpdate {
+                    bangumi_subject_id: 506_677,
+                    aliases: vec![],
+                    expected_at: None,
+                    expected_weekday: None,
+                    expected_time: None,
+                    timezone: "Asia/Shanghai".into(),
+                    broadcast_pattern: "R/2025-07-05T16:00:00Z/P7D".into(),
+                    schedule_source: "bangumi-data".into(),
+                    schedule_confidence: "unavailable".into(),
+                    schedule_warning: Some("source conflict".into()),
+                    next_sync_at: Utc::now() + chrono::Duration::days(1),
+                },
+            )
+            .await
+            .unwrap();
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        assert_eq!(
+            anime.anime.schedule_confidence.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            anime.anime.schedule_warning.as_deref(),
+            Some("source conflict")
+        );
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .expected_at,
+            None
+        );
     }
 
     #[tokio::test]

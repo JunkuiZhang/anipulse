@@ -170,6 +170,9 @@ review_grace_secs = 3600
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
 preferred_site = "bilibili"
+stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+max_stream_offset_days = 14
+max_catalog_offset_days = 1
 sync_interval_secs = 86400
 failure_retry_secs = 900
 request_timeout_secs = 30
@@ -182,6 +185,10 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 安装鉴权网页后可以把 `notify_pending` 改为 `true`：无法自动确认时，飞书会发送指向登录审核页的橙色卡片。网页、Caddy、Secret、管理员和 systemd 的完整步骤见 [`web-deployment.md`](web-deployment.md)。在 `web.public_url` 尚未能通过 HTTPS 访问前保持 `false`。
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
+
+AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。程序先使用 `preferred_site`，没有具体时刻时再按 `stream_site_priority` 选取 `bangumi-data` 中的网络平台排期；这里读取的只是 JSON 元数据，阿里云服务器不会直接访问 U-NEXT、d Anime、ABEMA 或动画疯的网站。它再用 Bangumi 的本季首集日期和目标集日期校准跨日、先行配信、停播与连播：例如电视周六 23:30、网络周六 24:00，会按网络可用时间显示为上海周六 23:00。Bilibili 检查仍独立运行，视频提前出现时不会等到这个时间才允许确认。
+
+网络来源与首集日期的偏差超过 `max_stream_offset_days`，或只能使用默认目录时段且偏差超过 `max_catalog_offset_days` 时，程序会隐藏错误的“精确时间”、立即安排一次 Bilibili 检查并显示排期告警。不要为了让某个异常条目通过而随意放大阈值；先核对 Bangumi ID、季度和集数映射。
 
 ## 6. 保存飞书应用凭证
 
@@ -386,16 +393,32 @@ cargo test --locked
 cargo build --locked --release
 ```
 
-替换程序：
+同时停止调度器和网页，备份数据库与旧二进制，再替换程序。下面的 `/tmp/anipulse` 应是第 3 节验证过的 Ubuntu 本机构建或静态 musl 产物：
 
 ```bash
-sudo systemctl stop anipulse
-sudo install -m 0755 target/release/anipulse /usr/local/bin/anipulse
-sudo systemctl start anipulse
-sudo systemctl status anipulse --no-pager
+sudo systemctl stop anipulse.service anipulse-web.service
+sudo cp --preserve=mode,ownership /var/lib/anipulse/anipulse.db \
+  /var/lib/anipulse/anipulse.db.before-upgrade
+sudo cp -a /usr/local/bin/anipulse /usr/local/bin/anipulse.before-upgrade
+sudo install -m 0755 /tmp/anipulse /usr/local/bin/anipulse
+/usr/local/bin/anipulse --help >/dev/null
+
+sudo systemctl start anipulse.service
+sudo systemctl start anipulse-web.service
+sudo systemctl --no-pager --full status anipulse.service anipulse-web.service
+sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
 ```
 
-SQLite migration 会在启动时自动执行。
+SQLite migration 会在启动时自动执行。本次排期升级会保留追番、候选、历史视频和旧预计时间，并把所有仍在追的自动排期标记为“尽快重新同步”；同步成功后网页详情会显示“排期来源”和“校准状态”。旧配置即使没有 `stream_site_priority` 和两个 offset 选项也会使用安全默认值，但建议按第 5 节显式补上，方便以后调整。
+
+如需立即核对单个条目，可执行：
+
+```bash
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml anime sync ANIME_ID
+sudo -u anipulse /usr/local/bin/anipulse \
+  --config /etc/anipulse/config.toml anime show ANIME_ID
+```
 
 ## 12. 备份与恢复
 
@@ -436,14 +459,16 @@ sudo systemctl start anipulse
 - 多条同名记录：根据命令列出的候选选择正确季度，再传入 `--bangumi-id`。
 - 找不到精确标题：换用作品的正式中文名或日文原名；仍找不到时改用手工排期。
 - Bangumi 请求失败：检查服务器能否访问 `unpkg.com` 和 `api.bgm.tv`，以及 `schedule.user_agent` 是否已经修改。
+- 电视时间与网络时间不同：这是正常情况。AniPulse 默认显示可信网络平台时间，因为它更接近 Bilibili 视频可能出现的时间；详情页会标出具体来源。
+- 显示“时间不可用”：来源日期偏差越过安全阈值。程序仍会检查 Bilibili，但不会拿互相冲突的数据拼出一个假时间；先检查 Bangumi ID 和集数映射。
 
 后台同步失败不会清空现有时间；程序会保留旧排期，默认 15 分钟后重试。可用 `anime show ID` 查看最近同步时间和错误。
 
 如果国内服务器持续无法访问这些域名，可以使用项目内置的专用 [Cloudflare Worker 转发方案](cloudflare-worker.md)，无需在服务器上配置全局代理或修改 DNS。
 
-常驻服务连续两次无法读取 `bangumi-data` 时，会通过当前通知通道发送一次“数据源异常”告警。同一轮故障只告警一次；读取恢复后再发送一次“数据源已恢复”。告警期间已有排期和 Bilibili 视频检查继续工作，只是自动排期暂时不能刷新。数据库迁移会在新版本首次启动时自动创建告警状态表，无需手工执行 SQL。
+常驻服务连续两次无法读取 `bangumi-data`，或同一 Bangumi 条目的章节日期 API 连续两次失败/持续产生不安全的日期冲突时，会通过当前通知通道发送一次“数据源异常”告警。同一轮故障只告警一次；读取恢复后再发送一次“数据源已恢复”。告警期间 Bilibili 视频检查继续工作。数据库迁移会在新版本首次启动时自动创建告警状态，无需手工执行 SQL。
 
-日志中的 `Bangumi episode API timed out; using broadcast recurrence` 不会触发该告警：它表示章节日期校准不可用，但 `bangumi-data` 给出的周播递推仍然有效。只有 `bangumi-data` 目录本身连续读取失败才会告警。
+单次 `Bangumi episode API timed out` 会先降级为周期估算并在网页显示提示，不会马上打扰你；同一条目连续失败达到阈值才发送飞书告警。恢复成功后会清除错误并发送一次恢复通知。
 
 ### 通知一直是 pending
 

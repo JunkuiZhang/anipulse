@@ -71,6 +71,30 @@ impl AppConfig {
                 "schedule.sync_batch_size must be greater than zero".into(),
             ));
         }
+        if !(0..=31).contains(&self.schedule.max_stream_offset_days) {
+            return Err(AppError::Config(
+                "schedule.max_stream_offset_days must be between 0 and 31".into(),
+            ));
+        }
+        if !(0..=7).contains(&self.schedule.max_catalog_offset_days) {
+            return Err(AppError::Config(
+                "schedule.max_catalog_offset_days must be between 0 and 7".into(),
+            ));
+        }
+        for site in std::iter::once(&self.schedule.preferred_site)
+            .chain(self.schedule.stream_site_priority.iter())
+        {
+            if site.trim().is_empty()
+                || !site.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+            {
+                return Err(AppError::Config(
+                    "schedule site names must contain only ASCII letters, digits, '_' or '-'"
+                        .into(),
+                ));
+            }
+        }
         for (name, value) in [
             ("schedule.bangumi_data_url", &self.schedule.bangumi_data_url),
             (
@@ -287,6 +311,9 @@ pub struct ScheduleConfig {
     pub bangumi_data_url: String,
     pub bangumi_api_base_url: String,
     pub preferred_site: String,
+    pub stream_site_priority: Vec<String>,
+    pub max_stream_offset_days: i64,
+    pub max_catalog_offset_days: i64,
     pub sync_interval_secs: u64,
     pub failure_retry_secs: u64,
     pub request_timeout_secs: u64,
@@ -300,6 +327,15 @@ impl Default for ScheduleConfig {
             bangumi_data_url: "https://unpkg.com/bangumi-data@0.3/dist/data.json".into(),
             bangumi_api_base_url: "https://api.bgm.tv".into(),
             preferred_site: "bilibili".into(),
+            stream_site_priority: vec![
+                "unext".into(),
+                "danime".into(),
+                "abema".into(),
+                "gamer".into(),
+                "gamer_hk".into(),
+            ],
+            max_stream_offset_days: 14,
+            max_catalog_offset_days: 1,
             sync_interval_secs: 86_400,
             failure_retry_secs: 900,
             request_timeout_secs: 30,
@@ -407,5 +443,16 @@ mod tests {
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("web.timezone"));
+    }
+
+    #[test]
+    fn rejects_unsafe_schedule_alignment_policy() {
+        let mut config = AppConfig::default();
+        config.schedule.max_stream_offset_days = 32;
+        assert!(config.validate().is_err());
+
+        config.schedule.max_stream_offset_days = 14;
+        config.schedule.stream_site_priority = vec!["not/a/site".into()];
+        assert!(config.validate().is_err());
     }
 }

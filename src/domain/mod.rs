@@ -45,6 +45,9 @@ pub struct Anime {
     pub schedule_sync_at: Option<DateTime<Utc>>,
     pub schedule_next_sync_at: Option<DateTime<Utc>>,
     pub schedule_sync_error: Option<String>,
+    pub schedule_source: Option<String>,
+    pub schedule_confidence: Option<String>,
+    pub schedule_warning: Option<String>,
     pub local_episode_origin: Option<i64>,
     pub bangumi_episode_origin: Option<i64>,
     pub lifecycle: String,
@@ -78,6 +81,9 @@ pub struct NewAnime {
 pub struct AutoScheduleMetadata {
     pub bangumi_subject_id: i64,
     pub broadcast_pattern: String,
+    pub schedule_source: String,
+    pub schedule_confidence: String,
+    pub schedule_warning: Option<String>,
     pub next_sync_at: DateTime<Utc>,
     pub episode_mapping: Option<EpisodeNumberMapping>,
 }
@@ -121,11 +127,14 @@ impl EpisodeNumberMapping {
 pub struct ScheduleUpdate {
     pub bangumi_subject_id: i64,
     pub aliases: Vec<String>,
-    pub expected_at: DateTime<Utc>,
-    pub expected_weekday: i64,
-    pub expected_time: String,
+    pub expected_at: Option<DateTime<Utc>>,
+    pub expected_weekday: Option<i64>,
+    pub expected_time: Option<String>,
     pub timezone: String,
     pub broadcast_pattern: String,
+    pub schedule_source: String,
+    pub schedule_confidence: String,
+    pub schedule_warning: Option<String>,
     pub next_sync_at: DateTime<Utc>,
 }
 
