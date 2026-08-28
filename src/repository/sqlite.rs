@@ -119,6 +119,18 @@ pub struct UpcomingReleaseRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct WatchQueueRow {
+    pub episode_id: i64,
+    pub anime_id: i64,
+    pub anime_title: String,
+    pub bangumi_subject_id: Option<i64>,
+    pub episode_no: i64,
+    pub bvid: String,
+    pub video_title: String,
+    pub released_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct ManagementJob {
     pub id: i64,
     pub kind: String,
@@ -410,6 +422,65 @@ impl Repository {
         .bind(until)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn watch_queue(&self, limit: i64) -> Result<Vec<WatchQueueRow>> {
+        let limit = limit.clamp(1, 100);
+        Ok(sqlx::query_as::<_, WatchQueueRow>(
+            r#"WITH ranked_videos AS (
+                   SELECT ev.episode_id, ev.bvid, ev.title, ev.published_at,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY ev.episode_id
+                              ORDER BY ev.is_preferred DESC, ev.score DESC,
+                                       ev.updated_at DESC, ev.id ASC
+                          ) AS rank
+                   FROM episode_video ev
+                   JOIN episode e ON e.id = ev.episode_id
+                   LEFT JOIN uploader_trust ut
+                     ON ut.anime_id = e.anime_id AND ut.uploader_mid = ev.uploader_mid
+                   WHERE COALESCE(ut.manually_blocked, 0) = 0
+               )
+               SELECT e.id AS episode_id, a.id AS anime_id,
+                      a.title AS anime_title, a.bangumi_subject_id,
+                      e.episode_no, rv.bvid, rv.title AS video_title,
+                      COALESCE(rv.published_at, e.confirmed_at, e.notified_at, e.next_check_at)
+                          AS released_at
+               FROM episode e
+               JOIN anime a ON a.id = e.anime_id
+               JOIN ranked_videos rv ON rv.episode_id = e.id AND rv.rank = 1
+               WHERE e.state IN ('confirmed', 'notified')
+                 AND e.watched_at IS NULL
+                 AND a.lifecycle != 'archived'
+               ORDER BY released_at DESC, e.id DESC
+               LIMIT ?"#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn mark_episode_watched(&self, episode_id: i64) -> Result<(i64, i64)> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let (anime_id, episode_no, state) = sqlx::query_as::<_, (i64, i64, String)>(
+            "SELECT anime_id, episode_no, state FROM episode WHERE id = ?",
+        )
+        .bind(episode_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("episode {episode_id}")))?;
+        if !matches!(state.as_str(), "confirmed" | "notified") {
+            return Err(AppError::InvalidInput(
+                "only a released episode can be marked watched".into(),
+            ));
+        }
+        sqlx::query("UPDATE episode SET watched_at = COALESCE(watched_at, ?) WHERE id = ?")
+            .bind(now)
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok((anime_id, episode_no))
     }
 
     pub async fn anime_display_number(&self, anime_id: i64) -> Result<i64> {
@@ -945,11 +1016,13 @@ impl Repository {
         }
         sqlx::query(
             r#"INSERT OR IGNORE INTO episode(
-                   anime_id, episode_no, state, next_check_at, confirmed_at, notified_at
-               ) VALUES (?, ?, 'notified', ?, ?, ?)"#,
+                   anime_id, episode_no, state, next_check_at,
+                   confirmed_at, notified_at, watched_at
+               ) VALUES (?, ?, 'notified', ?, ?, ?, ?)"#,
         )
         .bind(anime_id)
         .bind(episode_no)
+        .bind(now)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -1049,7 +1122,8 @@ impl Repository {
             }
             sqlx::query(
                 r#"UPDATE episode_video SET bvid = ?, title = ?, uploader_mid = ?,
-                       uploader_name = ?, duration_sec = ?, score = ?, updated_at = ?
+                       uploader_name = ?, duration_sec = ?, score = ?,
+                       published_at = ?, updated_at = ?
                    WHERE id = ?"#,
             )
             .bind(&candidate.bvid)
@@ -1058,6 +1132,7 @@ impl Repository {
             .bind(&candidate.uploader_name)
             .bind(candidate.duration_sec)
             .bind(score)
+            .bind(candidate.published_at)
             .bind(now)
             .bind(video_id)
             .execute(&mut *tx)
@@ -1067,14 +1142,15 @@ impl Repository {
             sqlx::query(
                 r#"INSERT INTO episode_video(
                        episode_id, bvid, title, uploader_mid, uploader_name,
-                       duration_sec, score, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       duration_sec, score, published_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(episode_id, bvid) DO UPDATE SET
                        title = excluded.title,
                        uploader_mid = excluded.uploader_mid,
                        uploader_name = excluded.uploader_name,
                        duration_sec = excluded.duration_sec,
                        score = excluded.score,
+                       published_at = excluded.published_at,
                        updated_at = excluded.updated_at"#,
             )
             .bind(episode_id)
@@ -1084,6 +1160,7 @@ impl Repository {
             .bind(&candidate.uploader_name)
             .bind(candidate.duration_sec)
             .bind(score)
+            .bind(candidate.published_at)
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
@@ -1253,7 +1330,8 @@ impl Repository {
                 .rows_affected();
         sqlx::query(
             r#"UPDATE episode SET state = 'waiting', next_check_at = ?,
-                   first_candidate_at = NULL, confirmed_at = NULL, notified_at = NULL
+                   first_candidate_at = NULL, confirmed_at = NULL,
+                   notified_at = NULL, watched_at = NULL
                WHERE id = ?"#,
         )
         .bind(now)
@@ -1950,10 +2028,10 @@ impl Repository {
         sqlx::query(
             r#"INSERT INTO episode_video(
                    episode_id, bvid, title, uploader_mid, uploader_name,
-                   duration_sec, score, is_preferred, created_at, updated_at
+                   duration_sec, score, is_preferred, published_at, created_at, updated_at
                )
                SELECT episode_id, bvid, title, uploader_mid, uploader_name,
-                      duration_sec, score, 1, first_seen_at, ?
+                      duration_sec, score, 1, published_at, first_seen_at, ?
                FROM candidate WHERE id = ?
                ON CONFLICT(episode_id, bvid) DO UPDATE SET
                    title = excluded.title,
@@ -1962,6 +2040,7 @@ impl Repository {
                    duration_sec = excluded.duration_sec,
                    score = excluded.score,
                    is_preferred = 1,
+                   published_at = excluded.published_at,
                    updated_at = excluded.updated_at"#,
         )
         .bind(now)
@@ -3570,6 +3649,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_episode_stays_in_watch_queue_until_marked_watched() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (mut candidate, evaluation) = candidate();
+        candidate.published_at = Utc::now() - chrono::Duration::minutes(35);
+        repository
+            .upsert_candidate(episode.id, &candidate, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &candidate.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+
+        let queued = repository.watch_queue(50).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].episode_id, episode.id);
+        assert_eq!(queued[0].anime_id, anime_id);
+        assert_eq!(queued[0].episode_no, episode.episode_no);
+        assert_eq!(queued[0].bvid, candidate.bvid);
+        assert_eq!(queued[0].released_at, candidate.published_at);
+
+        assert_eq!(
+            repository.mark_episode_watched(episode.id).await.unwrap(),
+            (anime_id, episode.episode_no)
+        );
+        repository.mark_episode_watched(episode.id).await.unwrap();
+        assert!(repository.watch_queue(50).await.unwrap().is_empty());
+        assert!(
+            repository
+                .episode(episode.id)
+                .await
+                .unwrap()
+                .watched_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn historical_video_library_supports_ranking_preference_replacement_and_blocking() {
         let (_directory, repository, anime_id, current_episode) = fixture().await;
         assert!(
@@ -3583,6 +3700,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(historical.state, "notified");
+        assert!(historical.watched_at.is_some());
 
         let (low, _) = candidate();
         let low_id = repository

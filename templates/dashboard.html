@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}概览 · AniPulse{% endblock %}
 {% block content %}
+{% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
 <div class="page-heading">
   <div><p class="eyebrow">NEXT 7 DAYS</p><h1>未来一周</h1><p class="page-description">按预计更新时间排列，实际更新以检测结果为准。</p></div>
   <a class="primary button" href="/anime/new">添加追番</a>
@@ -22,6 +23,37 @@
 </section>
 {% else %}
 <div class="empty upcoming-empty">未来 7 天暂无已知排期。</div>
+{% endif %}
+
+<div class="section-title watch-queue-title" id="watch-queue">
+  <div><p class="eyebrow">READY TO WATCH</p><h2>等待观看</h2><p class="section-description">已经确认更新、但还没有标记为看过的剧集。</p></div>
+</div>
+{% if !watch_queue.is_empty() %}
+<section class="watch-queue" aria-label="等待观看的更新">
+{% for item in watch_queue %}
+  <article class="watch-card">
+    <a class="watch-cover anime-cover" href="/anime/{{ item.anime_id }}" aria-label="查看{{ item.title }}详情">
+      {% if item.has_cover %}<img src="{{ item.cover_url }}" alt="{{ item.title }}封面" loading="lazy">{% else %}<span aria-hidden="true">{{ item.cover_initial }}</span>{% endif %}
+    </a>
+    <div class="watch-main">
+      <div class="watch-heading">
+        <div><span class="badge success"><span class="status-dot"></span>已更新</span><h3><a href="/anime/{{ item.anime_id }}">{{ item.title }}</a> <span>{{ item.episode }}</span></h3></div>
+        <div class="watch-time"><span>更新于</span><time>{{ item.updated_at }}</time></div>
+      </div>
+      <p class="watch-video-title" title="{{ item.video_title }}">{{ item.video_title }}</p>
+      <div class="watch-actions">
+        <a class="button primary" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">观看 ↗</a>
+        <form method="post" action="/episodes/{{ item.episode_id }}/watched">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">✓ 已观看</button>
+        </form>
+      </div>
+    </div>
+  </article>
+{% endfor %}
+</section>
+{% else %}
+<div class="empty watch-empty">暂时没有待看的新集数。</div>
 {% endif %}
 
 <div class="section-title dashboard-monitor-title"><div><p class="eyebrow">MONITOR</p><h2>监控概览</h2></div><a href="/anime">查看全部追番 →</a></div>

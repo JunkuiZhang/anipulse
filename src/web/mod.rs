@@ -182,6 +182,7 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
             post(reject_all_intent),
         )
         .route("/episodes/{id}/candidates/reject-all", post(reject_all))
+        .route("/episodes/{id}/watched", post(episode_watched))
         .route(
             "/episodes/{id}/candidates/from-url",
             post(candidate_from_url),
@@ -479,6 +480,8 @@ struct DashboardTemplate {
     scheduler_status: String,
     provider_status: String,
     upcoming: Vec<UpcomingReleaseView>,
+    watch_queue: Vec<WatchQueueView>,
+    notice: String,
 }
 
 struct UpcomingReleaseView {
@@ -493,9 +496,28 @@ struct UpcomingReleaseView {
     enabled: bool,
 }
 
+struct WatchQueueView {
+    episode_id: i64,
+    anime_id: i64,
+    title: String,
+    episode: String,
+    video_title: String,
+    url: String,
+    updated_at: String,
+    cover_url: String,
+    has_cover: bool,
+    cover_initial: String,
+}
+
+#[derive(Deserialize, Default)]
+struct DashboardQuery {
+    result: Option<String>,
+}
+
 async fn dashboard(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
+    Query(query): Query<DashboardQuery>,
 ) -> WebResponse {
     let stats = state.repository.dashboard_stats().await?;
     let now = Utc::now();
@@ -524,6 +546,37 @@ async fn dashboard(
             }
         })
         .collect();
+    let watch_queue = state
+        .repository
+        .watch_queue(50)
+        .await?
+        .into_iter()
+        .filter_map(|episode| {
+            let url = canonical_bilibili_url(&episode.bvid)?;
+            let cover_url = episode.bangumi_subject_id.and_then(bangumi_cover_url);
+            Some(WatchQueueView {
+                episode_id: episode.episode_id,
+                anime_id: episode.anime_id,
+                cover_initial: title_initial(&episode.anime_title),
+                title: episode.anime_title,
+                episode: format!("EP{}", episode.episode_no),
+                video_title: clean_bilibili_title(&episode.video_title),
+                url,
+                updated_at: episode
+                    .released_at
+                    .with_timezone(&state.display_timezone)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string(),
+                has_cover: cover_url.is_some(),
+                cover_url: cover_url.unwrap_or_default(),
+            })
+        })
+        .collect();
+    let notice = match query.result.as_deref() {
+        Some("episode-watched") => "已标记为已观看。",
+        _ => "",
+    }
+    .to_string();
     render(DashboardTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
@@ -537,7 +590,30 @@ async fn dashboard(
         scheduler_status: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
         provider_status: provider_status(stats.provider_backoff_until, state.display_timezone),
         upcoming,
+        watch_queue,
+        notice,
     })
+}
+
+async fn episode_watched(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(episode_id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let (anime_id, episode_no) = state.repository.mark_episode_watched(episode_id).await?;
+    audit_success(
+        &state,
+        &identity,
+        "episode.watched",
+        "episode",
+        episode_id,
+        serde_json::json!({"anime_id": anime_id, "episode_no": episode_no}),
+    )
+    .await?;
+    Ok(Redirect::to("/?result=episode-watched#watch-queue").into_response())
 }
 
 struct AnimeListItem {

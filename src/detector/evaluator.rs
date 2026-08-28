@@ -258,6 +258,7 @@ mod tests {
                 first_candidate_at: None,
                 confirmed_at: None,
                 notified_at: None,
+                watched_at: None,
             },
             VideoCandidate {
                 bvid: "BVtest".into(),

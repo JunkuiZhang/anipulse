@@ -169,6 +169,7 @@ pub struct Episode {
     pub first_candidate_at: Option<DateTime<Utc>>,
     pub confirmed_at: Option<DateTime<Utc>>,
     pub notified_at: Option<DateTime<Utc>>,
+    pub watched_at: Option<DateTime<Utc>>,
 }
 
 impl Episode {
