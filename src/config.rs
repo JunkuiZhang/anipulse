@@ -83,6 +83,7 @@ impl AppConfig {
         }
         for site in std::iter::once(&self.schedule.preferred_site)
             .chain(self.schedule.stream_site_priority.iter())
+            .chain(self.schedule.excluded_stream_sites.iter())
         {
             if site.trim().is_empty()
                 || !site.chars().all(|character| {
@@ -94,6 +95,16 @@ impl AppConfig {
                         .into(),
                 ));
             }
+        }
+        if self
+            .schedule
+            .excluded_stream_sites
+            .iter()
+            .any(|site| site == &self.schedule.preferred_site)
+        {
+            return Err(AppError::Config(
+                "schedule.preferred_site must not also appear in excluded_stream_sites".into(),
+            ));
         }
         for (name, value) in [
             ("schedule.bangumi_data_url", &self.schedule.bangumi_data_url),
@@ -312,6 +323,7 @@ pub struct ScheduleConfig {
     pub bangumi_api_base_url: String,
     pub preferred_site: String,
     pub stream_site_priority: Vec<String>,
+    pub excluded_stream_sites: Vec<String>,
     pub max_stream_offset_days: i64,
     pub max_catalog_offset_days: i64,
     pub sync_interval_secs: u64,
@@ -328,12 +340,12 @@ impl Default for ScheduleConfig {
             bangumi_api_base_url: "https://api.bgm.tv".into(),
             preferred_site: "bilibili".into(),
             stream_site_priority: vec![
-                "unext".into(),
                 "danime".into(),
                 "abema".into(),
                 "gamer".into(),
                 "gamer_hk".into(),
             ],
+            excluded_stream_sites: vec!["unext".into()],
             max_stream_offset_days: 14,
             max_catalog_offset_days: 1,
             sync_interval_secs: 86_400,
@@ -454,5 +466,24 @@ mod tests {
         config.schedule.max_stream_offset_days = 14;
         config.schedule.stream_site_priority = vec!["not/a/site".into()];
         assert!(config.validate().is_err());
+
+        config.schedule.stream_site_priority = vec!["danime".into()];
+        config.schedule.preferred_site = "unext".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn old_schedule_config_excludes_unext_by_default() {
+        let config: AppConfig = toml::from_str(
+            r#"
+                [schedule]
+                preferred_site = "bilibili"
+                stream_site_priority = ["unext", "danime", "gamer"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.schedule.excluded_stream_sites, ["unext"]);
+        assert!(config.validate().is_ok());
     }
 }

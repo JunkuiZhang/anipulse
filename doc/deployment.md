@@ -170,7 +170,8 @@ review_grace_secs = 3600
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
 preferred_site = "bilibili"
-stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
+excluded_stream_sites = ["unext"]
 max_stream_offset_days = 14
 max_catalog_offset_days = 1
 sync_interval_secs = 86400
@@ -186,7 +187,7 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 
-AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。显式的 `preferred_site` 有具体时刻时优先使用它；否则程序会比较 `stream_site_priority` 中的全部可用排期，采用至少两个独立平台在 2 小时内相互印证的最早档期。列表顺序只用于同时间决胜，或完全没有平台共识时的保守回退；`gamer` 与 `gamer_hk` 属于同一平台，不会被错误算作两票。这里读取的只是 `bangumi-data` JSON 元数据，阿里云服务器不会直接访问 U-NEXT、d Anime、ABEMA 或动画疯的网站。
+AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。显式的 `preferred_site` 有具体时刻时优先使用它；否则程序会比较 `stream_site_priority` 中的全部可用排期，采用至少两个独立平台在 2 小时内相互印证的最早档期。列表顺序只用于同时间决胜，或完全没有平台共识时的保守回退；`gamer` 与 `gamer_hk` 属于同一平台，不会被错误算作两票。`excluded_stream_sites` 会在选择前排除不可信来源，默认禁用 U-NEXT；旧配置没有这个字段时也会继承该默认值。这里读取的只是 `bangumi-data` JSON 元数据，阿里云服务器不会直接访问 d Anime、ABEMA 或动画疯的网站。
 
 选出网络来源后，程序再用 Bangumi 的本季首集日期和目标集日期校准跨日、先行配信、停播与连播。例如《猫与龙》的 d Anime 与动画疯排期共同表明它比电视提前一周，因此等待 EP10 时应得到上海时间 `2026-08-29 20:30`，而不是 U-NEXT 普通配信的 `2026-09-05 20:00`。Bilibili 检查仍独立运行，视频提前出现时不会等到预计时间才允许确认。
 
@@ -411,7 +412,7 @@ sudo systemctl --no-pager --full status anipulse.service anipulse-web.service
 sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
 ```
 
-SQLite migration 会在启动时自动执行。本次排期升级会保留追番、候选、历史视频和旧预计时间，并把所有仍在追的自动排期标记为“尽快重新同步”；同步成功后网页详情会显示“排期来源”和“校准状态”。旧配置即使没有 `stream_site_priority` 和两个 offset 选项也会使用安全默认值，但建议按第 5 节显式补上，方便以后调整。
+SQLite migration 会在启动时自动执行。本次排期升级会保留追番、候选和历史视频；对于正在使用 U-NEXT 的条目，会清除其旧预计时间并标记为“尽快重新同步”，避免同步失败时继续展示不可信时间。同步成功后网页详情会显示新的“排期来源”和“校准状态”。旧配置即使没有 `excluded_stream_sites` 也会默认排除 U-NEXT，但建议按第 5 节显式补上，方便以后调整。
 
 如需立即核对单个条目，可执行：
 

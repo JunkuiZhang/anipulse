@@ -51,7 +51,9 @@ bangumi_api_base_url = "https://api.bgm.tv"
 preferred_site = "bilibili"
 # preferred_site 没有具体时刻时，会比较以下可信来源：优先采用至少两个独立平台
 # 在 2 小时内相互印证的最早档期；列表顺序只用于同时间决胜和无共识时回退。
-stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
+# 即使旧配置仍在上面的优先列表中写了 U-NEXT，也会先被这里排除。
+excluded_stream_sites = ["unext"]
 # 网络先行/延后可能跨日或跨周；默认最多接受与 Bangumi 首集日期相差 14 天。
 max_stream_offset_days = 14
 # 默认目录时间不是明确网络来源，只允许很小的日期偏差，避免生成错误的精确时间。

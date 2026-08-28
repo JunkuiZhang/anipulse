@@ -700,6 +700,11 @@ fn select_broadcast(
     config: &ScheduleConfig,
     origin_airdate: Option<NaiveDate>,
 ) -> Result<SelectedBroadcast> {
+    let excluded_sources = config
+        .excluded_stream_sites
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let item_pattern = item
         .broadcast
         .as_deref()
@@ -707,10 +712,11 @@ fn select_broadcast(
         .map(str::to_string)
         .or_else(|| fallback_weekly_pattern(&item.begin));
 
-    if let Some(site) = item
-        .sites
-        .iter()
-        .find(|site| site.site == config.preferred_site)
+    if !excluded_sources.contains(config.preferred_site.as_str())
+        && let Some(site) = item
+            .sites
+            .iter()
+            .find(|site| site.site == config.preferred_site)
         && let Some(pattern) = site_pattern(site, item_pattern.as_deref())
     {
         return Ok(SelectedBroadcast {
@@ -725,7 +731,10 @@ fn select_broadcast(
     let mut candidates = Vec::new();
     let mut rejected_by_date = Vec::new();
     for (priority, source) in config.stream_site_priority.iter().enumerate() {
-        if source == &config.preferred_site || !seen.insert(source.clone()) {
+        if source == &config.preferred_site
+            || excluded_sources.contains(source.as_str())
+            || !seen.insert(source.clone())
+        {
             continue;
         }
         let Some(site) = item.sites.iter().find(|site| site.site == *source) else {
@@ -1000,7 +1009,7 @@ mod tests {
         );
         assert_eq!(resolved.expected_weekday, Some(5));
         assert_eq!(resolved.expected_time.as_deref(), Some("23:00"));
-        assert_eq!(resolved.schedule_source, "unext");
+        assert_eq!(resolved.schedule_source, "danime");
         assert_eq!(resolved.schedule_confidence, "calibrated");
         assert_eq!(requests.await.unwrap(), 3);
     }
@@ -1042,7 +1051,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 501_000,
                     broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
-                    schedule_source: "unext".into(),
+                    schedule_source: "danime".into(),
                     schedule_confidence: "calibrated".into(),
                     schedule_warning: None,
                     next_sync_at: Utc::now(),
@@ -1068,7 +1077,7 @@ mod tests {
 
         let anime = repository.get_anime(anime_id).await.unwrap();
         assert_eq!(anime.anime.schedule_confidence.as_deref(), Some("stale"));
-        assert_eq!(anime.anime.schedule_source.as_deref(), Some("unext"));
+        assert_eq!(anime.anime.schedule_source.as_deref(), Some("danime"));
         assert!(
             anime
                 .anime
@@ -1127,7 +1136,7 @@ mod tests {
         );
         assert_eq!(resolved.expected_weekday, Some(2));
         assert_eq!(resolved.expected_time.as_deref(), Some("21:00"));
-        assert_eq!(resolved.schedule_source, "unext");
+        assert_eq!(resolved.schedule_source, "danime");
         assert_eq!(resolved.schedule_confidence, "calibrated");
         assert_eq!(requests.await.unwrap(), 3);
     }
@@ -1261,8 +1270,38 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.source, "unext");
+        assert_eq!(selected.source, "gamer");
         assert!(selected.warning.is_some());
+    }
+
+    #[test]
+    fn excluded_stream_is_not_used_even_when_old_priority_still_lists_it() {
+        let item: BangumiDataItem = serde_json::from_str(
+            r#"{
+                "title":"example",
+                "titleTranslate":{},
+                "type":"tv",
+                "begin":"2026-07-04T12:00:00.000Z",
+                "broadcast":"R/2026-07-04T12:00:00.000Z/P7D",
+                "sites":[
+                    {"site":"bangumi","id":"1"},
+                    {"site":"unext","begin":"2026-07-01T01:11:00.000Z"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut config = ScheduleConfig::default();
+        config.stream_site_priority.insert(0, "unext".into());
+
+        let selected = select_broadcast(
+            &item,
+            &config,
+            Some(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(selected.source, "bangumi-data");
+        assert_eq!(selected.kind, BroadcastSourceKind::Catalog);
     }
 
     #[test]
@@ -1433,7 +1472,7 @@ mod tests {
                         "broadcast":"R/2026-08-12T13:00:00.000Z/P7D",
                         "sites":[
                             {"site":"bangumi","id":"633836"},
-                            {"site":"unext","begin":"2026-08-12T13:00:00.000Z"}
+                            {"site":"danime","begin":"2026-08-12T13:00:00.000Z"}
                         ]
                     }]}"#
                         .into()
@@ -1512,7 +1551,7 @@ mod tests {
                 "broadcast":"R/2026-07-03T15:00:00.000Z/P7D",
                 "sites":[
                     {{"site":"bangumi","id":"501000"}},
-                    {{"site":"unext","begin":"2026-07-04T15:00:00.000Z"}}
+                    {{"site":"danime","begin":"2026-07-04T15:00:00.000Z"}}
                 ]
             }}{duplicate}]}}"#
         )

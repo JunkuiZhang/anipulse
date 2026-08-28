@@ -2,7 +2,7 @@
 
 这个方案不替换 AniPulse 的排期来源：排期仍然来自 `bangumi-data`，章节日期和封面仍然来自 Bangumi。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
-新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 U-NEXT、d Anime、ABEMA 或动画疯等网络时段。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
+新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 d Anime、ABEMA 或动画疯等网络时段，并默认排除不可靠的 U-NEXT 排期。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
 
 ```text
 阿里云 AniPulse
@@ -220,14 +220,15 @@ sudo cp -a /etc/anipulse/config.toml /etc/anipulse/config.toml.before-worker
 bangumi_data_url = "https://bgm-proxy.example.com/data.json"
 bangumi_api_base_url = "https://bgm-proxy.example.com/bangumi"
 preferred_site = "bilibili"
-stream_site_priority = ["unext", "danime", "abema", "gamer", "gamer_hk"]
+stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
+excluded_stream_sites = ["unext"]
 max_stream_offset_days = 14
 max_catalog_offset_days = 1
 ```
 
 `bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加 `/v0/episodes` 和封面路径。
 
-`stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。AniPulse 会在本地比较 `/data.json` 中的全部候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
+`stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。`excluded_stream_sites` 会先排除不可信来源，默认禁用 U-NEXT；即使旧配置的优先列表里还保留 `unext`，缺省排除规则仍会生效。AniPulse 会在本地比较 `/data.json` 中的其余候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
 
 调度器和网页封面服务都会读取该配置，因此两个服务都要重启：
 
