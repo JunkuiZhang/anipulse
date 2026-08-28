@@ -206,6 +206,12 @@ pub struct VideoCandidate {
     pub url: String,
     pub tags: Vec<String>,
     pub page_count: Option<i64>,
+    #[serde(default)]
+    pub view_count: Option<i64>,
+    #[serde(default)]
+    pub reply_count: Option<i64>,
+    #[serde(default)]
+    pub uploader_follower_count: Option<i64>,
     pub discovered_at: DateTime<Utc>,
     pub enriched: bool,
 }
@@ -287,6 +293,12 @@ pub struct Evaluation {
     pub blocked_uploader: bool,
     pub negative_keywords: Vec<String>,
     pub metadata_enriched: bool,
+    #[serde(default)]
+    pub view_count: Option<i64>,
+    #[serde(default)]
+    pub reply_count: Option<i64>,
+    #[serde(default)]
+    pub uploader_follower_count: Option<i64>,
     pub score: i32,
     pub hard_reject: bool,
     pub manual_review: bool,

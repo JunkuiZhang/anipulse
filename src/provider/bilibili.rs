@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
     config::BilibiliConfig,
@@ -27,6 +27,7 @@ pub struct BilibiliProvider {
     request_lock: Arc<Mutex<Option<Instant>>>,
     wbi_cache: Arc<Mutex<Option<(String, Instant)>>>,
     public_cookie: Arc<Mutex<Option<String>>>,
+    uploader_follower_cache: Arc<Mutex<HashMap<i64, (i64, Instant)>>>,
 }
 
 impl BilibiliProvider {
@@ -44,7 +45,40 @@ impl BilibiliProvider {
             request_lock: Arc::new(Mutex::new(None)),
             wbi_cache: Arc::new(Mutex::new(None)),
             public_cookie: Arc::new(Mutex::new(None)),
+            uploader_follower_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    async fn uploader_follower_count(&self, mid: i64) -> Option<i64> {
+        if mid <= 0 {
+            return None;
+        }
+        {
+            let cache = self.uploader_follower_cache.lock().await;
+            if let Some((followers, fetched_at)) = cache.get(&mid)
+                && fetched_at.elapsed() < Duration::from_secs(21_600)
+            {
+                return Some(*followers);
+            }
+        }
+        let params = vec![("vmid".to_string(), mid.to_string())];
+        let value = match self.request_value("/x/relation/stat", &params).await {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(mid, %error, "uploader follower lookup failed");
+                return None;
+            }
+        };
+        if let Err(error) = Self::ensure_success(&value, "uploader relation stat") {
+            warn!(mid, %error, "uploader follower response unusable");
+            return None;
+        }
+        let followers = value.pointer("/data/follower").and_then(value_as_i64)?;
+        self.uploader_follower_cache
+            .lock()
+            .await
+            .insert(mid, (followers, Instant::now()));
+        Some(followers)
     }
 
     async fn request_value(
@@ -323,6 +357,9 @@ impl VideoSearchProvider for BilibiliProvider {
                 published_at,
                 tags,
                 page_count: None,
+                view_count: int_field(item, "play"),
+                reply_count: int_field(item, "review"),
+                uploader_follower_count: None,
                 discovered_at: now,
                 enriched: false,
             });
@@ -357,6 +394,10 @@ impl VideoSearchProvider for BilibiliProvider {
             .get("pages")
             .and_then(Value::as_array)
             .map(|pages| pages.len() as i64);
+        detailed.view_count = data.pointer("/stat/view").and_then(value_as_i64);
+        detailed.reply_count = data.pointer("/stat/reply").and_then(value_as_i64);
+        detailed.uploader_follower_count =
+            self.uploader_follower_count(detailed.uploader_mid).await;
         if let Some(category) = string_field(data, "tname")
             && !detailed.tags.iter().any(|tag| tag == &category)
         {

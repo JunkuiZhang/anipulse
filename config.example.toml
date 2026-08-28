@@ -19,6 +19,10 @@ max_duration_delta_secs = 180
 max_publish_delta_secs = 7200
 candidate_expire_secs = 259200
 trusted_confirmed_count = 3
+# 未手工信任的 UP 若低于以下粉丝数，候选只能人工审核，不能自动推送。
+minimum_auto_confirm_uploader_followers = 100
+# 播放量过低的视频同样先进入人工审核；设为 0 可关闭对应限制。
+minimum_auto_confirm_video_views = 200
 
 [polling]
 far_interval_secs = 21600

@@ -1,4 +1,5 @@
 use crate::{
+    config::ConfirmationConfig,
     detector::{episode::match_episode, title::match_anime},
     domain::{
         AnimeMatch, AnimeWithAliases, DurationMatch, Episode, EpisodeMatch, Evaluation,
@@ -11,7 +12,7 @@ pub fn evaluate(
     episode: &Episode,
     candidate: &VideoCandidate,
     trust: &UploaderTrust,
-    trusted_confirmed_count: i64,
+    confirmation: &ConfirmationConfig,
     blocked_keywords: &[String],
 ) -> Evaluation {
     let mut score = 0;
@@ -92,6 +93,12 @@ pub fn evaluate(
                 | "速看"
                 | "一口气"
                 | "预测"
+                | "泄露"
+                | "泄漏"
+                | "偷跑"
+                | "流出"
+                | "枪版"
+                | "盗录"
         );
         score -= if strong { 50 } else { 40 };
         if strong {
@@ -143,7 +150,7 @@ pub fn evaluate(
         }
     }
 
-    let trusted_uploader = trust.is_trusted(trusted_confirmed_count);
+    let trusted_uploader = trust.is_trusted(confirmation.trusted_confirmed_count);
     if trusted_uploader {
         score += 25;
     }
@@ -151,6 +158,57 @@ pub fn evaluate(
         score -= 100;
         hard_reject = true;
         reasons.push("uploader is blocked for this anime".into());
+    }
+    if candidate.enriched && !trust.manually_trusted {
+        let mut reputation_requires_review = false;
+        if confirmation.minimum_auto_confirm_uploader_followers > 0 {
+            match candidate.uploader_follower_count {
+                Some(followers)
+                    if followers < confirmation.minimum_auto_confirm_uploader_followers =>
+                {
+                    reputation_requires_review = true;
+                    reasons.push(format!(
+                        "uploader has only {followers} followers; at least {} are required for automatic confirmation",
+                        confirmation.minimum_auto_confirm_uploader_followers
+                    ));
+                }
+                None => {
+                    reputation_requires_review = true;
+                    reasons.push(
+                        "uploader follower count is unavailable; automatic confirmation is disabled"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if confirmation.minimum_auto_confirm_video_views > 0 {
+            match candidate.view_count {
+                Some(views) if views < confirmation.minimum_auto_confirm_video_views => {
+                    reputation_requires_review = true;
+                    let replies = candidate
+                        .reply_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    reasons.push(format!(
+                        "video engagement is low ({views} views, {replies} replies); at least {} views are required for automatic confirmation",
+                        confirmation.minimum_auto_confirm_video_views
+                    ));
+                }
+                None => {
+                    reputation_requires_review = true;
+                    reasons.push(
+                        "video view count is unavailable; automatic confirmation is disabled"
+                            .into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if reputation_requires_review {
+            score -= 25;
+            manual_review = true;
+        }
     }
     if candidate.enriched {
         score += 10;
@@ -165,6 +223,9 @@ pub fn evaluate(
         blocked_uploader: trust.manually_blocked,
         negative_keywords,
         metadata_enriched: candidate.enriched,
+        view_count: candidate.view_count,
+        reply_count: candidate.reply_count,
+        uploader_follower_count: candidate.uploader_follower_count,
         score,
         hard_reject,
         manual_review,
@@ -188,6 +249,12 @@ fn find_negative_keywords(normalized: &str) -> Vec<String> {
         "速看",
         "一口气",
         "预测",
+        "泄露",
+        "泄漏",
+        "偷跑",
+        "流出",
+        "枪版",
+        "盗录",
     ] {
         if keyword == "解说" && normalized.contains("无解说") {
             continue;
@@ -271,6 +338,9 @@ mod tests {
                 url: "https://example.com".into(),
                 tags: vec![],
                 page_count: Some(1),
+                view_count: Some(10_000),
+                reply_count: Some(20),
+                uploader_follower_count: Some(1_000),
                 discovered_at: now,
                 enriched: true,
             },
@@ -287,7 +357,7 @@ mod tests {
                     &episode,
                     &candidate,
                     &UploaderTrust::default(),
-                    3,
+                    &ConfirmationConfig::default(),
                     &[],
                 )
                 .hard_reject
@@ -300,7 +370,7 @@ mod tests {
                 &episode,
                 &candidate,
                 &UploaderTrust::default(),
-                3,
+                &ConfirmationConfig::default(),
                 &[],
             )
             .duration_match,
@@ -313,7 +383,7 @@ mod tests {
                 &episode,
                 &candidate,
                 &UploaderTrust::default(),
-                3,
+                &ConfirmationConfig::default(),
                 &[],
             )
             .duration_match,
@@ -331,11 +401,81 @@ mod tests {
                 &episode,
                 &candidate,
                 &UploaderTrust::default(),
-                3,
+                &ConfirmationConfig::default(),
                 &[],
             );
             assert!(evaluation.score < 60, "{suffix}: {}", evaluation.score);
         }
+    }
+
+    #[test]
+    fn leaked_or_bootleg_episode_titles_are_hard_rejected() {
+        for signal in ["泄露版", "偷跑版", "流出版", "枪版", "盗录"] {
+            let title = format!("尼古喵喵 第8话 {signal}");
+            let (mut anime, episode, candidate) = fixtures(1_688, &title);
+            anime.anime.title = "尼古喵喵".into();
+            anime.aliases = vec!["尼古喵喵".into(), "ヤニねこ".into()];
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                &ConfirmationConfig::default(),
+                &[],
+            );
+            assert!(evaluation.hard_reject, "{signal}: {:?}", evaluation.reasons);
+        }
+    }
+
+    #[test]
+    fn tiny_untrusted_uploader_and_low_engagement_require_review() {
+        let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
+        candidate.uploader_follower_count = Some(3);
+        candidate.view_count = Some(136);
+        candidate.reply_count = Some(0);
+        let evaluation = evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &UploaderTrust::default(),
+            &ConfirmationConfig::default(),
+            &[],
+        );
+        assert!(!evaluation.hard_reject);
+        assert!(evaluation.manual_review);
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("only 3 followers"))
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("136 views, 0 replies"))
+        );
+    }
+
+    #[test]
+    fn explicit_uploader_trust_bypasses_only_reputation_gate() {
+        let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
+        candidate.uploader_follower_count = Some(3);
+        candidate.view_count = Some(136);
+        let trust = UploaderTrust {
+            manually_trusted: true,
+            ..UploaderTrust::default()
+        };
+        let evaluation = evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &trust,
+            &ConfirmationConfig::default(),
+            &[],
+        );
+        assert!(!evaluation.hard_reject);
+        assert!(!evaluation.manual_review);
     }
 
     #[test]
@@ -357,7 +497,7 @@ mod tests {
                 &episode,
                 &candidate,
                 &UploaderTrust::default(),
-                3,
+                &ConfirmationConfig::default(),
                 &[],
             );
             assert!(!evaluation.hard_reject, "{title}: {:?}", evaluation.reasons);
@@ -376,7 +516,7 @@ mod tests {
             &episode,
             &candidate,
             &UploaderTrust::default(),
-            3,
+            &ConfirmationConfig::default(),
             &["有声漫画".into()],
         );
 

@@ -82,7 +82,7 @@ impl Detector {
                     &episode,
                     &candidate,
                     &trust,
-                    self.config.confirmation.trusted_confirmed_count,
+                    &self.config.confirmation,
                     &blocked_keywords,
                 );
                 if preliminary.hard_reject {
@@ -121,7 +121,7 @@ impl Detector {
                     &episode,
                     &detailed,
                     &trust,
-                    self.config.confirmation.trusted_confirmed_count,
+                    &self.config.confirmation,
                     &blocked_keywords,
                 );
                 let state = if evaluation.hard_reject {
@@ -217,6 +217,8 @@ impl Detector {
                 )
                 && evaluation.negative_keywords.is_empty()
                 && !evaluation.hard_reject
+                && !evaluation.manual_review
+                && evaluation.metadata_enriched
             {
                 self.repository
                     .confirm_candidate(
@@ -360,6 +362,9 @@ mod tests {
                 url: format!("https://www.bilibili.com/video/BVmock{index:05}"),
                 tags: vec![],
                 page_count: Some(1),
+                view_count: Some(10_000),
+                reply_count: Some(20),
+                uploader_follower_count: Some(1_000),
                 discovered_at: now,
                 enriched: false,
             })

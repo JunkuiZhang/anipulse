@@ -364,6 +364,9 @@ impl ApplicationService {
             url: format!("https://www.bilibili.com/video/{bvid}"),
             tags: Vec::new(),
             page_count: None,
+            view_count: None,
+            reply_count: None,
+            uploader_follower_count: None,
             discovered_at: now,
             enriched: false,
         };
@@ -386,7 +389,7 @@ impl ApplicationService {
             &episode,
             &candidate,
             &trust,
-            self.config.confirmation.trusted_confirmed_count,
+            &self.config.confirmation,
             &blocked_keywords,
         );
         self.repository
@@ -424,6 +427,9 @@ impl ApplicationService {
             url: format!("https://www.bilibili.com/video/{bvid}"),
             tags: Vec::new(),
             page_count: None,
+            view_count: None,
+            reply_count: None,
+            uploader_follower_count: None,
             discovered_at: now,
             enriched: false,
         };
@@ -446,7 +452,7 @@ impl ApplicationService {
             &episode,
             &candidate,
             &trust,
-            self.config.confirmation.trusted_confirmed_count,
+            &self.config.confirmation,
             &blocked_keywords,
         );
         self.repository

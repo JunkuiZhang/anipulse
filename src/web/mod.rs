@@ -33,7 +33,7 @@ use crate::{
     },
     auth::{AuthService, LoginOutcome, SessionIdentity},
     config::AppConfig,
-    domain::EpisodeNumberMapping,
+    domain::{EpisodeNumberMapping, Evaluation},
     error::{AppError, Result},
     repository::{AuditEventRow, CandidateListRow, EpisodeVideoRow, ManagementJob, Repository},
 };
@@ -1997,6 +1997,7 @@ struct CandidateView {
     score: i64,
     state: String,
     evaluation: String,
+    reputation: String,
     url: String,
     has_video_url: bool,
     pending: bool,
@@ -2053,6 +2054,7 @@ async fn candidate_list(
 }
 
 fn candidate_view(row: CandidateListRow) -> CandidateView {
+    let reputation = candidate_reputation(&row.evaluation_json);
     let evaluation = serde_json::from_str::<serde_json::Value>(&row.evaluation_json)
         .and_then(|value| serde_json::to_string_pretty(&value))
         .unwrap_or_else(|_| "判定详情不可用".into());
@@ -2071,6 +2073,7 @@ fn candidate_view(row: CandidateListRow) -> CandidateView {
         pending: row.state == "pending",
         state: candidate_state_label(&row.state).into(),
         evaluation,
+        reputation,
         has_video_url: url.is_some(),
         url: url.unwrap_or_default(),
     }
@@ -2507,6 +2510,7 @@ struct ReviewCandidate {
     uploader: String,
     duration: String,
     score: i64,
+    reputation: String,
     url: String,
     has_video_url: bool,
 }
@@ -2537,12 +2541,14 @@ async fn review_episode(
         .into_iter()
         .map(|candidate| {
             let url = canonical_bilibili_url(&candidate.bvid);
+            let reputation = candidate_reputation(&candidate.evaluation_json);
             ReviewCandidate {
                 bvid: candidate.bvid,
                 title: clean_bilibili_title(&candidate.title),
                 uploader: candidate.uploader_name,
                 duration: format_duration(candidate.duration_sec),
                 score: candidate.score,
+                reputation,
                 has_video_url: url.is_some(),
                 url: url.unwrap_or_default(),
             }
@@ -2557,6 +2563,23 @@ async fn review_episode(
         episode_no: episode.episode_no,
         candidates,
     })
+}
+
+fn candidate_reputation(evaluation_json: &str) -> String {
+    let Ok(evaluation) = serde_json::from_str::<Evaluation>(evaluation_json) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(followers) = evaluation.uploader_follower_count {
+        parts.push(format!("UP 粉丝 {followers}"));
+    }
+    if let Some(views) = evaluation.view_count {
+        parts.push(format!("播放 {views}"));
+    }
+    if let Some(replies) = evaluation.reply_count {
+        parts.push(format!("评论 {replies}"));
+    }
+    parts.join(" · ")
 }
 
 async fn reject_all_intent(

@@ -16,6 +16,8 @@ pub fn find_consensus(
         };
         if candidate.score < i64::from(minimum_score)
             || evaluation.hard_reject
+            || evaluation.manual_review
+            || !evaluation.metadata_enriched
             || evaluation.episode_match != EpisodeMatch::Strong
             || !matches!(
                 evaluation.anime_match,
@@ -77,6 +79,9 @@ mod tests {
             blocked_uploader: false,
             negative_keywords: vec![],
             metadata_enriched: true,
+            view_count: Some(10_000),
+            reply_count: Some(20),
+            uploader_follower_count: Some(1_000),
             score: 75,
             hard_reject: false,
             manual_review: false,
@@ -114,5 +119,17 @@ mod tests {
     fn distinct_uploaders_form_consensus() {
         let candidates = vec![candidate("BV1", 100), candidate("BV2", 200)];
         assert!(find_consensus(&candidates, 60, 2, 180, 7_200).is_some());
+    }
+
+    #[test]
+    fn candidates_requiring_review_never_form_automatic_consensus() {
+        let mut candidates = vec![candidate("BV1", 100), candidate("BV2", 200)];
+        for candidate in &mut candidates {
+            let mut evaluation: Evaluation =
+                serde_json::from_str(&candidate.evaluation_json).unwrap();
+            evaluation.manual_review = true;
+            candidate.evaluation_json = serde_json::to_string(&evaluation).unwrap();
+        }
+        assert!(find_consensus(&candidates, 60, 2, 180, 7_200).is_none());
     }
 }
