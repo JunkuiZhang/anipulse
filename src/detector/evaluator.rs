@@ -1,6 +1,9 @@
 use crate::{
     config::ConfirmationConfig,
-    detector::{episode::match_episode, title::match_anime},
+    detector::{
+        episode::{has_collection_signal, match_episode},
+        title::match_anime,
+    },
     domain::{
         AnimeMatch, AnimeWithAliases, DurationMatch, Episode, EpisodeMatch, Evaluation,
         UploaderTrust, VideoCandidate,
@@ -52,9 +55,17 @@ pub fn evaluate(
         }
     }
 
+    let collection_signal = has_collection_signal(&candidate.title);
+    if collection_signal {
+        score -= 100;
+        hard_reject = true;
+        reasons.push("title describes a multi-episode collection, not a single episode".into());
+    }
+
     let minimum = anime.anime.duration_min_sec;
     let maximum = anime.anime.duration_max_sec;
     let hard_minimum = minimum * 60 / 100;
+    let hard_maximum = maximum.saturating_mul(2);
     let duration_match = if candidate.duration_sec == 0 && !candidate.enriched {
         score -= 10;
         reasons.push("search result has no duration; detail metadata is required".into());
@@ -64,6 +75,11 @@ pub fn evaluate(
         hard_reject = true;
         reasons.push("video is below the hard minimum duration".into());
         DurationMatch::TooShort
+    } else if candidate.duration_sec > hard_maximum {
+        score -= 80;
+        hard_reject = true;
+        reasons.push("video is above twice the configured single-episode maximum duration".into());
+        DurationMatch::Suspicious
     } else if candidate.duration_sec >= minimum && candidate.duration_sec <= maximum {
         score += 15;
         DurationMatch::Normal
@@ -80,6 +96,9 @@ pub fn evaluate(
 
     let normalized = crate::detector::title::normalize_title(&candidate.title);
     let mut negative_keywords = find_negative_keywords(&normalized);
+    if collection_signal {
+        negative_keywords.push("合集/全集".into());
+    }
     for keyword in &negative_keywords {
         let strong = matches!(
             keyword.as_str(),
@@ -105,6 +124,8 @@ pub fn evaluate(
             hard_reject = true;
         }
     }
+    negative_keywords.sort();
+    negative_keywords.dedup();
     if !negative_keywords.is_empty() {
         reasons.push(format!(
             "negative title signals: {}",
@@ -388,6 +409,55 @@ mod tests {
             .duration_match,
             DurationMatch::Suspicious
         );
+
+        let (anime, episode, candidate) = fixtures(19_020, "Silent Witch EP08");
+        let evaluation = evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &UploaderTrust::default(),
+            &ConfirmationConfig::default(),
+            &[],
+        );
+        assert!(evaluation.hard_reject);
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("twice the configured"))
+        );
+    }
+
+    #[test]
+    fn complete_series_titles_are_hard_rejected() {
+        for (title, target, duration) in [
+            ("落第贤者的学院无双 全12话 4k超清无删减完整版", 12, 19_020),
+            ("攻壳机动队 THE GHOST IN THE SHELL 全10话 周更", 10, 20_220),
+        ] {
+            let (mut anime, mut episode, candidate) = fixtures(duration, title);
+            let alias = title.split(" 全").next().unwrap().to_string();
+            anime.anime.title = alias.clone();
+            anime.aliases = vec![alias];
+            episode.episode_no = target;
+
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &UploaderTrust::default(),
+                &ConfirmationConfig::default(),
+                &[],
+            );
+            assert!(evaluation.hard_reject, "{title}: {:?}", evaluation.reasons);
+            assert_eq!(evaluation.episode_match, EpisodeMatch::Ambiguous, "{title}");
+            assert!(
+                evaluation
+                    .negative_keywords
+                    .iter()
+                    .any(|keyword| keyword == "合集/全集"),
+                "{title}"
+            );
+        }
     }
 
     #[test]

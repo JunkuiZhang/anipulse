@@ -17,6 +17,12 @@ static CHINESE_ARABIC: LazyLock<Regex> =
 static CHINESE_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"第\s*([零〇一二两三四五六七八九十百]+)\s*[集话話]").expect("valid regex")
 });
+static COLLECTION_TOTAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:全\s*0*\d{1,4}\s*[集话話]|全\s*[零〇一二两三四五六七八九十百]+\s*[集话話]|(?:第\s*)?0*\d{1,4}\s*[-~至到]\s*0*\d{1,4}\s*[集话話]|0*\d{1,4}\s*[集话話]\s*全(?:\s|$))",
+    )
+    .expect("valid regex")
+});
 static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").expect("valid regex"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +33,10 @@ pub struct EpisodeEvidence {
 
 pub fn match_episode(title: &str, target: i64) -> EpisodeEvidence {
     let normalized = normalize_title(title);
+
+    if has_collection_signal_normalized(&normalized) {
+        return evidence(EpisodeMatch::Ambiguous, false);
+    }
 
     for captures in RANGE.captures_iter(&normalized) {
         let first = captures[1].parse::<i64>().unwrap_or_default();
@@ -106,6 +116,16 @@ pub fn match_episode(title: &str, target: i64) -> EpisodeEvidence {
         );
     }
     evidence(EpisodeMatch::None, false)
+}
+
+pub fn has_collection_signal(title: &str) -> bool {
+    has_collection_signal_normalized(&normalize_title(title))
+}
+
+fn has_collection_signal_normalized(normalized: &str) -> bool {
+    normalized.contains("合集")
+        || normalized.contains("全集")
+        || COLLECTION_TOTAL.is_match(normalized)
 }
 
 fn evidence(kind: EpisodeMatch, explicit_other: bool) -> EpisodeEvidence {
@@ -199,6 +219,30 @@ mod tests {
         assert_eq!(
             match_episode("Silent Witch EP8.5", 8).kind,
             EpisodeMatch::Ambiguous
+        );
+    }
+
+    #[test]
+    fn collection_totals_are_not_single_episode_evidence() {
+        for title in [
+            "落第贤者的学院无双 全12话 4k超清无删减完整版",
+            "攻壳机动队 全10话 周更",
+            "某动画 第1-12集",
+            "某动画 12集全",
+            "某动画 全十二話",
+        ] {
+            assert!(has_collection_signal(title), "{title}");
+            assert_eq!(
+                match_episode(title, 12).kind,
+                EpisodeMatch::Ambiguous,
+                "{title}"
+            );
+        }
+
+        assert!(!has_collection_signal("某动画 第12集 全程高能"));
+        assert_eq!(
+            match_episode("某动画 第12集 全程高能", 12).kind,
+            EpisodeMatch::Strong
         );
     }
 }
