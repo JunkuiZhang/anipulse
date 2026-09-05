@@ -574,6 +574,7 @@ async fn dashboard(
         .collect();
     let notice = match query.result.as_deref() {
         Some("episode-watched") => "已标记为已观看。",
+        Some("episode-watched-archived") => "最后一集已经看完，本季已自动归档收藏。",
         _ => "",
     }
     .to_string();
@@ -603,17 +604,27 @@ async fn episode_watched(
     Form(form): Form<CsrfForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
-    let (anime_id, episode_no) = state.repository.mark_episode_watched(episode_id).await?;
+    let outcome = state.repository.mark_episode_watched(episode_id).await?;
+    let auto_archived = outcome.auto_archive.is_some();
     audit_success(
         &state,
         &identity,
         "episode.watched",
         "episode",
         episode_id,
-        serde_json::json!({"anime_id": anime_id, "episode_no": episode_no}),
+        serde_json::json!({
+            "anime_id": outcome.anime_id,
+            "episode_no": outcome.episode_no,
+            "auto_archived": auto_archived,
+        }),
     )
     .await?;
-    Ok(Redirect::to("/?result=episode-watched#watch-queue").into_response())
+    let result = if auto_archived {
+        "episode-watched-archived"
+    } else {
+        "episode-watched"
+    };
+    Ok(Redirect::to(&format!("/?result={result}#watch-queue")).into_response())
 }
 
 struct AnimeListItem {
@@ -889,6 +900,8 @@ struct AnimeDraftTemplate {
     matched_title: String,
     bangumi_id: String,
     next_episode: i64,
+    total_episodes: String,
+    has_total_episodes: bool,
     expected_at: String,
     schedule_source: String,
     schedule_confidence: String,
@@ -918,6 +931,7 @@ async fn anime_draft(
         matched_title,
         bangumi_id,
         next_episode,
+        total_episodes,
         expected_at,
         schedule_source,
         schedule_confidence,
@@ -926,6 +940,16 @@ async fn anime_draft(
         episode_mapping,
         warning,
     ) = if let Some(resolved) = resolved {
+        let total_episodes = resolved
+            .total_episodes
+            .map(|total| {
+                resolved
+                    .episode_mapping
+                    .and_then(|mapping| mapping.final_local_episode(total).ok())
+                    .map(|final_episode| format!("{total} 集（站内最终 EP{final_episode}）"))
+                    .unwrap_or_else(|| format!("{total} 集"))
+            })
+            .unwrap_or_default();
         let episode_mapping = resolved
             .episode_mapping
             .and_then(|mapping| {
@@ -951,6 +975,7 @@ async fn anime_draft(
                 .map(|id| format!("#{id}"))
                 .unwrap_or_else(|| "未绑定".into()),
             resolved.next_episode,
+            total_episodes,
             format_time(resolved.expected_at, state.display_timezone),
             resolved
                 .schedule_source
@@ -988,6 +1013,7 @@ async fn anime_draft(
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
         )
     };
     render(AnimeDraftTemplate {
@@ -1001,6 +1027,8 @@ async fn anime_draft(
         matched_title,
         bangumi_id,
         next_episode,
+        has_total_episodes: !total_episodes.is_empty(),
+        total_episodes,
         expected_at,
         schedule_source,
         schedule_confidence,
@@ -1069,6 +1097,8 @@ struct AnimeDetailTemplate {
     next_check: String,
     duration: String,
     bangumi: String,
+    total_episodes: String,
+    has_total_episodes: bool,
     episode_mapping: String,
     has_episode_mapping: bool,
     mapping_search_start: String,
@@ -1198,6 +1228,20 @@ async fn anime_detail(
             format!("站内 EP{local_origin} ↔ Bangumi EP{bangumi_origin}{current}")
         })
         .unwrap_or_default();
+    let total_episodes = anime
+        .anime
+        .total_episodes
+        .map(|total| {
+            anime
+                .anime
+                .final_episode_no()
+                .ok()
+                .flatten()
+                .filter(|final_episode| *final_episode != total)
+                .map(|final_episode| format!("{total} 集 · 站内最终 EP{final_episode}"))
+                .unwrap_or_else(|| format!("{total} 集"))
+        })
+        .unwrap_or_default();
     let video_job_enqueued = query.result.as_deref() == Some("video-enqueued");
     let notice = match query.result.as_deref() {
         Some("video-enqueued") => "视频已加入处理队列，元数据读取完成后会显示在本页。",
@@ -1222,7 +1266,7 @@ async fn anime_detail(
                 .map(|episode| (episode.episode_no - 1).max(1))
         })
         .unwrap_or(1);
-    let resume_episode = suggested_total + 1;
+    let resume_episode = anime.anime.final_episode_no()?.unwrap_or(suggested_total) + 1;
     render(AnimeDetailTemplate {
         username: identity.username,
         csrf_token: identity.csrf_token,
@@ -1298,6 +1342,8 @@ async fn anime_detail(
             .bangumi_subject_id
             .map(|id| format!("#{id}"))
             .unwrap_or_else(|| "未绑定".into()),
+        has_total_episodes: !total_episodes.is_empty(),
+        total_episodes,
         has_episode_mapping: !episode_mapping.is_empty(),
         episode_mapping,
         mapping_search_start: anime
@@ -3488,6 +3534,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 633_836,
+                    total_episodes: None,
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
                     episode_mapping: None,

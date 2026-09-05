@@ -63,6 +63,8 @@ pub struct AnimeDraftResolution {
     pub duration_min_sec: i64,
     pub duration_max_sec: i64,
     pub bangumi_subject_id: Option<i64>,
+    #[serde(default)]
+    pub total_episodes: Option<i64>,
     pub broadcast_pattern: Option<String>,
     #[serde(default)]
     pub schedule_source: Option<String>,
@@ -90,6 +92,7 @@ impl AnimeDraftResolution {
             auto_schedule: self.bangumi_subject_id.zip(self.broadcast_pattern).map(
                 |(bangumi_subject_id, broadcast_pattern)| AutoScheduleMetadata {
                     bangumi_subject_id,
+                    total_episodes: self.total_episodes,
                     broadcast_pattern,
                     schedule_source: self.schedule_source.unwrap_or_else(|| "unknown".into()),
                     schedule_confidence: self
@@ -510,6 +513,7 @@ impl ApplicationService {
                 duration_min_sec: request.duration_min_sec,
                 duration_max_sec: request.duration_max_sec,
                 bangumi_subject_id: None,
+                total_episodes: None,
                 broadcast_pattern: None,
                 schedule_source: None,
                 schedule_confidence: None,
@@ -591,6 +595,7 @@ impl ApplicationService {
             duration_min_sec: request.duration_min_sec,
             duration_max_sec: request.duration_max_sec,
             bangumi_subject_id: Some(resolved.bangumi_subject_id),
+            total_episodes: resolved.total_episodes,
             broadcast_pattern: Some(resolved.broadcast_pattern),
             schedule_source: Some(resolved.schedule_source),
             schedule_confidence: Some(resolved.schedule_confidence),

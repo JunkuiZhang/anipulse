@@ -296,6 +296,8 @@ sudo -u anipulse /usr/local/bin/anipulse \
 
 映射会随下一集自动递增：站内 EP14 对应 Bangumi EP80，但 Bilibili 搜索仍使用 EP14。网页添加页也提供“特殊集数映射”；已有追番可在详情页修改并立即加入后台排期同步。
 
+自动同步还会读取 Bangumi `type=0` 正篇章节的总数。以上例子若 Bangumi 条目包含 EP78–EP85 共 8 个正篇章节，AniPulse 会保存“正篇 8 集”，同时计算站内最终集为 `EP12 + 8 - 1 = EP19`。最后一集发布后不会创建 EP20；当最后一集及其他待看集都被标记为“已观看”时，系统自动归档。Bangumi 请求失败或总数未知时不会猜测完结。
+
 如果数据源中没有该作品，仍可按原方式手工提供多个 `--alias`、`--weekday` 和 `--time`，但不要同时使用 `--auto-schedule`。
 
 检查结果：

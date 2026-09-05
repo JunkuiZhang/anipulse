@@ -517,6 +517,19 @@ async fn handle_anime(
                     resolved.schedule_source,
                     resolved.schedule_confidence,
                 );
+                if let Some(total) = resolved.total_episodes {
+                    let final_episode = episode_mapping
+                        .map(|mapping| mapping.final_local_episode(total))
+                        .transpose()?
+                        .unwrap_or(total);
+                    if final_episode == total {
+                        println!("Bangumi reports {total} regular episodes");
+                    } else {
+                        println!(
+                            "Bangumi reports {total} regular episodes; mapped final local episode is EP{final_episode}"
+                        );
+                    }
+                }
                 if let Some(warning) = &resolved.schedule_warning {
                     println!("schedule warning: {warning}");
                 }
@@ -526,6 +539,7 @@ async fn handle_anime(
                     resolved.expected_at,
                     Some(AutoScheduleMetadata {
                         bangumi_subject_id: resolved.bangumi_subject_id,
+                        total_episodes: resolved.total_episodes,
                         broadcast_pattern: resolved.broadcast_pattern,
                         schedule_source: resolved.schedule_source,
                         schedule_confidence: resolved.schedule_confidence,

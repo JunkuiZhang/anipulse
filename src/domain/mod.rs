@@ -63,6 +63,26 @@ pub struct AnimeWithAliases {
     pub aliases: Vec<String>,
 }
 
+impl Anime {
+    pub fn final_episode_no(&self) -> Result<Option<i64>> {
+        let Some(total_episodes) = self.total_episodes else {
+            return Ok(None);
+        };
+        match (self.local_episode_origin, self.bangumi_episode_origin) {
+            (Some(local_origin), Some(bangumi_origin)) => EpisodeNumberMapping {
+                local_origin,
+                bangumi_origin,
+            }
+            .final_local_episode(total_episodes)
+            .map(Some),
+            (None, None) => Ok(Some(total_episodes)),
+            _ => Err(AppError::InvalidInput(
+                "anime has an incomplete episode number mapping".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewAnime {
     pub title: String,
@@ -80,6 +100,7 @@ pub struct NewAnime {
 #[derive(Debug, Clone)]
 pub struct AutoScheduleMetadata {
     pub bangumi_subject_id: i64,
+    pub total_episodes: Option<i64>,
     pub broadcast_pattern: String,
     pub schedule_source: String,
     pub schedule_confidence: String,
@@ -121,11 +142,29 @@ impl EpisodeNumberMapping {
         })?;
         Ok((subject_index, bangumi_episode))
     }
+
+    pub fn final_local_episode(self, subject_episode_count: i64) -> Result<i64> {
+        if subject_episode_count <= 0 || subject_episode_count > 10_000 {
+            return Err(AppError::InvalidInput(
+                "subject episode count must be between 1 and 10000".into(),
+            ));
+        }
+        self.mapped_numbers(self.local_origin)?;
+        self.local_origin
+            .checked_add(subject_episode_count - 1)
+            .filter(|value| *value <= 10_000)
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "episode mapping produces an invalid final local episode".into(),
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ScheduleUpdate {
     pub bangumi_subject_id: i64,
+    pub total_episodes: Option<i64>,
     pub aliases: Vec<String>,
     pub expected_at: Option<DateTime<Utc>>,
     pub expected_weekday: Option<i64>,

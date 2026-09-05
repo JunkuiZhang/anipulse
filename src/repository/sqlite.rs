@@ -96,6 +96,13 @@ pub struct AnimeArchiveSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct EpisodeWatchedResult {
+    pub anime_id: i64,
+    pub episode_no: i64,
+    pub auto_archive: Option<AnimeArchiveSummary>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DashboardStats {
     pub anime_count: i64,
     pub enabled_anime_count: i64,
@@ -285,6 +292,7 @@ impl Repository {
         let now = Utc::now();
         let (
             bangumi_subject_id,
+            total_episodes,
             auto_schedule,
             broadcast_pattern,
             schedule_sync_at,
@@ -301,6 +309,7 @@ impl Repository {
                 let mapping = metadata.episode_mapping;
                 (
                     Some(metadata.bangumi_subject_id),
+                    metadata.total_episodes,
                     true,
                     Some(metadata.broadcast_pattern.as_str()),
                     Some(now),
@@ -312,7 +321,9 @@ impl Repository {
                     mapping.map(|value| value.bangumi_origin),
                 )
             })
-            .unwrap_or((None, false, None, None, None, None, None, None, None, None));
+            .unwrap_or((
+                None, None, false, None, None, None, None, None, None, None, None,
+            ));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
@@ -320,8 +331,8 @@ impl Repository {
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
                 auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
                 schedule_source, schedule_confidence, schedule_warning,
-                local_episode_origin, bangumi_episode_origin
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                local_episode_origin, bangumi_episode_origin, total_episodes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
@@ -341,6 +352,7 @@ impl Repository {
         .bind(schedule_warning)
         .bind(local_episode_origin)
         .bind(bangumi_episode_origin)
+        .bind(total_episodes)
         .execute(&mut *tx)
         .await?;
         let anime_id = result.last_insert_rowid();
@@ -459,17 +471,15 @@ impl Repository {
         .await?)
     }
 
-    pub async fn mark_episode_watched(&self, episode_id: i64) -> Result<(i64, i64)> {
+    pub async fn mark_episode_watched(&self, episode_id: i64) -> Result<EpisodeWatchedResult> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let (anime_id, episode_no, state) = sqlx::query_as::<_, (i64, i64, String)>(
-            "SELECT anime_id, episode_no, state FROM episode WHERE id = ?",
-        )
-        .bind(episode_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("episode {episode_id}")))?;
-        if !matches!(state.as_str(), "confirmed" | "notified") {
+        let episode = sqlx::query_as::<_, Episode>("SELECT * FROM episode WHERE id = ?")
+            .bind(episode_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("episode {episode_id}")))?;
+        if !matches!(episode.state.as_str(), "confirmed" | "notified") {
             return Err(AppError::InvalidInput(
                 "only a released episode can be marked watched".into(),
             ));
@@ -480,7 +490,47 @@ impl Repository {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok((anime_id, episode_no))
+
+        let anime = self.get_anime(episode.anime_id).await?.anime;
+        let auto_archive = if let Some(final_episode_no) = anime.final_episode_no()? {
+            let ready = sqlx::query_scalar::<_, bool>(
+                r#"SELECT
+                       EXISTS(
+                           SELECT 1 FROM episode
+                           WHERE anime_id = ? AND episode_no = ?
+                             AND state IN ('confirmed','notified') AND watched_at IS NOT NULL
+                       )
+                       AND NOT EXISTS(
+                           SELECT 1 FROM episode
+                           WHERE anime_id = ? AND state IN ('confirmed','notified')
+                             AND watched_at IS NULL
+                       )"#,
+            )
+            .bind(episode.anime_id)
+            .bind(final_episode_no)
+            .bind(episode.anime_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if ready {
+                if anime.lifecycle == "tracking" {
+                    self.mark_anime_released_complete(episode.anime_id, anime.total_episodes)
+                        .await?;
+                }
+                Some(
+                    self.archive_anime(episode.anime_id, anime.total_episodes, &anime.summary)
+                        .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(EpisodeWatchedResult {
+            anime_id: episode.anime_id,
+            episode_no: episode.episode_no,
+            auto_archive,
+        })
     }
 
     pub async fn anime_display_number(&self, anime_id: i64) -> Result<i64> {
@@ -724,7 +774,8 @@ impl Repository {
         let now = Utc::now();
         sqlx::query(
             r#"UPDATE anime SET local_episode_origin = ?, bangumi_episode_origin = ?,
-                   schedule_next_sync_at = ?, schedule_sync_error = NULL, updated_at = ?
+                   total_episodes = NULL, schedule_next_sync_at = ?,
+                   schedule_sync_error = NULL, updated_at = ?
                WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
         )
         .bind(mapping.map(|value| value.local_origin))
@@ -774,9 +825,22 @@ impl Repository {
                 "cannot infer total episodes; enter the completed episode count".into(),
             ));
         }
-        if inferred_total < completed_max {
+        let final_episode_no = match (anime.local_episode_origin, anime.bangumi_episode_origin) {
+            (Some(local_origin), Some(bangumi_origin)) => EpisodeNumberMapping {
+                local_origin,
+                bangumi_origin,
+            }
+            .final_local_episode(inferred_total)?,
+            (None, None) => inferred_total,
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "anime has an incomplete episode number mapping".into(),
+                ));
+            }
+        };
+        if final_episode_no < completed_max {
             return Err(AppError::InvalidInput(format!(
-                "total episodes cannot be lower than completed EP{completed_max}"
+                "the mapped final episode EP{final_episode_no} cannot be lower than completed EP{completed_max}"
             )));
         }
         sqlx::query(
@@ -902,7 +966,20 @@ impl Repository {
         let total_episodes = total_episodes
             .or(anime.total_episodes)
             .unwrap_or(completed_max);
-        if total_episodes <= 0 || total_episodes < completed_max {
+        let final_episode_no = match (anime.local_episode_origin, anime.bangumi_episode_origin) {
+            (Some(local_origin), Some(bangumi_origin)) => EpisodeNumberMapping {
+                local_origin,
+                bangumi_origin,
+            }
+            .final_local_episode(total_episodes)?,
+            (None, None) => total_episodes,
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "anime has an incomplete episode number mapping".into(),
+                ));
+            }
+        };
+        if total_episodes <= 0 || final_episode_no < completed_max {
             return Err(AppError::InvalidInput(
                 "archive total episodes is lower than the completed history".into(),
             ));
@@ -982,20 +1059,19 @@ impl Repository {
         }
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let (lifecycle, total_episodes) = sqlx::query_as::<_, (String, Option<i64>)>(
-            "SELECT lifecycle, total_episodes FROM anime WHERE id = ?",
-        )
-        .bind(anime_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
-        if lifecycle == "archived" {
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if anime.lifecycle == "archived" {
             return Err(AppError::InvalidInput(
                 "archived anime no longer accepts episode videos".into(),
             ));
         }
-        let exclusive_limit = if lifecycle == "released_complete" {
-            total_episodes
+        let exclusive_limit = if anime.lifecycle == "released_complete" {
+            anime
+                .final_episode_no()?
                 .ok_or_else(|| AppError::InvalidInput("anime total episodes is unknown".into()))?
                 + 1
         } else {
@@ -1413,6 +1489,7 @@ impl Repository {
                 bangumi_subject_id = ?, expected_weekday = ?, expected_time = ?, timezone = ?,
                 broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
                 schedule_source = ?, schedule_confidence = ?, schedule_warning = ?,
+                total_episodes = COALESCE(?, total_episodes),
                 schedule_sync_error = NULL, updated_at = ?
                WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
         )
@@ -1426,6 +1503,7 @@ impl Repository {
         .bind(&update.schedule_source)
         .bind(&update.schedule_confidence)
         .bind(update.schedule_warning.as_deref())
+        .bind(update.total_episodes)
         .bind(now)
         .bind(anime_id)
         .execute(&mut *tx)
@@ -1473,6 +1551,7 @@ impl Repository {
         .bind(anime_id)
         .execute(&mut *tx)
         .await?;
+        transition_released_complete_if_final_released(&mut tx, anime_id, now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2473,25 +2552,39 @@ impl Repository {
             .execute(&mut *tx)
             .await?;
 
-        let next_expected = episode
-            .expected_at
-            .and_then(|at| at.checked_add_days(Days::new(7)));
-        let next_check = now + chrono::Duration::hours(6);
-        sqlx::query(
-            r#"INSERT OR IGNORE INTO episode(
-                   anime_id, episode_no, expected_at, state, next_check_at
-               ) SELECT ?, ?, ?, 'waiting', ?
-                 WHERE EXISTS (
-                   SELECT 1 FROM anime WHERE id = ? AND lifecycle = 'tracking'
-                 )"#,
-        )
-        .bind(episode.anime_id)
-        .bind(episode.episode_no + 1)
-        .bind(next_expected)
-        .bind(next_check)
-        .bind(episode.anime_id)
-        .execute(&mut *tx)
-        .await?;
+        let released_complete =
+            transition_released_complete_if_final_released(&mut tx, episode.anime_id, now).await?;
+        if !released_complete {
+            let next_expected = episode
+                .expected_at
+                .and_then(|at| at.checked_add_days(Days::new(7)));
+            let next_check = now + chrono::Duration::hours(6);
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO episode(
+                       anime_id, episode_no, expected_at, state, next_check_at
+                   ) SELECT ?, ?, ?, 'waiting', ?
+                     WHERE EXISTS (
+                       SELECT 1 FROM anime
+                       WHERE id = ? AND lifecycle = 'tracking'
+                         AND (
+                           total_episodes IS NULL OR ? < CASE
+                             WHEN local_episode_origin IS NOT NULL
+                              AND bangumi_episode_origin IS NOT NULL
+                             THEN local_episode_origin + total_episodes - 1
+                             ELSE total_episodes
+                           END
+                         )
+                     )"#,
+            )
+            .bind(episode.anime_id)
+            .bind(episode.episode_no + 1)
+            .bind(next_expected)
+            .bind(next_check)
+            .bind(episode.anime_id)
+            .bind(episode.episode_no)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE candidate SET state = 'expired' WHERE episode_id = ? AND state = 'pending'",
         )
@@ -3473,6 +3566,59 @@ impl Repository {
     }
 }
 
+async fn transition_released_complete_if_final_released(
+    tx: &mut Transaction<'_, Sqlite>,
+    anime_id: i64,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+        .bind(anime_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+    if anime.lifecycle != "tracking" {
+        return Ok(anime.lifecycle == "released_complete");
+    }
+    let Some(final_episode_no) = anime.final_episode_no()? else {
+        return Ok(false);
+    };
+    let final_released = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM episode
+               WHERE anime_id = ? AND episode_no = ?
+                 AND state IN ('confirmed','notified')
+           )"#,
+    )
+    .bind(anime_id)
+    .bind(final_episode_no)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !final_released {
+        return Ok(false);
+    }
+    sqlx::query(
+        r#"DELETE FROM episode
+           WHERE anime_id = ? AND episode_no > ?
+             AND state NOT IN ('confirmed','notified')"#,
+    )
+    .bind(anime_id)
+    .bind(final_episode_no)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"UPDATE anime SET lifecycle = 'released_complete', enabled = 0,
+               released_completed_at = COALESCE(released_completed_at, ?),
+               schedule_next_sync_at = NULL, updated_at = ?
+           WHERE id = ? AND lifecycle = 'tracking'"#,
+    )
+    .bind(now)
+    .bind(now)
+    .bind(anime_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
 fn map_unique_rule_error(error: sqlx::Error) -> AppError {
     match error {
         sqlx::Error::Database(error) if error.is_unique_violation() => {
@@ -3676,10 +3822,10 @@ mod tests {
         assert_eq!(queued[0].bvid, candidate.bvid);
         assert_eq!(queued[0].released_at, candidate.published_at);
 
-        assert_eq!(
-            repository.mark_episode_watched(episode.id).await.unwrap(),
-            (anime_id, episode.episode_no)
-        );
+        let watched = repository.mark_episode_watched(episode.id).await.unwrap();
+        assert_eq!(watched.anime_id, anime_id);
+        assert_eq!(watched.episode_no, episode.episode_no);
+        assert!(watched.auto_archive.is_none());
         repository.mark_episode_watched(episode.id).await.unwrap();
         assert!(repository.watch_queue(50).await.unwrap().is_empty());
         assert!(
@@ -3775,6 +3921,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 328_609,
+                    total_episodes: None,
                     broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
                     episode_mapping: None,
@@ -3987,6 +4134,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_final_episode_completes_then_archives_when_watched() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        sqlx::query("UPDATE anime SET total_episodes = ? WHERE id = ?")
+            .bind(episode.episode_no)
+            .bind(anime_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let (video, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+
+        let completed = repository.get_anime(anime_id).await.unwrap().anime;
+        assert_eq!(completed.lifecycle, "released_complete");
+        assert!(!completed.enabled);
+        assert!(repository.active_episode(anime_id).await.is_err());
+        assert_eq!(repository.watch_queue(50).await.unwrap().len(), 1);
+
+        let watched = repository.mark_episode_watched(episode.id).await.unwrap();
+        let archived = watched.auto_archive.expect("final episode auto archives");
+        assert_eq!(archived.total_episodes, episode.episode_no);
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .lifecycle,
+            "archived"
+        );
+        assert!(repository.watch_queue(50).await.unwrap().is_empty());
+        assert!(repository.episode(episode.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_sync_repairs_a_previously_created_episode_past_the_finale() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("late-total.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "Silent Witch".into(),
+                aliases: vec![],
+                next_episode: 8,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_800,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 501_000,
+                    total_episodes: None,
+                    broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
+                    schedule_source: "danime".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        let (video, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .episode_no,
+            9
+        );
+
+        repository
+            .apply_schedule_update(
+                anime_id,
+                &ScheduleUpdate {
+                    bangumi_subject_id: 501_000,
+                    total_episodes: Some(8),
+                    aliases: vec![],
+                    expected_at: None,
+                    expected_weekday: None,
+                    expected_time: None,
+                    timezone: "Asia/Shanghai".into(),
+                    broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
+                    schedule_source: "danime".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now() + chrono::Duration::days(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let anime = repository.get_anime(anime_id).await.unwrap().anime;
+        assert_eq!(anime.total_episodes, Some(8));
+        assert_eq!(anime.lifecycle, "released_complete");
+        assert!(repository.active_episode(anime_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mapped_subject_count_uses_the_final_local_episode() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mapped-final.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "Re:Zero fourth season second cour".into(),
+                aliases: vec![],
+                next_episode: 19,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_800,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 633_836,
+                    total_episodes: Some(8),
+                    broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
+                    schedule_source: "danime".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: Some(EpisodeNumberMapping {
+                        local_origin: 12,
+                        bangumi_origin: 78,
+                    }),
+                }),
+            })
+            .await
+            .unwrap();
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .final_episode_no()
+                .unwrap(),
+            Some(19)
+        );
+        let (mut video, evaluation) = candidate();
+        video.title = "Re:Zero EP19".into();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification_id = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .lifecycle,
+            "released_complete"
+        );
+        let archived = repository
+            .mark_episode_watched(episode.id)
+            .await
+            .unwrap()
+            .auto_archive
+            .unwrap();
+        assert_eq!(archived.total_episodes, 8);
+    }
+
+    #[tokio::test]
     async fn rejecting_all_pending_candidates_records_feedback() {
         let (_directory, repository, anime_id, episode) = fixture().await;
         let (candidate, evaluation) = candidate();
@@ -4128,6 +4477,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 506_677,
+                    total_episodes: None,
                     broadcast_pattern: "R/2025-07-04T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now() + chrono::Duration::days(1),
                     episode_mapping: Some(EpisodeNumberMapping {
@@ -4147,6 +4497,7 @@ mod tests {
                 anime_id,
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
+                    total_episodes: Some(12),
                     aliases: vec!["沉默魔女".into(), "サイレント・ウィッチ".into()],
                     expected_at: Some(updated_expected),
                     expected_weekday: Some(5),
@@ -4167,6 +4518,7 @@ mod tests {
         assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
         assert_eq!(anime.anime.local_episode_origin, Some(8));
         assert_eq!(anime.anime.bangumi_episode_origin, Some(80));
+        assert_eq!(anime.anime.total_episodes, Some(12));
         assert_eq!(anime.anime.schedule_source.as_deref(), Some("abema"));
         assert_eq!(
             anime.anime.schedule_confidence.as_deref(),
@@ -4181,6 +4533,7 @@ mod tests {
                 anime_id,
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
+                    total_episodes: None,
                     aliases: vec![],
                     expected_at: None,
                     expected_weekday: None,

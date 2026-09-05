@@ -36,6 +36,7 @@ pub struct ScheduleCatalog {
 #[derive(Debug, Clone)]
 pub struct ResolvedSchedule {
     pub bangumi_subject_id: i64,
+    pub total_episodes: Option<i64>,
     pub matched_title: String,
     pub aliases: Vec<String>,
     pub expected_at: Option<DateTime<Utc>>,
@@ -89,7 +90,14 @@ struct BangumiDataSite {
 #[derive(Debug, Deserialize)]
 struct PagedEpisodes {
     #[serde(default)]
+    total: Option<i64>,
+    #[serde(default)]
     data: Vec<BangumiEpisode>,
+}
+
+struct EpisodeLookup {
+    airdate: Option<NaiveDate>,
+    total_episodes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,7 +286,7 @@ impl ScheduleProvider {
             .map(|mapping| mapping.bangumi_origin)
             .unwrap_or(1);
         let mut source_health_error = None;
-        let target_airdate = match self
+        let (target_airdate, subject_episode_count) = match self
             .episode_airdate(
                 bangumi_subject_id,
                 subject_episode_index,
@@ -286,11 +294,11 @@ impl ScheduleProvider {
             )
             .await
         {
-            Ok(value) => value,
+            Ok(value) => (value.airdate, value.total_episodes),
             Err(error) => {
                 warn!(bangumi_subject_id, next_episode, bangumi_episode_no, %error, "Bangumi episode date unavailable; using a lower-confidence schedule");
                 source_health_error = Some(error.to_string());
-                None
+                (None, None)
             }
         };
         let origin_airdate = if subject_episode_index == 1 {
@@ -300,7 +308,7 @@ impl ScheduleProvider {
                 .episode_airdate(bangumi_subject_id, 1, bangumi_origin_episode)
                 .await
             {
-                Ok(value) => value,
+                Ok(value) => value.airdate,
                 Err(error) => {
                     warn!(bangumi_subject_id, bangumi_origin_episode, %error, "Bangumi season origin date unavailable; using a lower-confidence schedule");
                     source_health_error = Some(error.to_string());
@@ -310,6 +318,17 @@ impl ScheduleProvider {
         } else {
             None
         };
+        let total_episodes = subject_episode_count
+            .filter(|total| *total > 0 && *total <= 10_000)
+            .map(|total| {
+                episode_target
+                    .mapping
+                    .map(|mapping| mapping.final_local_episode(total))
+                    .transpose()
+                    .map_err(|error| AppError::Schedule(error.to_string()))
+                    .map(|_| total)
+            })
+            .transpose()?;
         let selected = select_broadcast(item, &self.config, origin_airdate)?;
         let recurrence = parse_recurrence(&selected.pattern)?;
         let expected = expected_at(
@@ -337,6 +356,7 @@ impl ScheduleProvider {
 
         Ok(ResolvedSchedule {
             bangumi_subject_id,
+            total_episodes,
             matched_title: item.title.clone(),
             aliases: item_aliases(item),
             expected_at: expected.expected_at,
@@ -358,7 +378,7 @@ impl ScheduleProvider {
         subject_id: i64,
         subject_episode_index: i64,
         bangumi_episode_no: i64,
-    ) -> Result<Option<NaiveDate>> {
+    ) -> Result<EpisodeLookup> {
         let offset = subject_episode_index - 1;
         let response = self
             .client
@@ -390,8 +410,12 @@ impl ScheduleProvider {
                 "Bangumi episode API returned invalid JSON: {error}"
             ))
         })?;
+        let total_episodes = page.total.filter(|total| *total > 0 && *total <= 10_000);
         let Some(episode) = page.data.first() else {
-            return Ok(None);
+            return Ok(EpisodeLookup {
+                airdate: None,
+                total_episodes,
+            });
         };
         let returned_number = if episode.ep > 0.0 {
             episode.ep
@@ -399,9 +423,12 @@ impl ScheduleProvider {
             episode.sort
         };
         if (returned_number - bangumi_episode_no as f64).abs() > 0.01 {
-            return Ok(None);
+            return Ok(EpisodeLookup {
+                airdate: None,
+                total_episodes,
+            });
         }
-        episode
+        let airdate = episode
             .airdate
             .as_deref()
             .filter(|value| !value.is_empty())
@@ -412,7 +439,11 @@ impl ScheduleProvider {
                     ))
                 })
             })
-            .transpose()
+            .transpose()?;
+        Ok(EpisodeLookup {
+            airdate,
+            total_episodes,
+        })
     }
 }
 
@@ -588,6 +619,7 @@ impl ResolvedSchedule {
     pub fn to_update(&self, next_sync_at: DateTime<Utc>) -> ScheduleUpdate {
         ScheduleUpdate {
             bangumi_subject_id: self.bangumi_subject_id,
+            total_episodes: self.total_episodes,
             aliases: self.aliases.clone(),
             expected_at: self.expected_at,
             expected_weekday: self.expected_weekday,
@@ -1011,6 +1043,7 @@ mod tests {
         assert_eq!(resolved.expected_time.as_deref(), Some("23:00"));
         assert_eq!(resolved.schedule_source, "danime");
         assert_eq!(resolved.schedule_confidence, "calibrated");
+        assert_eq!(resolved.total_episodes, Some(12));
         assert_eq!(requests.await.unwrap(), 3);
     }
 
@@ -1050,6 +1083,7 @@ mod tests {
                 duration_max_sec: 1_800,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 501_000,
+                    total_episodes: None,
                     broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
                     schedule_confidence: "calibrated".into(),
@@ -1138,7 +1172,43 @@ mod tests {
         assert_eq!(resolved.expected_time.as_deref(), Some("21:00"));
         assert_eq!(resolved.schedule_source, "danime");
         assert_eq!(resolved.schedule_confidence, "calibrated");
+        assert_eq!(resolved.total_episodes, Some(8));
+        assert_eq!(
+            EpisodeNumberMapping {
+                local_origin: 12,
+                bangumi_origin: 78,
+            }
+            .final_local_episode(resolved.total_episodes.unwrap())
+            .unwrap(),
+            19
+        );
         assert_eq!(requests.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn episode_count_survives_an_offset_past_the_final_episode() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let headers = String::from_utf8_lossy(request_headers(&request));
+            assert!(headers.contains("offset=12"));
+            let response_body = r#"{"total":12,"data":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let provider = provider(&format!("http://{address}"));
+
+        let lookup = provider.episode_airdate(633_836, 13, 90).await.unwrap();
+
+        assert!(lookup.airdate.is_none());
+        assert_eq!(lookup.total_episodes, Some(12));
+        task.await.unwrap();
     }
 
     #[test]
@@ -1436,12 +1506,12 @@ mod tests {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=501000"));
                     assert!(headers.contains("offset=7"));
-                    r#"{"data":[{"airdate":"2026-08-22","sort":8,"ep":8}]}"#.into()
+                    r#"{"total":12,"data":[{"airdate":"2026-08-22","sort":8,"ep":8}]}"#.into()
                 } else {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=501000"));
                     assert!(headers.contains("offset=0"));
-                    r#"{"data":[{"airdate":"2026-07-04","sort":1,"ep":1}]}"#.into()
+                    r#"{"total":12,"data":[{"airdate":"2026-07-04","sort":1,"ep":1}]}"#.into()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1480,12 +1550,12 @@ mod tests {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=633836"));
                     assert!(headers.contains("offset=2"));
-                    r#"{"data":[{"airdate":"2026-08-26","sort":80,"ep":80}]}"#.into()
+                    r#"{"total":8,"data":[{"airdate":"2026-08-26","sort":80,"ep":80}]}"#.into()
                 } else {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=633836"));
                     assert!(headers.contains("offset=0"));
-                    r#"{"data":[{"airdate":"2026-08-12","sort":78,"ep":78}]}"#.into()
+                    r#"{"total":8,"data":[{"airdate":"2026-08-12","sort":78,"ep":78}]}"#.into()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
