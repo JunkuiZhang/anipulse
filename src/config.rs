@@ -44,7 +44,7 @@ impl AppConfig {
                 "confirmation.consensus_uploaders must be at least 2".into(),
             ));
         }
-        if !(0..=1_000_000_000).contains(&self.confirmation.minimum_auto_confirm_uploader_followers)
+        if !(0..=1_000_000_000).contains(&self.confirmation.minimum_uploader_followers)
             || !(0..=1_000_000_000).contains(&self.confirmation.minimum_auto_confirm_video_views)
         {
             return Err(AppError::Config(
@@ -260,7 +260,8 @@ pub struct ConfirmationConfig {
     pub max_publish_delta_secs: i64,
     pub candidate_expire_secs: i64,
     pub trusted_confirmed_count: i64,
-    pub minimum_auto_confirm_uploader_followers: i64,
+    #[serde(alias = "minimum_auto_confirm_uploader_followers")]
+    pub minimum_uploader_followers: i64,
     pub minimum_auto_confirm_video_views: i64,
 }
 
@@ -274,7 +275,7 @@ impl Default for ConfirmationConfig {
             max_publish_delta_secs: 7_200,
             candidate_expire_secs: 259_200,
             trusted_confirmed_count: 3,
-            minimum_auto_confirm_uploader_followers: 100,
+            minimum_uploader_followers: 100,
             minimum_auto_confirm_video_views: 200,
         }
     }
@@ -496,6 +497,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.schedule.excluded_stream_sites, ["unext"]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn old_follower_threshold_name_remains_compatible() {
+        let config: AppConfig = toml::from_str(
+            r#"
+                [confirmation]
+                minimum_auto_confirm_uploader_followers = 42
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.confirmation.minimum_uploader_followers, 42);
         assert!(config.validate().is_ok());
     }
 }

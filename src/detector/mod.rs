@@ -329,6 +329,14 @@ mod tests {
     }
 
     async fn fixture(mids: &[i64]) -> (TempDir, Repository, Detector, i64) {
+        fixture_with_reputation(mids, 1_000, 10_000).await
+    }
+
+    async fn fixture_with_reputation(
+        mids: &[i64],
+        followers: i64,
+        views: i64,
+    ) -> (TempDir, Repository, Detector, i64) {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("detector.db");
         let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
@@ -362,9 +370,9 @@ mod tests {
                 url: format!("https://www.bilibili.com/video/BVmock{index:05}"),
                 tags: vec![],
                 page_count: Some(1),
-                view_count: Some(10_000),
+                view_count: Some(views),
                 reply_count: Some(20),
-                uploader_follower_count: Some(1_000),
+                uploader_follower_count: Some(followers),
                 discovered_at: now,
                 enriched: false,
             })
@@ -396,6 +404,30 @@ mod tests {
         let (_directory, repository, detector, anime_id) = fixture(&[100, 100]).await;
         let episode = repository.active_episode(anime_id).await.unwrap();
         detector.check_anime(anime_id).await.unwrap();
+        assert_ne!(
+            repository.episode(episode.id).await.unwrap().state,
+            "confirmed"
+        );
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn detector_directly_rejects_tiny_uploaders() {
+        let (_directory, repository, detector, anime_id) =
+            fixture_with_reputation(&[100], 3, 418).await;
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        detector.check_anime(anime_id).await.unwrap();
+
+        assert!(
+            repository
+                .active_candidates(episode.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rejected = repository.list_candidates(Some("rejected")).await.unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].uploader_mid, 100);
         assert_ne!(
             repository.episode(episode.id).await.unwrap().state,
             "confirmed"

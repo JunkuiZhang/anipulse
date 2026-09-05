@@ -159,20 +159,19 @@ pub fn evaluate(
         hard_reject = true;
         reasons.push("uploader is blocked for this anime".into());
     }
-    if candidate.enriched && !trust.manually_trusted {
+    if candidate.enriched {
         let mut reputation_requires_review = false;
-        if confirmation.minimum_auto_confirm_uploader_followers > 0 {
+        if confirmation.minimum_uploader_followers > 0 {
             match candidate.uploader_follower_count {
-                Some(followers)
-                    if followers < confirmation.minimum_auto_confirm_uploader_followers =>
-                {
-                    reputation_requires_review = true;
+                Some(followers) if followers < confirmation.minimum_uploader_followers => {
+                    score -= 100;
+                    hard_reject = true;
                     reasons.push(format!(
-                        "uploader has only {followers} followers; at least {} are required for automatic confirmation",
-                        confirmation.minimum_auto_confirm_uploader_followers
+                        "uploader has only {followers} followers; candidates below the minimum of {} are rejected",
+                        confirmation.minimum_uploader_followers
                     ));
                 }
-                None => {
+                None if !trust.manually_trusted => {
                     reputation_requires_review = true;
                     reasons.push(
                         "uploader follower count is unavailable; automatic confirmation is disabled"
@@ -182,7 +181,7 @@ pub fn evaluate(
                 _ => {}
             }
         }
-        if confirmation.minimum_auto_confirm_video_views > 0 {
+        if !trust.manually_trusted && confirmation.minimum_auto_confirm_video_views > 0 {
             match candidate.view_count {
                 Some(views) if views < confirmation.minimum_auto_confirm_video_views => {
                     reputation_requires_review = true;
@@ -428,9 +427,32 @@ mod tests {
     }
 
     #[test]
-    fn tiny_untrusted_uploader_and_low_engagement_require_review() {
+    fn tiny_uploader_is_hard_rejected() {
         let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
         candidate.uploader_follower_count = Some(3);
+        candidate.view_count = Some(418);
+        candidate.reply_count = Some(0);
+        let evaluation = evaluate(
+            &anime,
+            &episode,
+            &candidate,
+            &UploaderTrust::default(),
+            &ConfirmationConfig::default(),
+            &[],
+        );
+        assert!(evaluation.hard_reject);
+        assert!(!evaluation.manual_review);
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("only 3 followers"))
+        );
+    }
+
+    #[test]
+    fn low_engagement_requires_review() {
+        let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
         candidate.view_count = Some(136);
         candidate.reply_count = Some(0);
         let evaluation = evaluate(
@@ -447,21 +469,15 @@ mod tests {
             evaluation
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("only 3 followers"))
-        );
-        assert!(
-            evaluation
-                .reasons
-                .iter()
                 .any(|reason| reason.contains("136 views, 0 replies"))
         );
     }
 
     #[test]
-    fn explicit_uploader_trust_bypasses_only_reputation_gate() {
+    fn explicit_uploader_trust_does_not_bypass_follower_gate() {
         let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
         candidate.uploader_follower_count = Some(3);
-        candidate.view_count = Some(136);
+        candidate.view_count = Some(10_000);
         let trust = UploaderTrust {
             manually_trusted: true,
             ..UploaderTrust::default()
@@ -474,7 +490,7 @@ mod tests {
             &ConfirmationConfig::default(),
             &[],
         );
-        assert!(!evaluation.hard_reject);
+        assert!(evaluation.hard_reject);
         assert!(!evaluation.manual_review);
     }
 
