@@ -18,10 +18,13 @@ use feishu::FeishuWebhookNotifier;
 use feishu_app::FeishuAppNotifier;
 
 fn source_alert_label(source: &str) -> String {
-    source
-        .strip_prefix("bangumi-schedule:")
-        .map(|subject_id| format!("Bangumi #{subject_id} 章节排期"))
-        .unwrap_or_else(|| source.to_string())
+    if let Some(subject_id) = source.strip_prefix("bangumi-schedule:") {
+        format!("Bangumi #{subject_id} 章节排期")
+    } else if let Some(subject_id) = source.strip_prefix("anilist-schedule:") {
+        format!("未上映条目 #{subject_id} 的 Bangumi/AniList 排期")
+    } else {
+        source.to_string()
+    }
 }
 
 #[async_trait]

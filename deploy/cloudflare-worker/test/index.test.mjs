@@ -22,9 +22,48 @@ test("only exposes the exact AniPulse upstream routes", () => {
   );
   assert.equal(resolveRoute(new URL("https://proxy.example.com/data.json?url=evil")), null);
   assert.equal(resolveRoute(new URL("https://proxy.example.com/bangumi/v0/users/me")), null);
+  assert.equal(
+    resolveRoute(new URL("https://proxy.example.com/bangumi/v0/subjects/568244")).upstreamUrl,
+    "https://api.bgm.tv/v0/subjects/568244",
+  );
   assert.equal(resolveRoute(new URL(
     "https://proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=100&offset=0",
   )), null);
+});
+
+test("only forwards AniPulse's two fixed AniList queries", async () => {
+  const calls = [];
+  const env = { ALLOWED_CLIENT_IPS: CLIENT_IP };
+  const request = new Request("https://proxy.example.com/anilist/graphql", {
+    method: "POST",
+    headers: {
+      "CF-Connecting-IP": CLIENT_IP,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      operationName: "AniPulseSearch",
+      query: "mutation Evil { DeleteEverything }",
+      variables: { search: "薬屋のひとりごと 第3期", seasonYear: 2026 },
+    }),
+  });
+  const response = await worker.fetch(request, env, immediateContext(), {
+    cache: null,
+    fetch: async (url, init) => {
+      calls.push({ url, init });
+      return new Response('{"data":{"Page":{"media":[]}}}', {
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(calls[0].url, "https://graphql.anilist.co");
+  const forwarded = JSON.parse(calls[0].init.body);
+  assert.equal(forwarded.operationName, "AniPulseSearch");
+  assert.match(forwarded.query, /type: ANIME/);
+  assert.doesNotMatch(forwarded.query, /DeleteEverything/);
+
+  const rejected = authorizedRequest("https://proxy.example.com/anilist/graphql", "GET");
+  assert.equal((await worker.fetch(rejected, env, immediateContext())).status, 405);
 });
 
 test("fails closed when the allowlist is missing and rejects other clients", async () => {

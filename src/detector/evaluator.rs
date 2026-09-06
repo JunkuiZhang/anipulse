@@ -309,6 +309,7 @@ mod tests {
                     id: 1,
                     title: "Silent Witch".into(),
                     bangumi_subject_id: None,
+                    anilist_media_id: None,
                     expected_weekday: None,
                     expected_time: None,
                     timezone: "Asia/Shanghai".into(),

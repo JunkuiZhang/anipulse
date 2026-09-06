@@ -10,7 +10,7 @@ use anipulse::{
     notification::NotificationDispatcher,
     provider::BilibiliProvider,
     repository::Repository,
-    schedule::{ScheduleProvider, ScheduleSynchronizer},
+    schedule::{AutoScheduleRequest, ScheduleProvider, ScheduleSynchronizer},
     scheduler,
 };
 use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
@@ -130,6 +130,12 @@ struct AddAnimeArgs {
     auto_schedule: bool,
     #[arg(long, requires = "auto_schedule")]
     bangumi_id: Option<i64>,
+    #[arg(
+        long,
+        requires_all = ["auto_schedule", "bangumi_id"],
+        help = "explicit AniList media ID for a Bangumi subject missing from bangumi-data"
+    )]
+    anilist_id: Option<i64>,
     #[arg(
         long,
         requires_all = ["auto_schedule", "bangumi_episode_start"],
@@ -477,28 +483,19 @@ async fn handle_anime(
             {
                 let provider = ScheduleProvider::new(config.schedule.clone())?;
                 let catalog = provider.load_catalog().await?;
-                let resolved = if let Some(mapping) = episode_mapping {
-                    provider
-                        .resolve_with_mapping(
-                            &catalog,
-                            &args.title,
-                            args.bangumi_id,
-                            args.next_episode,
-                            mapping,
-                            &args.timezone,
-                        )
-                        .await?
-                } else {
-                    provider
-                        .resolve(
-                            &catalog,
-                            &args.title,
-                            args.bangumi_id,
-                            args.next_episode,
-                            &args.timezone,
-                        )
-                        .await?
-                };
+                let resolved = provider
+                    .resolve_auto(
+                        &catalog,
+                        AutoScheduleRequest {
+                            title: &args.title,
+                            subject_id: args.bangumi_id,
+                            next_episode: args.next_episode,
+                            episode_mapping,
+                            anilist_media_id: args.anilist_id,
+                            timezone: &args.timezone,
+                        },
+                    )
+                    .await?;
                 aliases.extend(resolved.aliases.iter().cloned());
                 let mapped_episode = episode_mapping
                     .and_then(|mapping| mapping.mapped_numbers(args.next_episode).ok())
@@ -539,6 +536,7 @@ async fn handle_anime(
                     resolved.expected_at,
                     Some(AutoScheduleMetadata {
                         bangumi_subject_id: resolved.bangumi_subject_id,
+                        anilist_media_id: resolved.anilist_media_id,
                         total_episodes: resolved.total_episodes,
                         broadcast_pattern: resolved.broadcast_pattern,
                         schedule_source: resolved.schedule_source,
@@ -630,6 +628,9 @@ async fn handle_anime(
             println!("auto schedule: {}", anime.anime.auto_schedule);
             if let Some(subject_id) = anime.anime.bangumi_subject_id {
                 println!("Bangumi subject: {subject_id}");
+            }
+            if let Some(media_id) = anime.anime.anilist_media_id {
+                println!("AniList media: {media_id}");
             }
             if let Some((local_origin, bangumi_origin)) = anime
                 .anime

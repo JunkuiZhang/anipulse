@@ -7,7 +7,7 @@
 {% else if failed %}
 <div class="alert">解析失败：{{ error }}</div>
 {% else %}
-<section class="panel details"><dl><dt>输入标题</dt><dd>{{ title }}</dd><dt>匹配标题</dt><dd>{{ matched_title }}</dd><dt>Bangumi ID</dt><dd>{{ bangumi_id }}</dd><dt>等待集数</dt><dd>EP{{ next_episode }}</dd>{% if has_total_episodes %}<dt>正篇集数</dt><dd>{{ total_episodes }}</dd>{% endif %}{% if has_episode_mapping %}<dt>集数映射</dt><dd>{{ episode_mapping }}</dd>{% endif %}<dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>排期来源</dt><dd>{{ schedule_source }} · {{ schedule_confidence }}</dd><dt>别名</dt><dd>{{ aliases }}</dd><dt>时长</dt><dd>{{ duration }}</dd></dl></section>
+<section class="panel details"><dl><dt>输入标题</dt><dd>{{ title }}</dd><dt>匹配标题</dt><dd>{{ matched_title }}</dd><dt>Bangumi ID</dt><dd>{{ bangumi_id }}</dd><dt>AniList ID</dt><dd>{{ anilist_id }}</dd><dt>等待集数</dt><dd>EP{{ next_episode }}</dd>{% if has_total_episodes %}<dt>正篇集数</dt><dd>{{ total_episodes }}</dd>{% endif %}{% if has_episode_mapping %}<dt>集数映射</dt><dd>{{ episode_mapping }}</dd>{% endif %}<dt>预计更新</dt><dd>{{ expected_at }}</dd><dt>排期来源</dt><dd>{{ schedule_source }} · {{ schedule_confidence }}</dd><dt>别名</dt><dd>{{ aliases }}</dd><dt>时长</dt><dd>{{ duration }}</dd></dl></section>
 {% if has_warning %}<div class="alert">{{ warning }}</div>{% endif %}
 <form method="post" action="/anime" class="stack">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

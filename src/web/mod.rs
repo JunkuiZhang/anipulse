@@ -790,6 +790,7 @@ struct AnimeResolveForm {
     timezone: String,
     auto_schedule: Option<String>,
     bangumi_id: Option<String>,
+    anilist_id: Option<String>,
     search_episode_start: Option<String>,
     bangumi_episode_start: Option<String>,
 }
@@ -803,6 +804,19 @@ fn parse_optional_bangumi_id(value: Option<&str>) -> Result<Option<i64>> {
         .map_err(|_| AppError::InvalidInput("Bangumi ID 必须是正整数".into()))?;
     if id <= 0 {
         return Err(AppError::InvalidInput("Bangumi ID 必须是正整数".into()));
+    }
+    Ok(Some(id))
+}
+
+fn parse_optional_anilist_id(value: Option<&str>) -> Result<Option<i64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let id = value
+        .parse::<i64>()
+        .map_err(|_| AppError::InvalidInput("AniList ID 必须是正整数".into()))?;
+    if id <= 0 {
+        return Err(AppError::InvalidInput("AniList ID 必须是正整数".into()));
     }
     Ok(Some(id))
 }
@@ -854,6 +868,7 @@ async fn anime_resolve(
         .ok_or_else(|| WebError::bad_request("时长超出范围"))?;
     let auto_schedule = form.auto_schedule.as_deref() == Some("yes");
     let bangumi_id = parse_optional_bangumi_id(form.bangumi_id.as_deref())?;
+    let anilist_id = parse_optional_anilist_id(form.anilist_id.as_deref())?;
     let episode_mapping = parse_episode_mapping(
         form.search_episode_start.as_deref(),
         form.bangumi_episode_start.as_deref(),
@@ -871,6 +886,7 @@ async fn anime_resolve(
                 duration_max_sec,
                 auto_schedule,
                 bangumi_id: auto_schedule.then_some(bangumi_id).flatten(),
+                anilist_id: auto_schedule.then_some(anilist_id).flatten(),
                 episode_mapping,
             },
         )
@@ -899,6 +915,7 @@ struct AnimeDraftTemplate {
     title: String,
     matched_title: String,
     bangumi_id: String,
+    anilist_id: String,
     next_episode: i64,
     total_episodes: String,
     has_total_episodes: bool,
@@ -930,6 +947,7 @@ async fn anime_draft(
         title,
         matched_title,
         bangumi_id,
+        anilist_id,
         next_episode,
         total_episodes,
         expected_at,
@@ -974,6 +992,10 @@ async fn anime_draft(
                 .bangumi_subject_id
                 .map(|id| format!("#{id}"))
                 .unwrap_or_else(|| "未绑定".into()),
+            resolved
+                .anilist_media_id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "未使用".into()),
             resolved.next_episode,
             total_episodes,
             format_time(resolved.expected_at, state.display_timezone),
@@ -1005,6 +1027,7 @@ async fn anime_draft(
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
             0,
             String::new(),
             String::new(),
@@ -1026,6 +1049,7 @@ async fn anime_draft(
         title,
         matched_title,
         bangumi_id,
+        anilist_id,
         next_episode,
         has_total_episodes: !total_episodes.is_empty(),
         total_episodes,
@@ -1097,6 +1121,7 @@ struct AnimeDetailTemplate {
     next_check: String,
     duration: String,
     bangumi: String,
+    anilist: String,
     total_episodes: String,
     has_total_episodes: bool,
     episode_mapping: String,
@@ -1342,6 +1367,11 @@ async fn anime_detail(
             .bangumi_subject_id
             .map(|id| format!("#{id}"))
             .unwrap_or_else(|| "未绑定".into()),
+        anilist: anime
+            .anime
+            .anilist_media_id
+            .map(|id| format!("#{id}"))
+            .unwrap_or_else(|| "未使用".into()),
         has_total_episodes: !total_episodes.is_empty(),
         total_episodes,
         has_episode_mapping: !episode_mapping.is_empty(),
@@ -3172,6 +3202,7 @@ fn schedule_source_label(source: &str) -> String {
         "abema" => "ABEMA".into(),
         "gamer" => "巴哈姆特动画疯".into(),
         "gamer_hk" => "巴哈姆特动画疯（香港）".into(),
+        "anilist" => "AniList 精确播出时刻".into(),
         "bangumi-data" => "bangumi-data 默认时段".into(),
         "unknown" => "未知".into(),
         value => value.to_string(),
@@ -3534,6 +3565,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 633_836,
+                    anilist_media_id: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),

@@ -13,7 +13,7 @@ use crate::{
     error::{AppError, Result},
     provider::{BilibiliProvider, VideoSearchProvider},
     repository::{AnimeArchiveSummary, EpisodeRepairSummary, Repository},
-    schedule::ScheduleProvider,
+    schedule::{AutoScheduleRequest, ScheduleProvider},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +47,8 @@ pub struct AnimeDraftRequest {
     pub auto_schedule: bool,
     pub bangumi_id: Option<i64>,
     #[serde(default)]
+    pub anilist_id: Option<i64>,
+    #[serde(default)]
     pub episode_mapping: Option<EpisodeNumberMapping>,
 }
 
@@ -63,6 +65,8 @@ pub struct AnimeDraftResolution {
     pub duration_min_sec: i64,
     pub duration_max_sec: i64,
     pub bangumi_subject_id: Option<i64>,
+    #[serde(default)]
+    pub anilist_media_id: Option<i64>,
     #[serde(default)]
     pub total_episodes: Option<i64>,
     pub broadcast_pattern: Option<String>,
@@ -92,6 +96,7 @@ impl AnimeDraftResolution {
             auto_schedule: self.bangumi_subject_id.zip(self.broadcast_pattern).map(
                 |(bangumi_subject_id, broadcast_pattern)| AutoScheduleMetadata {
                     bangumi_subject_id,
+                    anilist_media_id: self.anilist_media_id,
                     total_episodes: self.total_episodes,
                     broadcast_pattern,
                     schedule_source: self.schedule_source.unwrap_or_else(|| "unknown".into()),
@@ -513,6 +518,7 @@ impl ApplicationService {
                 duration_min_sec: request.duration_min_sec,
                 duration_max_sec: request.duration_max_sec,
                 bangumi_subject_id: None,
+                anilist_media_id: None,
                 total_episodes: None,
                 broadcast_pattern: None,
                 schedule_source: None,
@@ -546,28 +552,19 @@ impl ApplicationService {
             .map_err(|_| AppError::InvalidInput("anime draft payload is invalid".into()))?;
         let provider = ScheduleProvider::new(self.config.schedule.clone())?;
         let catalog = provider.load_catalog().await?;
-        let resolved = if let Some(mapping) = request.episode_mapping {
-            provider
-                .resolve_with_mapping(
-                    &catalog,
-                    &request.title,
-                    request.bangumi_id,
-                    request.next_episode,
-                    mapping,
-                    &request.timezone,
-                )
-                .await?
-        } else {
-            provider
-                .resolve(
-                    &catalog,
-                    &request.title,
-                    request.bangumi_id,
-                    request.next_episode,
-                    &request.timezone,
-                )
-                .await?
-        };
+        let resolved = provider
+            .resolve_auto(
+                &catalog,
+                AutoScheduleRequest {
+                    title: &request.title,
+                    subject_id: request.bangumi_id,
+                    next_episode: request.next_episode,
+                    episode_mapping: request.episode_mapping,
+                    anilist_media_id: request.anilist_id,
+                    timezone: &request.timezone,
+                },
+            )
+            .await?;
         let input = normalize_title(&request.title);
         let matched = std::iter::once(&resolved.matched_title)
             .chain(resolved.aliases.iter())
@@ -595,6 +592,7 @@ impl ApplicationService {
             duration_min_sec: request.duration_min_sec,
             duration_max_sec: request.duration_max_sec,
             bangumi_subject_id: Some(resolved.bangumi_subject_id),
+            anilist_media_id: resolved.anilist_media_id,
             total_episodes: resolved.total_episodes,
             broadcast_pattern: Some(resolved.broadcast_pattern),
             schedule_source: Some(resolved.schedule_source),
@@ -663,9 +661,14 @@ fn validate_anime_draft(request: &AnimeDraftRequest) -> Result<()> {
         .timezone
         .parse::<Tz>()
         .map_err(|_| AppError::InvalidInput("timezone is invalid".into()))?;
-    if !request.auto_schedule && request.bangumi_id.is_some() {
+    if !request.auto_schedule && (request.bangumi_id.is_some() || request.anilist_id.is_some()) {
         return Err(AppError::InvalidInput(
-            "Bangumi ID requires automatic scheduling".into(),
+            "Bangumi/AniList ID requires automatic scheduling".into(),
+        ));
+    }
+    if request.anilist_id.is_some() && request.bangumi_id.is_none() {
+        return Err(AppError::InvalidInput(
+            "AniList ID requires a Bangumi ID so the mapping can be verified".into(),
         ));
     }
     if let Some(mapping) = request.episode_mapping {

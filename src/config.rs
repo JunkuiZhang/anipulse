@@ -120,6 +120,7 @@ impl AppConfig {
                 "schedule.bangumi_api_base_url",
                 &self.schedule.bangumi_api_base_url,
             ),
+            ("schedule.anilist_api_url", &self.schedule.anilist_api_url),
         ] {
             let url = url::Url::parse(value)
                 .map_err(|_| AppError::Config(format!("{name} must be a valid URL")))?;
@@ -334,6 +335,7 @@ impl Default for NotificationConfig {
 pub struct ScheduleConfig {
     pub bangumi_data_url: String,
     pub bangumi_api_base_url: String,
+    pub anilist_api_url: String,
     pub preferred_site: String,
     pub stream_site_priority: Vec<String>,
     pub excluded_stream_sites: Vec<String>,
@@ -351,6 +353,7 @@ impl Default for ScheduleConfig {
         Self {
             bangumi_data_url: "https://unpkg.com/bangumi-data@0.3/dist/data.json".into(),
             bangumi_api_base_url: "https://api.bgm.tv".into(),
+            anilist_api_url: "https://graphql.anilist.co".into(),
             preferred_site: "bilibili".into(),
             stream_site_priority: vec![
                 "danime".into(),

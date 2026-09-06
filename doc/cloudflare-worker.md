@@ -1,6 +1,6 @@
-# 使用 Cloudflare Worker 转发 Bangumi 数据
+# 使用 Cloudflare Worker 转发排期元数据
 
-这个方案不替换 AniPulse 的排期来源：排期仍然来自 `bangumi-data`，章节日期和封面仍然来自 Bangumi。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
+这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的日文标题、首播日期和类型匹配 AniList 的精确开播时刻。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
 新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 d Anime、ABEMA 或动画疯等网络时段，并默认排除不可靠的 U-NEXT 排期。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
 
@@ -9,10 +9,12 @@
   └── https://bgm-proxy.example.com
         ├── /data.json                  → unpkg 上的 bangumi-data
         ├── /bangumi/v0/episodes        → api.bgm.tv 章节 API
-        └── /bangumi/v0/subjects/...    → api.bgm.tv，并在 Worker 内跟随封面重定向
+        ├── /bangumi/v0/subjects/:id    → api.bgm.tv 条目元数据
+        ├── /bangumi/v0/subjects/...    → api.bgm.tv，并在 Worker 内跟随封面重定向
+        └── /anilist/graphql            → AniList，仅允许两个固定只读查询
 ```
 
-Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不是通用反向代理：只接受 AniPulse 当前使用的三个固定路由、严格校验查询参数，并只允许配置的服务器出口 IP。
+Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不是通用反向代理：只接受 AniPulse 当前使用的固定路由、严格校验查询参数和 AniList 操作名，并只允许配置的服务器出口 IP。客户端传来的 GraphQL 文本不会原样转发，Worker 会按操作名重新构造仓库内置的只读查询，因此不能借它执行任意 GraphQL 请求或 mutation。
 
 ## 1. 前提
 
@@ -186,6 +188,20 @@ curl -fsS \
   'https://bgm-proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=1&offset=8'
 ```
 
+检查 Bangumi 条目元数据：
+
+```bash
+curl -fsS https://bgm-proxy.example.com/bangumi/v0/subjects/568244
+```
+
+检查 AniList 固定 ID 查询。请求体里的 `query` 只是兼容 GraphQL 客户端；Worker 会丢弃它并使用内置只读查询：
+
+```bash
+curl -fsS -X POST https://bgm-proxy.example.com/anilist/graphql \
+  -H 'content-type: application/json' \
+  --data '{"operationName":"AniPulseMedia","query":"query placeholder","variables":{"id":195516}}'
+```
+
 排期校准会分别读取目标集和本季起始集，因此也要确认 `offset=0` 可用。Worker 允许的是经过校验的任意非负 `offset`，不是只放行某一个集数：
 
 ```bash
@@ -219,6 +235,7 @@ sudo cp -a /etc/anipulse/config.toml /etc/anipulse/config.toml.before-worker
 [schedule]
 bangumi_data_url = "https://bgm-proxy.example.com/data.json"
 bangumi_api_base_url = "https://bgm-proxy.example.com/bangumi"
+anilist_api_url = "https://bgm-proxy.example.com/anilist/graphql"
 preferred_site = "bilibili"
 stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
 excluded_stream_sites = ["unext"]
@@ -226,7 +243,7 @@ max_stream_offset_days = 14
 max_catalog_offset_days = 1
 ```
 
-`bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加 `/v0/episodes` 和封面路径。
+`bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加章节、条目和封面路径。`anilist_api_url` 必须写完整的 `/anilist/graphql`。
 
 `stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。`excluded_stream_sites` 会先排除不可信来源，默认禁用 U-NEXT；即使旧配置的优先列表里还保留 `unext`，缺省排除规则仍会生效。AniPulse 会在本地比较 `/data.json` 中的其余候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
 
@@ -261,7 +278,9 @@ Worker 使用以下边缘缓存时间：
 |---|---:|---:|
 | `bangumi-data` | 6 小时 | 5 分钟 |
 | 章节日期 | 15 分钟 | 1 分钟 |
+| Bangumi 条目元数据 | 15 分钟 | 1 分钟 |
 | 封面 | 30 天 | 1 天 |
+| AniList 查询 | 不缓存 | 不缓存 |
 
 封面下载到 AniPulse 服务器后，还有现有的 7 天服务器缓存和浏览器条件缓存。删除番剧时，AniPulse 会按现有清理逻辑删除不再被数据库引用的本地封面；Cloudflare 上的匿名公共封面缓存会在 TTL 到期后自然淘汰。
 
@@ -269,7 +288,7 @@ Worker 使用以下边缘缓存时间：
 
 ### 更新 Worker
 
-本次“电视/网络排期校准”没有增加 Worker 路由：如果当前 Worker 已经来自本仓库，并且上面的 `offset=0` 与目标集请求都成功，只升级 AniPulse 二进制即可，不必重新部署 Worker。
+本次“未上映作品 AniList fallback”增加了 Bangumi 条目和 AniList 两条固定路由。升级 AniPulse 二进制前，必须先把新版 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 完整粘贴到网页编辑器并 Deploy；旧 Worker 会令新功能返回 404/405。
 
 以后仓库中的 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 有更新时，可完全通过网页升级：
 
@@ -278,7 +297,7 @@ Worker 使用以下边缘缓存时间：
 3. 点击 **Edit code**，用仓库中 `src/index.js` 的完整内容替换旧代码；
 4. 点击 **Deploy**；域名、Secret 和现有变量会保留；
 5. 如果路由/解析逻辑改变或怀疑命中了旧缓存，把 `CACHE_VERSION` 从例如 `v1` 改成 `v2`，然后再次部署；
-6. 回到 ECS，依次验证 `/healthz`、`/data.json`、两个章节 offset 和封面，再重启 AniPulse 两个服务。
+6. 回到 ECS，依次验证 `/healthz`、`/data.json`、Bangumi 条目、两个章节 offset、AniList 查询和封面，再重启 AniPulse 两个服务。
 
 更新前可把网页编辑器中的旧代码保存到本地作为回滚副本。若新版本异常，重新粘贴旧代码并 Deploy；不要在文档、Git、截图或聊天记录中暴露实际出口 IP 与 Secret。
 

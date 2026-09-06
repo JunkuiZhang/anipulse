@@ -292,6 +292,7 @@ impl Repository {
         let now = Utc::now();
         let (
             bangumi_subject_id,
+            anilist_media_id,
             total_episodes,
             auto_schedule,
             broadcast_pattern,
@@ -309,6 +310,7 @@ impl Repository {
                 let mapping = metadata.episode_mapping;
                 (
                     Some(metadata.bangumi_subject_id),
+                    metadata.anilist_media_id,
                     metadata.total_episodes,
                     true,
                     Some(metadata.broadcast_pattern.as_str()),
@@ -322,20 +324,21 @@ impl Repository {
                 )
             })
             .unwrap_or((
-                None, None, false, None, None, None, None, None, None, None, None,
+                None, None, None, false, None, None, None, None, None, None, None, None,
             ));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
-                title, bangumi_subject_id, expected_weekday, expected_time, timezone,
+                title, bangumi_subject_id, anilist_media_id, expected_weekday, expected_time, timezone,
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
                 auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
                 schedule_source, schedule_confidence, schedule_warning,
                 local_episode_origin, bangumi_episode_origin, total_episodes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
+        .bind(anilist_media_id)
         .bind(new.expected_weekday)
         .bind(new.expected_time.as_deref())
         .bind(&new.timezone)
@@ -374,6 +377,10 @@ impl Repository {
             .await?;
         }
 
+        let initial_check_at = new
+            .expected_at
+            .filter(|expected_at| *expected_at > now)
+            .unwrap_or(now);
         sqlx::query(
             r#"INSERT INTO episode(
                 anime_id, episode_no, expected_at, state, next_check_at
@@ -383,7 +390,7 @@ impl Repository {
         .bind(new.next_episode)
         .bind(new.expected_at)
         .bind(EpisodeState::Watching.to_string())
-        .bind(now)
+        .bind(initial_check_at)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1486,7 +1493,8 @@ impl Repository {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"UPDATE anime SET
-                bangumi_subject_id = ?, expected_weekday = ?, expected_time = ?, timezone = ?,
+                bangumi_subject_id = ?, anilist_media_id = COALESCE(?, anilist_media_id),
+                expected_weekday = ?, expected_time = ?, timezone = ?,
                 broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
                 schedule_source = ?, schedule_confidence = ?, schedule_warning = ?,
                 total_episodes = COALESCE(?, total_episodes),
@@ -1494,6 +1502,7 @@ impl Repository {
                WHERE id = ? AND auto_schedule = 1 AND lifecycle = 'tracking'"#,
         )
         .bind(update.bangumi_subject_id)
+        .bind(update.anilist_media_id)
         .bind(update.expected_weekday)
         .bind(&update.expected_time)
         .bind(&update.timezone)
@@ -1541,13 +1550,17 @@ impl Repository {
             }
         }
 
+        let next_check_at = update
+            .expected_at
+            .filter(|expected_at| *expected_at > now)
+            .unwrap_or(now);
         sqlx::query(
             r#"UPDATE episode SET expected_at = ?, next_check_at = ?
                WHERE anime_id = ? AND state IN
                    ('waiting','watching','candidate_found','needs_manual_review')"#,
         )
         .bind(update.expected_at)
-        .bind(now)
+        .bind(next_check_at)
         .bind(anime_id)
         .execute(&mut *tx)
         .await?;
@@ -3921,6 +3934,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 328_609,
+                    anilist_media_id: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
@@ -4197,6 +4211,7 @@ mod tests {
                 duration_max_sec: 1_800,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 501_000,
+                    anilist_media_id: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
@@ -4237,6 +4252,7 @@ mod tests {
                 anime_id,
                 &ScheduleUpdate {
                     bangumi_subject_id: 501_000,
+                    anilist_media_id: None,
                     total_episodes: Some(8),
                     aliases: vec![],
                     expected_at: None,
@@ -4277,6 +4293,7 @@ mod tests {
                 duration_max_sec: 1_800,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 633_836,
+                    anilist_media_id: None,
                     total_episodes: Some(8),
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
@@ -4477,6 +4494,7 @@ mod tests {
                 duration_max_sec: 1_680,
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 506_677,
+                    anilist_media_id: Some(195_516),
                     total_episodes: None,
                     broadcast_pattern: "R/2025-07-04T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now() + chrono::Duration::days(1),
@@ -4497,6 +4515,7 @@ mod tests {
                 anime_id,
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
+                    anilist_media_id: None,
                     total_episodes: Some(12),
                     aliases: vec!["沉默魔女".into(), "サイレント・ウィッチ".into()],
                     expected_at: Some(updated_expected),
@@ -4516,6 +4535,7 @@ mod tests {
         let anime = repository.get_anime(anime_id).await.unwrap();
         assert!(anime.anime.auto_schedule);
         assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
+        assert_eq!(anime.anime.anilist_media_id, Some(195_516));
         assert_eq!(anime.anime.local_episode_origin, Some(8));
         assert_eq!(anime.anime.bangumi_episode_origin, Some(80));
         assert_eq!(anime.anime.total_episodes, Some(12));
@@ -4527,12 +4547,14 @@ mod tests {
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));
+        assert_eq!(episode.next_check_at, updated_expected);
 
         repository
             .apply_schedule_update(
                 anime_id,
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
+                    anilist_media_id: None,
                     total_episodes: None,
                     aliases: vec![],
                     expected_at: None,

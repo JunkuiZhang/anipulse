@@ -174,6 +174,7 @@ review_grace_secs = 3600
 [schedule]
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
+anilist_api_url = "https://graphql.anilist.co"
 preferred_site = "bilibili"
 stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
 excluded_stream_sites = ["unext"]
@@ -193,6 +194,8 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 安装鉴权网页后可以把 `notify_pending` 改为 `true`：无法自动确认时，飞书会发送指向登录审核页的橙色卡片。网页、Caddy、Secret、管理员和 systemd 的完整步骤见 [`web-deployment.md`](web-deployment.md)。在 `web.public_url` 尚未能通过 HTTPS 访问前保持 `false`。
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
+
+尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的日文标题、首播日期和类型，再到 AniList 查找唯一高置信结果；成功后把 AniList Media ID 持久化，后续不再依赖模糊标题搜索。若没有唯一结果，添加会停止并列出候选，核对后可在网页高级选项或 CLI 的 `--anilist-id` 中指定。AniList ID 不能脱离 Bangumi ID 单独填写，两者会在保存前交叉校验。
 
 AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。显式的 `preferred_site` 有具体时刻时优先使用它；否则程序会比较 `stream_site_priority` 中的全部可用排期，采用至少两个独立平台在 2 小时内相互印证的最早档期。列表顺序只用于同时间决胜，或完全没有平台共识时的保守回退；`gamer` 与 `gamer_hk` 属于同一平台，不会被错误算作两票。`excluded_stream_sites` 会在选择前排除不可信来源，默认禁用 U-NEXT；旧配置没有这个字段时也会继承该默认值。这里读取的只是 `bangumi-data` JSON 元数据，阿里云服务器不会直接访问 d Anime、ABEMA 或动画疯的网站。
 
@@ -421,7 +424,7 @@ sudo systemctl --no-pager --full status anipulse.service anipulse-web.service
 sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
 ```
 
-SQLite migration 会在启动时自动执行。本次排期升级会保留追番、候选和历史视频；对于正在使用 U-NEXT 的条目，会清除其旧预计时间并标记为“尽快重新同步”，避免同步失败时继续展示不可信时间。同步成功后网页详情会显示新的“排期来源”和“校准状态”。旧配置即使没有 `excluded_stream_sites` 也会默认排除 U-NEXT，但建议按第 5 节显式补上，方便以后调整。
+SQLite migration 会在启动时自动执行。本次升级会保留追番、候选和历史视频，并新增可空的 AniList 映射列。升级 Worker 后，建议按第 5 节补上 `anilist_api_url`；旧配置缺少该字段时会使用官方直连地址。对于正在使用 U-NEXT 的旧条目，迁移仍会清除其旧预计时间并标记为“尽快重新同步”，避免同步失败时继续展示不可信时间。同步成功后网页详情会显示新的“排期来源”和“校准状态”。
 
 如需立即核对单个条目，可执行：
 
