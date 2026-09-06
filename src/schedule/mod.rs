@@ -886,19 +886,50 @@ fn anilist_matches_subject(
     subject_date: Option<NaiveDate>,
     media: &AniListMedia,
 ) -> bool {
-    let subject_native = normalize_title(&subject.name);
-    let Some(media_native) = media.title.native.as_deref().map(normalize_title) else {
+    let subject_titles = [&subject.name, &subject.name_cn]
+        .into_iter()
+        .map(|value| normalize_title(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let media_primary_titles = media
+        .title
+        .native
+        .iter()
+        .chain(media.title.romaji.iter())
+        .chain(media.title.english.iter())
+        .map(|value| normalize_title(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let media_titles = media_primary_titles
+        .iter()
+        .cloned()
+        .chain(media.synonyms.iter().map(|value| normalize_title(value)))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if subject_titles.is_empty() || media_titles.is_empty() {
         return false;
-    };
-    let exact_native = subject_native == media_native;
-    if !equivalent_native_title(&subject_native, &media_native) {
+    }
+    let exact_title = subject_titles
+        .iter()
+        .any(|subject| media_titles.iter().any(|media| subject == media));
+    let exact_primary_title = subject_titles
+        .iter()
+        .any(|subject| media_primary_titles.iter().any(|media| subject == media));
+    let equivalent_title = exact_title
+        || subject_titles.iter().any(|subject| {
+            media_titles
+                .iter()
+                .any(|media| equivalent_title_spelling(subject, media))
+        });
+    if !equivalent_title {
         return false;
     }
     let media_date = anilist_date(&media.start_date);
-    // A one-character difference is accepted only with an exact date match. This
-    // covers Japanese old/new glyph variants such as 藥/薬 without allowing a
-    // nearby season title to bind when either source has incomplete metadata.
-    if !exact_native
+    // Synonyms and one-character spelling variants are accepted only with an
+    // exact date match. This covers Japanese old/new glyph variants such as
+    // 藥/薬 without allowing a nearby season title to bind when either source
+    // has incomplete metadata.
+    if !exact_primary_title
         && subject_date
             .zip(media_date)
             .is_none_or(|(left, right)| left != right)
@@ -919,7 +950,7 @@ fn anilist_matches_subject(
     true
 }
 
-fn equivalent_native_title(left: &str, right: &str) -> bool {
+fn equivalent_title_spelling(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
@@ -1619,6 +1650,51 @@ mod tests {
 
     use super::*;
     use crate::domain::{AutoScheduleMetadata, NewAnime};
+
+    #[test]
+    fn anilist_mapping_compares_all_titles_without_weakening_date_checks() {
+        let subject_date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let subject = BangumiSubject {
+            id: 513_878,
+            name: "Cyberpunk: Edgerunners 2".into(),
+            name_cn: "赛博朋克：边缘行者 2".into(),
+            date: Some(subject_date.to_string()),
+            platform: Some("WEB".into()),
+            total_episodes: Some(10),
+        };
+        let media = AniListMedia {
+            id: 195_539,
+            title: AniListTitle {
+                romaji: Some("Cyberpunk: Edgerunners 2".into()),
+                english: Some("Cyberpunk: Edgerunners 2".into()),
+                native: Some("サイバーパンク: エッジランナーズ2".into()),
+            },
+            synonyms: Vec::new(),
+            format: Some("ONA".into()),
+            status: Some("NOT_YET_RELEASED".into()),
+            start_date: AniListDate {
+                year: Some(2026),
+                month: Some(10),
+                day: Some(20),
+            },
+            episodes: Some(10),
+            next_airing_episode: None,
+        };
+
+        assert!(anilist_matches_subject(
+            &subject,
+            Some(subject_date),
+            &media
+        ));
+
+        let mut wrong_date = media.clone();
+        wrong_date.start_date.day = Some(21);
+        assert!(!anilist_matches_subject(
+            &subject,
+            Some(subject_date),
+            &wrong_date
+        ));
+    }
 
     #[tokio::test]
     async fn resolves_aliases_and_episode_airdate() {
