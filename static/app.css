@@ -556,9 +556,9 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .anime-detail-hero {
   display: grid;
-  grid-template-columns: minmax(230px, 285px) minmax(0, 1fr);
+  grid-template-columns: minmax(270px, 320px) minmax(0, 1fr);
   align-items: stretch;
-  gap: 24px;
+  gap: 28px;
   margin-bottom: 26px;
 }
 
@@ -634,6 +634,16 @@ tbody tr:last-child td { border-bottom: 0; }
 .hero-meta .meta-wide { grid-column: 1 / -1; }
 .hero-meta dt { color: var(--subtle); font-size: 0.72rem; }
 .hero-meta dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+
+.job-target {
+  color: var(--text);
+  font-weight: 680;
+  text-decoration-color: rgba(216, 138, 104, 0.45);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.job-target:hover { color: var(--accent-hover); }
 
 .hero-actions {
   margin-top: 20px;

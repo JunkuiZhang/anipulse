@@ -2,5 +2,5 @@
 {% block title %}任务 · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">JOBS</p><h1>后台任务</h1></div></div>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>类型</th><th>目标</th><th>状态</th><th>创建</th><th>错误</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.id }}</td><td>{{ item.kind }}</td><td>{{ item.target }}</td><td>{{ item.state }}</td><td>{{ item.created_at }}</td><td>{{ item.error }}</td></tr>{% endfor %}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>类型</th><th>目标</th><th>状态</th><th>创建</th><th>错误</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.id }}</td><td>{{ item.kind }}</td><td>{% if item.has_target_url %}<a class="job-target" href="{{ item.target_url }}">{{ item.target }}</a>{% else %}{{ item.target }}{% endif %}</td><td>{{ item.state }}</td><td>{{ item.created_at }}</td><td>{{ item.error }}</td></tr>{% endfor %}</tbody></table></div>
 {% endblock %}

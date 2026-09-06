@@ -35,7 +35,9 @@ use crate::{
     config::AppConfig,
     domain::{EpisodeNumberMapping, Evaluation},
     error::{AppError, Result},
-    repository::{AuditEventRow, CandidateListRow, EpisodeVideoRow, ManagementJob, Repository},
+    repository::{
+        AuditEventRow, CandidateListRow, EpisodeVideoRow, ManagementJobListRow, Repository,
+    },
 };
 use cover_cache::{CoverAsset, CoverCache};
 
@@ -2791,6 +2793,8 @@ struct JobView {
     id: i64,
     kind: String,
     target: String,
+    target_url: String,
+    has_target_url: bool,
     state: String,
     created_at: String,
     error: String,
@@ -2809,7 +2813,7 @@ async fn job_list(
 ) -> WebResponse {
     let items = state
         .repository
-        .list_management_jobs(100)
+        .list_management_jobs_with_targets(100)
         .await?
         .into_iter()
         .map(|job| job_view(job, state.display_timezone))
@@ -2821,11 +2825,29 @@ async fn job_list(
     })
 }
 
-fn job_view(job: ManagementJob, timezone: Tz) -> JobView {
+fn job_view(job: ManagementJobListRow, timezone: Tz) -> JobView {
+    let anime_id = if job.target_type.as_deref() == Some("anime") {
+        job.target_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+    } else {
+        None
+    };
+    let target = match (job.anime_title.as_deref(), anime_id) {
+        (Some(title), Some(id)) => format!("{title} · #{id}"),
+        (None, Some(id)) => format!("番剧 #{id}"),
+        _ => job.target_id.clone().unwrap_or_else(|| "—".into()),
+    };
+    let target_url = anime_id
+        .map(|id| format!("/anime/{id}"))
+        .unwrap_or_default();
     JobView {
         id: job.id,
         kind: job.kind,
-        target: job.target_id.unwrap_or_else(|| "—".into()),
+        target,
+        has_target_url: !target_url.is_empty(),
+        target_url,
         state: job.state,
         created_at: format_time(Some(job.created_at), timezone),
         error: job.error.unwrap_or_default(),
@@ -3724,6 +3746,27 @@ mod tests {
             format_time(Some(value), chrono_tz::Asia::Shanghai),
             "2026-08-21 21:25:20"
         );
+    }
+
+    #[test]
+    fn anime_management_job_target_includes_title_and_detail_link() {
+        let view = job_view(
+            ManagementJobListRow {
+                id: 42,
+                kind: "sync_schedule".into(),
+                target_type: Some("anime".into()),
+                target_id: Some("11".into()),
+                state: "completed".into(),
+                created_at: Utc::now(),
+                error: None,
+                anime_title: Some("药屋少女的呢喃 第三季".into()),
+            },
+            chrono_tz::Asia::Shanghai,
+        );
+
+        assert_eq!(view.target, "药屋少女的呢喃 第三季 · #11");
+        assert_eq!(view.target_url, "/anime/11");
+        assert!(view.has_target_url);
     }
 
     #[test]

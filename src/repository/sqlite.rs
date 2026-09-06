@@ -155,6 +155,18 @@ pub struct ManagementJob {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct ManagementJobListRow {
+    pub id: i64,
+    pub kind: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub error: Option<String>,
+    pub anime_title: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct PendingSourceAlert {
     pub source: String,
     pub alert_state: String,
@@ -3184,6 +3196,26 @@ impl Repository {
         .await?)
     }
 
+    pub async fn list_management_jobs_with_targets(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ManagementJobListRow>> {
+        Ok(sqlx::query_as::<_, ManagementJobListRow>(
+            r#"SELECT job.id, job.kind, job.target_type, job.target_id,
+                      job.state, job.created_at, job.error,
+                      anime.title AS anime_title
+               FROM management_job AS job
+               LEFT JOIN anime
+                 ON job.target_type = 'anime'
+                AND job.target_id = CAST(anime.id AS TEXT)
+               ORDER BY job.created_at DESC, job.id DESC
+               LIMIT ?"#,
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn update_scheduler_heartbeat(&self) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO scheduler_state(name, heartbeat_at, metadata_json)
@@ -4645,6 +4677,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, duplicate);
+
+        let listed = repository
+            .list_management_jobs_with_targets(10)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].target_id.as_deref(), Some(target.as_str()));
+        assert_eq!(listed[0].anime_title.as_deref(), Some("Silent Witch"));
 
         let claimed = repository.claim_management_jobs(10).await.unwrap();
         assert_eq!(claimed.len(), 1);
