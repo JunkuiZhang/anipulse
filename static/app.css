@@ -1180,6 +1180,27 @@ input:focus {
   flex: 1;
 }
 
+.global-uploader-form {
+  grid-template-columns: minmax(150px, 0.7fr) minmax(220px, 1.3fr) auto;
+}
+
+.trust-scope-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 0 12px;
+}
+
+.trust-scope-heading h3 { margin: 0 0 3px; }
+.trust-scope-heading p { margin: 0; }
+
+.trust-scope-secondary {
+  margin-top: 28px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+
 .uploader-create-form {
   margin-bottom: 16px;
   padding: 15px;
@@ -1187,6 +1208,7 @@ input:focus {
   background: rgba(238, 241, 240, 0.72);
 }
 
+.rule-action-form,
 .rule-delete-form { align-self: end; }
 .empty.compact { padding: 13px; }
 
@@ -1656,7 +1678,10 @@ textarea:focus {
   .library-meta { grid-template-columns: 1fr; }
   .library-meta dd { margin-bottom: 4px; }
   .rule-row { align-items: stretch; flex-direction: column; }
-  .rule-row > form:last-child button { width: 100%; }
+  .rule-row > .rule-action-form,
+  .rule-row > .rule-delete-form { width: 100%; }
+  .rule-row > .rule-action-form button,
+  .rule-row > .rule-delete-form button { width: 100%; }
   .uploader-form { grid-template-columns: 1fr; width: 100%; }
   .rule-create-form { grid-template-columns: 1fr; }
   .history-add-form { grid-template-columns: 1fr; }

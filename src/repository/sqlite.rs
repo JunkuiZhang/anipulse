@@ -40,6 +40,8 @@ pub struct CandidateListRow {
     pub seen_count: i64,
     pub evaluation_json: String,
     pub url: String,
+    pub manually_trusted: bool,
+    pub globally_trusted: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -58,6 +60,7 @@ pub struct EpisodeVideoRow {
     pub confirmed_count: i64,
     pub rejected_count: i64,
     pub manually_trusted: bool,
+    pub globally_trusted: bool,
     pub manually_blocked: bool,
 }
 
@@ -74,6 +77,12 @@ pub struct BlockedKeywordRow {
 pub struct TrustedUploaderRow {
     pub anime_id: i64,
     pub anime_title: String,
+    pub uploader_mid: i64,
+    pub uploader_name: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct GlobalTrustedUploaderRow {
     pub uploader_mid: i64,
     pub uploader_name: Option<String>,
 }
@@ -1148,11 +1157,14 @@ impl Repository {
                       COALESCE(ut.confirmed_count, 0) AS confirmed_count,
                       COALESCE(ut.rejected_count, 0) AS rejected_count,
                       COALESCE(ut.manually_trusted, 0) AS manually_trusted,
+                      gut.uploader_mid IS NOT NULL AS globally_trusted,
                       COALESCE(ut.manually_blocked, 0) AS manually_blocked
                FROM episode_video ev
                JOIN episode e ON e.id = ev.episode_id
                LEFT JOIN uploader_trust ut
                  ON ut.anime_id = e.anime_id AND ut.uploader_mid = ev.uploader_mid
+               LEFT JOIN global_uploader_trust gut
+                 ON gut.uploader_mid = ev.uploader_mid
                WHERE e.anime_id = ?
                ORDER BY e.episode_no DESC, ev.is_preferred DESC, ev.score DESC,
                         ev.updated_at DESC, ev.id ASC"#,
@@ -1709,10 +1721,16 @@ impl Repository {
             sqlx::query_as::<_, CandidateListRow>(
                 r#"SELECT c.episode_id, e.anime_id, c.bvid, a.title AS anime_title, e.episode_no,
                           c.uploader_mid, c.uploader_name, c.title, c.duration_sec,
-                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url
+                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url,
+                          COALESCE(ut.manually_trusted, 0) AS manually_trusted,
+                          gut.uploader_mid IS NOT NULL AS globally_trusted
                    FROM candidate c
                    JOIN episode e ON e.id = c.episode_id
                    JOIN anime a ON a.id = e.anime_id
+                   LEFT JOIN uploader_trust ut
+                     ON ut.anime_id = e.anime_id AND ut.uploader_mid = c.uploader_mid
+                   LEFT JOIN global_uploader_trust gut
+                     ON gut.uploader_mid = c.uploader_mid
                    WHERE c.state = ?
                      AND (? != 'pending' OR e.state NOT IN ('confirmed', 'notified'))
                    ORDER BY c.last_seen_at DESC"#,
@@ -1725,10 +1743,16 @@ impl Repository {
             sqlx::query_as::<_, CandidateListRow>(
                 r#"SELECT c.episode_id, e.anime_id, c.bvid, a.title AS anime_title, e.episode_no,
                           c.uploader_mid, c.uploader_name, c.title, c.duration_sec,
-                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url
+                          c.published_at, c.score, c.state, c.seen_count, c.evaluation_json, c.url,
+                          COALESCE(ut.manually_trusted, 0) AS manually_trusted,
+                          gut.uploader_mid IS NOT NULL AS globally_trusted
                    FROM candidate c
                    JOIN episode e ON e.id = c.episode_id
                    JOIN anime a ON a.id = e.anime_id
+                   LEFT JOIN uploader_trust ut
+                     ON ut.anime_id = e.anime_id AND ut.uploader_mid = c.uploader_mid
+                   LEFT JOIN global_uploader_trust gut
+                     ON gut.uploader_mid = c.uploader_mid
                    ORDER BY c.last_seen_at DESC"#,
             )
             .fetch_all(&self.pool)
@@ -1779,17 +1803,26 @@ impl Repository {
 
     pub async fn uploader_trust(&self, anime_id: i64, mid: i64) -> Result<UploaderTrust> {
         Ok(sqlx::query_as::<_, UploaderTrust>(
-            "SELECT * FROM uploader_trust WHERE anime_id = ? AND uploader_mid = ?",
+            r#"SELECT ? AS anime_id, ? AS uploader_mid,
+                      COALESCE(ut.uploader_name, gut.uploader_name) AS uploader_name,
+                      COALESCE(ut.confirmed_count, 0) AS confirmed_count,
+                      COALESCE(ut.rejected_count, 0) AS rejected_count,
+                      COALESCE(ut.manually_trusted, 0) AS manually_trusted,
+                      gut.uploader_mid IS NOT NULL AS globally_trusted,
+                      COALESCE(ut.manually_blocked, 0) AS manually_blocked
+               FROM (SELECT 1) seed
+               LEFT JOIN uploader_trust ut
+                 ON ut.anime_id = ? AND ut.uploader_mid = ?
+               LEFT JOIN global_uploader_trust gut
+                 ON gut.uploader_mid = ?"#,
         )
         .bind(anime_id)
         .bind(mid)
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or(UploaderTrust {
-            anime_id,
-            uploader_mid: mid,
-            ..UploaderTrust::default()
-        }))
+        .bind(anime_id)
+        .bind(mid)
+        .bind(mid)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn list_manually_trusted_uploaders(&self) -> Result<Vec<TrustedUploaderRow>> {
@@ -1803,12 +1836,183 @@ impl Repository {
         .await?)
     }
 
+    pub async fn list_globally_trusted_uploaders(&self) -> Result<Vec<GlobalTrustedUploaderRow>> {
+        Ok(sqlx::query_as::<_, GlobalTrustedUploaderRow>(
+            r#"SELECT uploader_mid, uploader_name
+               FROM global_uploader_trust
+               ORDER BY uploader_name, uploader_mid"#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn add_globally_trusted_uploader(&self, mid: i64, name: &str) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO global_uploader_trust(
+                   uploader_mid, uploader_name, created_at, updated_at
+               ) VALUES (?, ?, ?, ?)
+               ON CONFLICT(uploader_mid) DO UPDATE SET
+                   uploader_name = excluded.uploader_name,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(mid)
+        .bind(name)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE uploader_trust SET manually_trusted = 0 WHERE uploader_mid = ?")
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn promote_uploader_to_global(&self, mid: i64, name: &str) -> Result<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO global_uploader_trust(
+                   uploader_mid, uploader_name, created_at, updated_at
+               ) VALUES (?, ?, ?, ?)
+               ON CONFLICT(uploader_mid) DO UPDATE SET
+                   uploader_name = excluded.uploader_name,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(mid)
+        .bind(name)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE uploader_trust SET manually_trusted = 0 WHERE uploader_mid = ?")
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn promote_uploader_from_anime(&self, anime_id: i64, mid: i64) -> Result<()> {
+        let uploader_name = sqlx::query_scalar::<_, String>(
+            r#"SELECT uploader_name FROM (
+                   SELECT u.uploader_name, '9999-12-31T23:59:59Z' AS seen_at
+                   FROM uploader_trust u
+                   WHERE u.anime_id = ? AND u.uploader_mid = ?
+                     AND u.uploader_name IS NOT NULL
+                   UNION ALL
+                   SELECT c.uploader_name, c.last_seen_at AS seen_at
+                   FROM candidate c JOIN episode e ON e.id = c.episode_id
+                   WHERE e.anime_id = ? AND c.uploader_mid = ?
+                   UNION ALL
+                   SELECT ev.uploader_name, ev.updated_at AS seen_at
+                   FROM episode_video ev JOIN episode e ON e.id = ev.episode_id
+                   WHERE e.anime_id = ? AND ev.uploader_mid = ?
+               ) ORDER BY seen_at DESC LIMIT 1"#,
+        )
+        .bind(anime_id)
+        .bind(mid)
+        .bind(anime_id)
+        .bind(mid)
+        .bind(anime_id)
+        .bind(mid)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("uploader {anime_id}:{mid}")))?;
+        self.promote_uploader_to_global(mid, &uploader_name).await
+    }
+
+    pub async fn update_globally_trusted_uploader(
+        &self,
+        old_mid: i64,
+        mid: i64,
+        name: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM global_uploader_trust WHERE uploader_mid = ?)",
+        )
+        .bind(old_mid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "globally trusted uploader {old_mid}"
+            )));
+        }
+        let now = Utc::now();
+        if old_mid == mid {
+            sqlx::query(
+                "UPDATE global_uploader_trust SET uploader_name = ?, updated_at = ? WHERE uploader_mid = ?",
+            )
+            .bind(name)
+            .bind(now)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let result = sqlx::query(
+                r#"UPDATE global_uploader_trust
+                   SET uploader_mid = ?, uploader_name = ?, updated_at = ?
+                   WHERE uploader_mid = ?"#,
+            )
+            .bind(mid)
+            .bind(name)
+            .bind(now)
+            .bind(old_mid)
+            .execute(&mut *tx)
+            .await;
+            match result {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                    return Err(AppError::InvalidInput(format!(
+                        "globally trusted uploader {mid} already exists"
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        sqlx::query("UPDATE uploader_trust SET manually_trusted = 0 WHERE uploader_mid = ?")
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn remove_global_uploader_trust(&self, mid: i64) -> Result<()> {
+        let result = sqlx::query("DELETE FROM global_uploader_trust WHERE uploader_mid = ?")
+            .bind(mid)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!(
+                "globally trusted uploader {mid}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn add_manually_trusted_uploader(
         &self,
         anime_id: i64,
         mid: i64,
         name: &str,
     ) -> Result<()> {
+        let globally_trusted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM global_uploader_trust WHERE uploader_mid = ?)",
+        )
+        .bind(mid)
+        .fetch_one(&self.pool)
+        .await?;
+        if globally_trusted {
+            return Err(AppError::InvalidInput(format!(
+                "uploader {mid} is already globally trusted"
+            )));
+        }
         let result = sqlx::query(
             r#"INSERT INTO uploader_trust(
                 anime_id, uploader_mid, uploader_name, manually_trusted, manually_blocked
@@ -1851,6 +2055,17 @@ impl Repository {
         if !exists {
             return Err(AppError::NotFound(format!(
                 "trusted uploader {old_anime_id}:{old_mid}"
+            )));
+        }
+        let globally_trusted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM global_uploader_trust WHERE uploader_mid = ?)",
+        )
+        .bind(mid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if globally_trusted {
+            return Err(AppError::InvalidInput(format!(
+                "uploader {mid} is already globally trusted"
             )));
         }
         if old_anime_id == anime_id && old_mid == mid {
@@ -1921,6 +2136,13 @@ impl Repository {
         trusted: bool,
         blocked: bool,
     ) -> Result<()> {
+        let globally_trusted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM global_uploader_trust WHERE uploader_mid = ?)",
+        )
+        .bind(mid)
+        .fetch_one(&self.pool)
+        .await?;
+        let manually_trusted = trusted && !globally_trusted;
         let uploader_name = sqlx::query_scalar::<_, String>(
             r#"SELECT uploader_name FROM (
                    SELECT c.uploader_name, c.last_seen_at AS seen_at
@@ -1951,7 +2173,7 @@ impl Repository {
         .bind(anime_id)
         .bind(mid)
         .bind(uploader_name)
-        .bind(trusted)
+        .bind(manually_trusted)
         .bind(blocked)
         .execute(&mut *tx)
         .await?;
@@ -5100,6 +5322,113 @@ mod tests {
         assert!(
             repository
                 .list_manually_trusted_uploaders()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn global_uploader_trust_applies_everywhere_and_local_block_wins() {
+        let (_directory, repository, anime_id, _episode) = fixture().await;
+        let other_anime_id = repository
+            .add_anime(NewAnime {
+                title: "另一部番".into(),
+                aliases: Vec::new(),
+                next_episode: 1,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_680,
+                auto_schedule: None,
+            })
+            .await
+            .unwrap();
+        let mid = 778_899;
+        repository
+            .add_manually_trusted_uploader(anime_id, mid, "跨番上传者")
+            .await
+            .unwrap();
+        repository
+            .add_globally_trusted_uploader(mid, "跨番上传者")
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .list_manually_trusted_uploaders()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let global = repository.list_globally_trusted_uploaders().await.unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].uploader_mid, mid);
+        assert!(matches!(
+            repository
+                .add_manually_trusted_uploader(other_anime_id, mid, "重复信任")
+                .await,
+            Err(AppError::InvalidInput(_))
+        ));
+
+        let trust = repository.uploader_trust(anime_id, mid).await.unwrap();
+        assert!(trust.globally_trusted);
+        assert!(!trust.manually_trusted);
+        assert!(trust.is_trusted(2));
+        let other_trust = repository
+            .uploader_trust(other_anime_id, mid)
+            .await
+            .unwrap();
+        assert!(other_trust.globally_trusted);
+        assert!(other_trust.is_trusted(2));
+
+        repository
+            .set_uploader_flag(anime_id, mid, false, true)
+            .await
+            .unwrap();
+        let blocked = repository.uploader_trust(anime_id, mid).await.unwrap();
+        assert!(blocked.globally_trusted);
+        assert!(blocked.manually_blocked);
+        assert!(!blocked.is_trusted(2));
+
+        repository
+            .add_manually_trusted_uploader(anime_id, mid + 1, "即将升级")
+            .await
+            .unwrap();
+        repository
+            .update_globally_trusted_uploader(mid, mid + 1, "新 UID")
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .list_manually_trusted_uploaders()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !repository
+                .uploader_trust(anime_id, mid)
+                .await
+                .unwrap()
+                .globally_trusted
+        );
+        assert!(
+            repository
+                .uploader_trust(anime_id, mid + 1)
+                .await
+                .unwrap()
+                .globally_trusted
+        );
+        repository
+            .remove_global_uploader_trust(mid + 1)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .list_globally_trusted_uploaders()
                 .await
                 .unwrap()
                 .is_empty()

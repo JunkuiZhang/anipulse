@@ -72,7 +72,8 @@
             <div class="video-source-actions">
               {% if !video.blocked %}
                 {% if !video.preferred %}<form method="post" action="/anime/{{ id }}/history/episodes/{{ item.episode_id }}/videos/{{ video.id }}/prefer"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">选为最佳</button></form>{% endif %}
-                {% if !video.trusted %}<form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button type="submit">信任此 UP</button></form>{% endif %}
+                {% if !video.manually_trusted && !video.globally_trusted %}<form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/trust"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button type="submit">仅信任此番</button></form>{% endif %}
+                {% if !video.globally_trusted %}<form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/trust-global"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button type="submit">{% if video.manually_trusted %}升级为全局{% else %}全局信任{% endif %}</button></form>{% endif %}
                 <form method="post" action="/anime/{{ id }}/uploaders/{{ video.uploader_mid }}/block"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="/anime/{{ id }}"><button class="danger-ghost" type="submit">屏蔽此 UP</button></form>
               {% endif %}
             </div>

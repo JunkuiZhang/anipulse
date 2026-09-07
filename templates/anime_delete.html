@@ -2,7 +2,7 @@
 {% block title %}删除 {{ title }} · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">DANGER ZONE</p><h1>永久删除追番</h1></div><a class="button" href="/anime/{{ id }}">取消</a></div>
-<div class="alert">此操作会删除“{{ title }}”的 Episode、候选、通知和 UP 信任记录，只能通过数据库备份恢复。</div>
+<div class="alert">此操作会删除“{{ title }}”的 Episode、候选、通知和该番的 UP 信任记录；全局信任不受影响。只能通过数据库备份恢复。</div>
 <section class="panel details"><dl><dt>Anime ID</dt><dd>{{ id }}</dd><dt>标题</dt><dd>{{ title }}</dd><dt>Bangumi</dt><dd>{{ bangumi }}</dd><dt>当前状态</dt><dd>已停用</dd></dl></section>
 <form method="post" action="/anime/{{ id }}/delete" class="stack">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

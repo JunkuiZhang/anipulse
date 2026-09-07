@@ -157,6 +157,18 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/rules/keywords", post(keyword_create))
         .route("/rules/keywords/{id}", post(keyword_update))
         .route("/rules/keywords/{id}/delete", post(keyword_delete))
+        .route(
+            "/rules/uploaders/global",
+            post(global_trusted_uploader_create),
+        )
+        .route(
+            "/rules/uploaders/global/{mid}",
+            post(global_trusted_uploader_update),
+        )
+        .route(
+            "/rules/uploaders/global/{mid}/delete",
+            post(global_trusted_uploader_delete),
+        )
         .route("/rules/uploaders", post(trusted_uploader_create))
         .route(
             "/rules/uploaders/{anime_id}/{mid}",
@@ -165,6 +177,10 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route(
             "/rules/uploaders/{anime_id}/{mid}/delete",
             post(trusted_uploader_delete),
+        )
+        .route(
+            "/rules/uploaders/{anime_id}/{mid}/promote",
+            post(trusted_uploader_promote),
         )
         .route(
             "/episodes/{episode_id}/candidates/{bvid}/accept-intent",
@@ -192,6 +208,10 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route(
             "/anime/{anime_id}/uploaders/{mid}/trust",
             post(uploader_trust),
+        )
+        .route(
+            "/anime/{anime_id}/uploaders/{mid}/trust-global",
+            post(uploader_trust_global),
         )
         .route(
             "/anime/{anime_id}/uploaders/{mid}/block",
@@ -1193,7 +1213,8 @@ struct EpisodeVideoView {
     url: String,
     preferred: bool,
     blocked: bool,
-    trusted: bool,
+    manually_trusted: bool,
+    globally_trusted: bool,
     trust_label: String,
     updated_at: String,
 }
@@ -1292,6 +1313,7 @@ async fn anime_detail(
         Some("preferred-set") => "已选择这条来源作为本集最佳视频。",
         Some("preferred-cleared") => "已恢复自动选择，将显示未屏蔽来源中评分最高的视频。",
         Some("uploader-trusted") => "已信任此 UP。",
+        Some("uploader-globally-trusted") => "已将此 UP 设为全局信任。",
         Some("uploader-blocked") => "已屏蔽此 UP；其视频不会再被自动展示或选为最佳。",
         Some("released-complete") => "已标记为本季播完，并停止查找下一集。等实际看完后再归档即可。",
         Some("tracking-resumed") => "已恢复监控，系统将从指定的下一集继续检查。",
@@ -1436,12 +1458,15 @@ fn episode_history_views(
     let mut groups: Vec<(i64, i64, Vec<EpisodeVideoView>)> = Vec::new();
     for row in rows {
         let trusted = !row.manually_blocked
-            && (row.manually_trusted
+            && (row.globally_trusted
+                || row.manually_trusted
                 || (row.confirmed_count >= trusted_confirmed_count && row.rejected_count == 0));
         let trust_label = if row.manually_blocked {
             "已屏蔽"
+        } else if row.globally_trusted {
+            "全局信任"
         } else if row.manually_trusted {
-            "手动信任"
+            "仅此番信任"
         } else if trusted {
             "自动信任"
         } else {
@@ -1458,7 +1483,8 @@ fn episode_history_views(
             url: canonical_bilibili_url(&row.bvid).unwrap_or_default(),
             preferred: row.is_preferred,
             blocked: row.manually_blocked,
-            trusted,
+            manually_trusted: row.manually_trusted,
+            globally_trusted: row.globally_trusted,
             trust_label: trust_label.into(),
             updated_at: format_time(Some(row.updated_at), timezone),
         };
@@ -2099,6 +2125,8 @@ struct CandidateView {
     url: String,
     has_video_url: bool,
     pending: bool,
+    manually_trusted: bool,
+    globally_trusted: bool,
 }
 
 #[derive(Template)]
@@ -2138,6 +2166,9 @@ async fn candidate_list(
         Some("uploader-trusted") => {
             "已信任此 UP；以后符合番剧、集数和时长条件的视频可以自动确认。".into()
         }
+        Some("uploader-globally-trusted") => {
+            "已全局信任此 UP；其为其他番剧上传的合格视频也可以自动确认。".into()
+        }
         Some("candidate-rejected") => "已拒绝该候选。".into(),
         _ => String::new(),
     };
@@ -2174,6 +2205,8 @@ fn candidate_view(row: CandidateListRow) -> CandidateView {
         reputation,
         has_video_url: url.is_some(),
         url: url.unwrap_or_default(),
+        manually_trusted: row.manually_trusted,
+        globally_trusted: row.globally_trusted,
     }
 }
 
@@ -2193,13 +2226,20 @@ struct TrustedUploaderView {
     uploader_name: String,
 }
 
+struct GlobalTrustedUploaderView {
+    uploader_mid: i64,
+    uploader_name: String,
+}
+
 #[derive(Template)]
 #[template(path = "rules.html")]
 struct RuleTemplate {
     username: String,
     csrf_token: String,
     keywords: Vec<crate::repository::BlockedKeywordRow>,
+    global_uploaders: Vec<GlobalTrustedUploaderView>,
     uploaders: Vec<TrustedUploaderView>,
+    trust_count: usize,
     anime: Vec<RuleAnimeOption>,
     notice: String,
 }
@@ -2210,6 +2250,18 @@ async fn rule_list(
     Query(query): Query<RuleQuery>,
 ) -> WebResponse {
     let keywords = state.repository.list_blocked_keywords().await?;
+    let global_uploaders = state
+        .repository
+        .list_globally_trusted_uploaders()
+        .await?
+        .into_iter()
+        .map(|row| GlobalTrustedUploaderView {
+            uploader_mid: row.uploader_mid,
+            uploader_name: row
+                .uploader_name
+                .unwrap_or_else(|| format!("UID {}", row.uploader_mid)),
+        })
+        .collect::<Vec<_>>();
     let uploaders = state
         .repository
         .list_manually_trusted_uploaders()
@@ -2222,7 +2274,8 @@ async fn rule_list(
                 .uploader_name
                 .unwrap_or_else(|| format!("UID {}", row.uploader_mid)),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let trust_count = global_uploaders.len() + uploaders.len();
     let anime = state
         .repository
         .list_anime()
@@ -2240,6 +2293,10 @@ async fn rule_list(
         Some("uploader-added") => "信任 UP 已添加。",
         Some("uploader-updated") => "信任 UP 已更新。",
         Some("uploader-deleted") => "信任 UP 已移除。",
+        Some("global-uploader-added") => "全局信任 UP 已添加。",
+        Some("global-uploader-updated") => "全局信任 UP 已更新。",
+        Some("global-uploader-deleted") => "全局信任 UP 已移除。",
+        Some("uploader-promoted") => "已升级为全局信任，重复的按番信任已自动清理。",
         _ => "",
     }
     .to_string();
@@ -2247,7 +2304,9 @@ async fn rule_list(
         username: identity.username,
         csrf_token: identity.csrf_token,
         keywords,
+        global_uploaders,
         uploaders,
+        trust_count,
         anime,
         notice,
     })
@@ -2332,6 +2391,84 @@ struct TrustedUploaderForm {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct GlobalTrustedUploaderForm {
+    csrf_token: String,
+    mid: i64,
+    name: String,
+}
+
+async fn global_trusted_uploader_create(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    headers: HeaderMap,
+    Form(form): Form<GlobalTrustedUploaderForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .add_global_trusted_uploader(form.mid, &form.name)
+        .await?;
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.global.create",
+        "global_trusted_uploader",
+        &form.mid.to_string(),
+        serde_json::json!({"name": form.name.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=global-uploader-added").into_response())
+}
+
+async fn global_trusted_uploader_update(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(old_mid): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<GlobalTrustedUploaderForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .update_global_trusted_uploader(old_mid, form.mid, &form.name)
+        .await?;
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.global.update",
+        "global_trusted_uploader",
+        &old_mid.to_string(),
+        serde_json::json!({"mid": form.mid, "name": form.name.trim()}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=global-uploader-updated").into_response())
+}
+
+async fn global_trusted_uploader_delete(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(mid): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .remove_global_trusted_uploader(mid)
+        .await?;
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.global.delete",
+        "global_trusted_uploader",
+        &mid.to_string(),
+        serde_json::json!({}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=global-uploader-deleted").into_response())
+}
+
 async fn trusted_uploader_create(
     State(state): State<WebState>,
     Extension(identity): Extension<SessionIdentity>,
@@ -2404,6 +2541,30 @@ async fn trusted_uploader_delete(
     )
     .await?;
     Ok(Redirect::to("/rules?result=uploader-deleted").into_response())
+}
+
+async fn trusted_uploader_promote(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, mid)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .promote_uploader_from_anime(anime_id, mid)
+        .await?;
+    audit_success_string(
+        &state,
+        &identity,
+        "rule.uploader.promote",
+        "global_trusted_uploader",
+        &mid.to_string(),
+        serde_json::json!({"source_anime_id": anime_id}),
+    )
+    .await?;
+    Ok(Redirect::to("/rules?result=uploader-promoted").into_response())
 }
 
 async fn candidate_accept_intent(
@@ -2545,6 +2706,36 @@ async fn uploader_trust(
         anime_id,
         form.return_to.as_deref(),
         "uploader-trusted",
+        None,
+    ))
+    .into_response())
+}
+
+async fn uploader_trust_global(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path((anime_id, mid)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Form(form): Form<UploaderActionForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    state
+        .application
+        .promote_uploader_from_anime(anime_id, mid)
+        .await?;
+    audit_success_string(
+        &state,
+        &identity,
+        "uploader.trust_global",
+        "global_trusted_uploader",
+        &mid.to_string(),
+        serde_json::json!({"source_anime_id": anime_id}),
+    )
+    .await?;
+    Ok(Redirect::to(&uploader_action_redirect(
+        anime_id,
+        form.return_to.as_deref(),
+        "uploader-globally-trusted",
         None,
     ))
     .into_response())
@@ -3442,6 +3633,8 @@ mod tests {
             seen_count: 1,
             evaluation_json: "{}".into(),
             url: "https://www.bilibili.com".into(),
+            manually_trusted: false,
+            globally_trusted: false,
         });
 
         assert_eq!(view.url, "https://www.bilibili.com/video/BV1Es8A6UEnr");
@@ -3829,6 +4022,7 @@ mod tests {
             confirmed_count: 0,
             rejected_count: 0,
             manually_trusted: false,
+            globally_trusted: false,
             manually_blocked: blocked,
         };
 

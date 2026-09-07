@@ -288,6 +288,36 @@ impl ApplicationService {
             .await
     }
 
+    pub async fn add_global_trusted_uploader(&self, mid: i64, name: &str) -> Result<()> {
+        let name = validate_uploader_input(mid, name)?;
+        self.repository
+            .add_globally_trusted_uploader(mid, &name)
+            .await
+    }
+
+    pub async fn promote_uploader_from_anime(&self, anime_id: i64, mid: i64) -> Result<()> {
+        validate_uploader_input(mid, "")?;
+        self.repository
+            .promote_uploader_from_anime(anime_id, mid)
+            .await
+    }
+
+    pub async fn update_global_trusted_uploader(
+        &self,
+        old_mid: i64,
+        mid: i64,
+        name: &str,
+    ) -> Result<()> {
+        let name = validate_uploader_input(mid, name)?;
+        self.repository
+            .update_globally_trusted_uploader(old_mid, mid, &name)
+            .await
+    }
+
+    pub async fn remove_global_trusted_uploader(&self, mid: i64) -> Result<()> {
+        self.repository.remove_global_uploader_trust(mid).await
+    }
+
     pub async fn repair_current_episode(
         &self,
         anime_id: i64,

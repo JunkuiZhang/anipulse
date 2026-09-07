@@ -549,20 +549,27 @@ mod tests {
         let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
         candidate.uploader_follower_count = Some(3);
         candidate.view_count = Some(10_000);
-        let trust = UploaderTrust {
-            manually_trusted: true,
-            ..UploaderTrust::default()
-        };
-        let evaluation = evaluate(
-            &anime,
-            &episode,
-            &candidate,
-            &trust,
-            &ConfirmationConfig::default(),
-            &[],
-        );
-        assert!(evaluation.hard_reject);
-        assert!(!evaluation.manual_review);
+        for trust in [
+            UploaderTrust {
+                manually_trusted: true,
+                ..UploaderTrust::default()
+            },
+            UploaderTrust {
+                globally_trusted: true,
+                ..UploaderTrust::default()
+            },
+        ] {
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &trust,
+                &ConfirmationConfig::default(),
+                &[],
+            );
+            assert!(evaluation.hard_reject);
+            assert!(!evaluation.manual_review);
+        }
     }
 
     #[test]

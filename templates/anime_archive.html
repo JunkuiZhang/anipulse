@@ -2,7 +2,7 @@
 {% block title %}归档 {{ title }} · AniPulse{% endblock %}
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">ARCHIVE COLLECTION</p><h1>看完并归档</h1><p class="page-description">归档不会删除收藏本身，但会压缩不再需要的运行数据。</p></div><a class="button" href="/anime/{{ id }}">取消</a></div>
-<div class="alert">归档“{{ title }}”后，将清理逐集候选、通知、检查任务、UP 信任和视频来源。封面、标题、别名、简介、总集数与归档时间会保留。</div>
+<div class="alert">归档“{{ title }}”后，将清理逐集候选、通知、检查任务、该番的 UP 信任和视频来源；全局信任不受影响。封面、标题、别名、简介、总集数与归档时间会保留。</div>
 <form method="post" action="/anime/{{ id }}/archive" class="panel stack archive-form">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input type="hidden" name="nonce" value="{{ nonce }}">

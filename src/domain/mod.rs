@@ -288,13 +288,16 @@ pub struct UploaderTrust {
     pub confirmed_count: i64,
     pub rejected_count: i64,
     pub manually_trusted: bool,
+    pub globally_trusted: bool,
     pub manually_blocked: bool,
 }
 
 impl UploaderTrust {
     pub fn is_trusted(&self, required_count: i64) -> bool {
-        self.manually_trusted
-            || (self.confirmed_count >= required_count && self.rejected_count == 0)
+        !self.manually_blocked
+            && (self.globally_trusted
+                || self.manually_trusted
+                || (self.confirmed_count >= required_count && self.rejected_count == 0))
     }
 }
 

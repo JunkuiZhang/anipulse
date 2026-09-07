@@ -308,11 +308,13 @@ CREATE TABLE management_job (
 | POST | `/episodes/{id}/candidates/{bvid}/reject` | 是 | 按 Episode + BV 人工拒绝 |
 | POST | `/episodes/{id}/candidates/reject-all` | 是 | 拒绝本集当前全部候选 |
 | POST | `/episodes/{id}/candidates/from-url` | 是 | 校验 B 站链接并创建人工候选任务 |
-| POST | `/anime/{id}/uploaders/{mid}/trust` | 是 | 信任 UP |
+| POST | `/anime/{id}/uploaders/{mid}/trust` | 是 | 仅对此番信任 UP |
+| POST | `/anime/{id}/uploaders/{mid}/trust-global` | 是 | 全局信任 UP |
 | POST | `/anime/{id}/uploaders/{mid}/block` | 是 | 屏蔽 UP |
-| GET | `/rules` | 是 | 查看全局屏蔽词和 per-Anime 信任 UP |
+| GET | `/rules` | 是 | 查看全局屏蔽词、全局信任和 per-Anime 信任 UP |
 | POST | `/rules/keywords[...]` | 是 | 新增、修改、删除全局屏蔽词 |
-| POST | `/rules/uploaders[...]` | 是 | 新增、修改、移除 per-Anime 信任 UP |
+| POST | `/rules/uploaders[...]` | 是 | 新增、修改、移除或升级 per-Anime 信任 UP |
+| POST | `/rules/uploaders/global[...]` | 是 | 新增、修改或移除全局信任 UP |
 | GET | `/jobs` | 是 | 后台任务状态 |
 | GET | `/audit` | 是 | 审计记录 |
 | GET | `/settings/status` | 是 | 脱敏配置与外部服务状态 |
