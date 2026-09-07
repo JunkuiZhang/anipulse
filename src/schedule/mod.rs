@@ -648,68 +648,80 @@ impl ScheduleProvider {
                 select_anilist_candidate(&subject, subject_date, candidates)?
             }
         };
-        let airing = media.next_airing_episode.ok_or_else(|| {
-            AppError::Schedule(format!(
-                "AniList #{} matched '{}', but it has no next airing timestamp; use a manual schedule until one is published",
-                media.id,
-                anilist_display_title(&media)
-            ))
-        })?;
-        let reported_at = Utc
-            .timestamp_opt(airing.airing_at, 0)
-            .single()
-            .ok_or_else(|| {
-                AppError::Schedule(format!(
-                    "AniList #{} returned an invalid airing timestamp",
-                    media.id
-                ))
-            })?;
-        let (expected_at, confidence, timing_warning) = if airing.episode == subject_episode_index {
-            let warning = episode.airdate.and_then(|airdate| {
-                let reported_date = reported_at.with_timezone(&Tokyo).date_naive();
-                (reported_date != airdate).then(|| {
-                    format!(
-                        "Bangumi 章节日期为 {airdate}，AniList 精确时刻对应日本日期 {reported_date}；已采用 AniList 时刻。"
-                    )
-                })
-            });
-            (reported_at, "calibrated", warning)
-        } else if let Some(airdate) = episode.airdate {
-            let tokyo_time = reported_at.with_timezone(&Tokyo).time();
-            let local = Tokyo
-                .with_ymd_and_hms(
-                    airdate.year(),
-                    airdate.month(),
-                    airdate.day(),
-                    tokyo_time.hour(),
-                    tokyo_time.minute(),
-                    tokyo_time.second(),
-                )
+        let (expected_at, confidence, timing_warning) = if let Some(airing) =
+            media.next_airing_episode
+        {
+            let reported_at = Utc
+                .timestamp_opt(airing.airing_at, 0)
                 .single()
-                .ok_or_else(|| AppError::Schedule("cannot construct AniList airing time".into()))?;
-            (
-                local.with_timezone(&Utc),
-                "estimated",
-                Some(format!(
-                    "AniList 当前报告 EP{}，目标为 Bangumi EP{}；已用 Bangumi 章节日期和 AniList 的日本时刻组合，待后续同步校准。",
-                    airing.episode, subject_episode_index
-                )),
-            )
+                .ok_or_else(|| {
+                    AppError::Schedule(format!(
+                        "AniList #{} returned an invalid airing timestamp",
+                        media.id
+                    ))
+                })?;
+            if airing.episode == subject_episode_index {
+                let warning = episode.airdate.and_then(|airdate| {
+                        let reported_date = reported_at.with_timezone(&Tokyo).date_naive();
+                        (reported_date != airdate).then(|| {
+                            format!(
+                                "Bangumi 章节日期为 {airdate}，AniList 精确时刻对应日本日期 {reported_date}；已采用 AniList 时刻。"
+                            )
+                        })
+                    });
+                (reported_at, "calibrated", warning)
+            } else if let Some(airdate) = episode.airdate {
+                let tokyo_time = reported_at.with_timezone(&Tokyo).time();
+                let local = Tokyo
+                    .with_ymd_and_hms(
+                        airdate.year(),
+                        airdate.month(),
+                        airdate.day(),
+                        tokyo_time.hour(),
+                        tokyo_time.minute(),
+                        tokyo_time.second(),
+                    )
+                    .single()
+                    .ok_or_else(|| {
+                        AppError::Schedule("cannot construct AniList airing time".into())
+                    })?;
+                (
+                    local.with_timezone(&Utc),
+                    "estimated",
+                    Some(format!(
+                        "AniList 当前报告 EP{}，目标为 Bangumi EP{}；已用 Bangumi 章节日期和 AniList 的日本时刻组合，待后续同步校准。",
+                        airing.episode, subject_episode_index
+                    )),
+                )
+            } else {
+                let offset = subject_episode_index
+                    .checked_sub(airing.episode)
+                    .and_then(|delta| delta.checked_mul(7))
+                    .ok_or_else(|| AppError::Schedule("episode offset overflowed".into()))?;
+                (
+                    reported_at + Duration::days(offset),
+                    "estimated",
+                    Some(format!(
+                        "Bangumi 暂无目标章节日期；已从 AniList EP{} 按周推算 EP{}，每日同步会继续校准。",
+                        airing.episode, subject_episode_index
+                    )),
+                )
+            }
         } else {
-            let offset = subject_episode_index
-                .checked_sub(airing.episode)
-                .and_then(|delta| delta.checked_mul(7))
-                .ok_or_else(|| AppError::Schedule("episode offset overflowed".into()))?;
-            (
-                reported_at + Duration::days(offset),
-                "estimated",
-                Some(format!(
-                    "Bangumi 暂无目标章节日期；已从 AniList EP{} 按周推算 EP{}，每日同步会继续校准。",
-                    airing.episode, subject_episode_index
-                )),
-            )
+            anilist_date_only_schedule(
+                episode.airdate,
+                subject_date,
+                &media,
+                subject_episode_index,
+                timezone,
+            )?
         };
-        let anchor = expected_at - Duration::days((subject_episode_index - 1) * 7);
+        let batch_release = confidence == "date_only" && media.format.as_deref() == Some("ONA");
+        let anchor = if batch_release {
+            expected_at
+        } else {
+            expected_at - Duration::days((subject_episode_index - 1) * 7)
+        };
         let local = expected_at.with_timezone(&timezone);
         let total_episodes = episode
             .total_episodes
@@ -732,7 +744,7 @@ impl ScheduleProvider {
             aliases,
             expected_at: Some(expected_at),
             expected_weekday: Some(i64::from(local.weekday().num_days_from_monday())),
-            expected_time: Some(local.format("%H:%M").to_string()),
+            expected_time: (confidence != "date_only").then(|| local.format("%H:%M").to_string()),
             timezone: timezone.name().to_string(),
             broadcast_pattern: format!("R/{}/P7D", anchor.to_rfc3339()),
             schedule_source: "anilist".into(),
@@ -856,6 +868,49 @@ fn anilist_data<T>(response: AniListResponse<T>) -> Result<T> {
 
 fn anilist_date(value: &AniListDate) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(value.year?, value.month?, value.day?)
+}
+
+fn anilist_date_only_schedule(
+    episode_airdate: Option<NaiveDate>,
+    subject_date: Option<NaiveDate>,
+    media: &AniListMedia,
+    subject_episode_index: i64,
+    timezone: Tz,
+) -> Result<(DateTime<Utc>, &'static str, Option<String>)> {
+    let start_date = subject_date.or_else(|| anilist_date(&media.start_date));
+    let date = if let Some(airdate) = episode_airdate {
+        airdate
+    } else {
+        let start_date = start_date.ok_or_else(|| {
+            AppError::Schedule(format!(
+                "AniList #{} matched '{}', but it has neither a next airing timestamp nor a start date",
+                media.id,
+                anilist_display_title(media)
+            ))
+        })?;
+        if subject_episode_index == 1 || media.format.as_deref() == Some("ONA") {
+            start_date
+        } else {
+            let day_offset = subject_episode_index
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(7))
+                .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?;
+            start_date
+                .checked_add_signed(Duration::days(day_offset))
+                .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?
+        }
+    };
+    let local = timezone
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .ok_or_else(|| AppError::Schedule("cannot construct date-only schedule boundary".into()))?;
+    Ok((
+        local.with_timezone(&Utc),
+        "date_only",
+        Some(format!(
+            "当前来源仅公布 {date} 的开播日期，尚无精确上线时刻；系统将从当天开始检查并每日同步，获得精确时刻后会自动校准。"
+        )),
+    ))
 }
 
 fn anilist_titles(media: &AniListMedia) -> Vec<&str> {
@@ -1784,6 +1839,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreleased_ona_without_airing_timestamp_uses_date_only_schedule() {
+        let (base_url, requests) = date_only_anilist_mock_server().await;
+        let provider = ScheduleProvider::new(ScheduleConfig {
+            bangumi_data_url: format!("{base_url}/data.json"),
+            bangumi_api_base_url: base_url.clone(),
+            anilist_api_url: format!("{base_url}/anilist/graphql"),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        })
+        .unwrap();
+        let catalog = provider.load_catalog().await.unwrap();
+
+        let resolved = provider
+            .resolve_auto(
+                &catalog,
+                AutoScheduleRequest {
+                    title: "Cyberpunk: Edgerunners 2",
+                    subject_id: Some(513_878),
+                    next_episode: 1,
+                    episode_mapping: None,
+                    anilist_media_id: Some(195_539),
+                    timezone: "Asia/Shanghai",
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.anilist_media_id, Some(195_539));
+        assert_eq!(resolved.total_episodes, Some(10));
+        assert_eq!(resolved.schedule_source, "anilist");
+        assert_eq!(resolved.schedule_confidence, "date_only");
+        assert_eq!(resolved.expected_time, None);
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-10-19T16:00:00+00:00"
+        );
+        assert!(
+            resolved
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("尚无精确上线时刻"))
+        );
+        assert_eq!(requests.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
     async fn sync_preserves_last_calibrated_time_during_episode_api_outage() {
         let directory = TempDir::new().unwrap();
         let database = directory.path().join("schedule-outage.db");
@@ -2352,6 +2453,45 @@ mod tests {
                     _ => {
                         assert!(headers.starts_with("POST /anilist/graphql"));
                         r#"{"data":{"Page":{"media":[{"id":195516,"title":{"romaji":"Kusuriya no Hitorigoto 3rd Season","english":"The Apothecary Diaries Season 3","native":"藥屋のひとりごと 第3期"},"synonyms":[],"format":"TV","status":"NOT_YET_RELEASED","startDate":{"year":2026,"month":10,"day":2},"episodes":null,"nextAiringEpisode":{"episode":1,"airingAt":1790949600}}]}}}"#
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            4
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn date_only_anilist_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let response_body = match index {
+                    0 => {
+                        r#"{"items":[{"title":"別の作品","titleTranslate":{},"type":"tv","begin":"2026-10-01T15:00:00.000Z","sites":[{"site":"bangumi","id":"999999"}]}]}"#
+                    }
+                    1 => {
+                        assert!(headers.contains("/v0/subjects/513878"));
+                        r#"{"id":513878,"name":"Cyberpunk: Edgerunners 2","name_cn":"赛博朋克：边缘行者 2","date":"2026-10-20","platform":"WEB","total_episodes":10}"#
+                    }
+                    2 => {
+                        assert!(headers.contains("/v0/episodes?"));
+                        assert!(headers.contains("subject_id=513878"));
+                        assert!(headers.contains("offset=0"));
+                        r#"{"total":10,"data":[{"airdate":"2026-10-20","sort":1,"ep":1}]}"#
+                    }
+                    _ => {
+                        assert!(headers.starts_with("POST /anilist/graphql"));
+                        r#"{"data":{"Media":{"id":195539,"title":{"romaji":"Cyberpunk: Edgerunners 2","english":"Cyberpunk: Edgerunners 2","native":"サイバーパンク: エッジランナーズ2"},"synonyms":[],"format":"ONA","status":"NOT_YET_RELEASED","startDate":{"year":2026,"month":10,"day":20},"episodes":10,"nextAiringEpisode":null}}}"#
                     }
                 };
                 let response = format!(

@@ -1,6 +1,6 @@
 # 使用 Cloudflare Worker 转发排期元数据
 
-这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的日文标题、首播日期和类型匹配 AniList 的精确开播时刻。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
+这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的多语言标题、首播日期和类型匹配 AniList 的精确开播时刻；上游只有开播日期时则保存为“时间待公布”的日期级排期。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
 新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 d Anime、ABEMA 或动画疯等网络时段，并默认排除不可靠的 U-NEXT 排期。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
 

@@ -195,7 +195,7 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 
-尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的日文标题、首播日期和类型，再到 AniList 查找唯一高置信结果；成功后把 AniList Media ID 持久化，后续不再依赖模糊标题搜索。若没有唯一结果，添加会停止并列出候选，核对后可在网页高级选项或 CLI 的 `--anilist-id` 中指定。AniList ID 不能脱离 Bangumi ID 单独填写，两者会在保存前交叉校验。
+尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的正式标题、中文名、首播日期和类型，再与 AniList 的日文、罗马字、英文标题及同义词进行高置信匹配；成功后把 AniList Media ID 持久化，后续不再依赖模糊标题搜索。若没有唯一结果，添加会停止并列出候选，核对后可在网页高级选项或 CLI 的 `--anilist-id` 中指定。AniList ID 不能脱离 Bangumi ID 单独填写，两者会在保存前交叉校验。AniList 尚无 `nextAiringEpisode` 但已有开播日期时可以正常添加：页面显示“仅开播日期，时间待公布”，系统从该日期开始检查并每日同步；精确时刻发布后会自动校准。若连开播日期都没有，才会要求暂用手工排期。
 
 AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。显式的 `preferred_site` 有具体时刻时优先使用它；否则程序会比较 `stream_site_priority` 中的全部可用排期，采用至少两个独立平台在 2 小时内相互印证的最早档期。列表顺序只用于同时间决胜，或完全没有平台共识时的保守回退；`gamer` 与 `gamer_hk` 属于同一平台，不会被错误算作两票。`excluded_stream_sites` 会在选择前排除不可信来源，默认禁用 U-NEXT；旧配置没有这个字段时也会继承该默认值。这里读取的只是 `bangumi-data` JSON 元数据，阿里云服务器不会直接访问 d Anime、ABEMA 或动画疯的网站。
 

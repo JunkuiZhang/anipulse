@@ -120,6 +120,7 @@ pub struct UpcomingReleaseRow {
     pub anime_id: i64,
     pub title: String,
     pub bangumi_subject_id: Option<i64>,
+    pub schedule_confidence: Option<String>,
     pub enabled: bool,
     pub episode_no: i64,
     pub expected_at: DateTime<Utc>,
@@ -439,8 +440,8 @@ impl Repository {
         until: DateTime<Utc>,
     ) -> Result<Vec<UpcomingReleaseRow>> {
         Ok(sqlx::query_as::<_, UpcomingReleaseRow>(
-            r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id, a.enabled,
-                      e.episode_no, e.expected_at
+            r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id,
+                      a.schedule_confidence, a.enabled, e.episode_no, e.expected_at
                FROM anime a
                JOIN episode e ON e.anime_id = a.id
                WHERE a.lifecycle = 'tracking'

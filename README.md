@@ -50,7 +50,7 @@ anipulse anime add \
 
 如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，并用 Bangumi 章节日期校准当前集；也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
 
-未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 日文标题、首播日期和类型匹配 AniList；只有唯一高置信结果才会自动绑定，并保存 AniList Media ID。匹配不唯一时会列出候选，核对后加 `--anilist-id ID` 重试。AniList 没有发布具体 `nextAiringEpisode` 时不会臆造时刻，可先使用手工排期，等上游补全后再同步。
+未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 的多语言标题、首播日期和类型匹配 AniList；只有唯一高置信结果才会自动绑定，并保存 AniList Media ID。匹配不唯一时会列出候选，核对后加 `--anilist-id ID` 重试。AniList 没有发布具体 `nextAiringEpisode`、但已有开播日期时，系统会保存“仅日期”排期并从当天开始检查，不会把 00:00 展示成精确时刻；每日同步获得精确时间后会自动升级排期。日期也没有时才需要暂用手工排期。
 
 如果站内使用的集数与 Bangumi 条目编号不同，可以提供一组起点映射。例如站内 EP12 对应 Bangumi EP78：
 
@@ -199,7 +199,7 @@ RUST_LOG=info
 
 Bilibili Web API 不是本项目可控制的稳定接口。所有 endpoint、WBI 签名、响应字段和错误码映射集中在 `src/provider/bilibili.rs`；如果接口变化，应只修改 Provider。Provider 优先读取公开聚合搜索中的 video 分组，在响应不可用时才尝试 WBI 搜索；`code=0` 但只含 `v_voucher` 会被识别为软风控，不再误报成“0 条结果”。遇到 HTTP 429、HTTP/Bilibili 412、软风控或异常响应时，AniPulse 不会高频重试。
 
-自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。AniPulse 把 Bangumi 单集日期当作日期锚点，并优先用 `bangumi-data` 中可信网络平台的时段校准跨日、网络先行和电视/网络时间差；服务器不会直接访问这些平台的网站。尚未进入目录的未上映作品可额外使用 [AniList GraphQL API](https://docs.anilist.co/) 的精确开播时刻，映射会持久化并在目录正式收录后自动切回常规来源。无法安全对齐时会隐藏预计时间而不是拼出一个错误的精确值，Bilibili 检查仍继续。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知。
+自动排期数据来自 [bangumi-data](https://github.com/bangumi-data/bangumi-data)（CC BY 4.0）和 [Bangumi API](https://bangumi.github.io/api/)。AniPulse 把 Bangumi 单集日期当作日期锚点，并优先用 `bangumi-data` 中可信网络平台的时段校准跨日、网络先行和电视/网络时间差；服务器不会直接访问这些平台的网站。尚未进入目录的未上映作品可额外使用 [AniList GraphQL API](https://docs.anilist.co/) 的精确开播时刻或开播日期，映射会持久化并在目录正式收录后自动切回常规来源。只有日期时页面明确显示“时间待公布”，不会把内部检查边界冒充成精确时刻。无法安全对齐时会隐藏预计时间，Bilibili 检查仍继续。外部元数据只用于缩小检查窗口，不会单独触发“已更新”通知。
 
 `bangumi-data`、同一条目的章节日期，或未上映条目的 Bangumi/AniList fallback 连续两次异常时，AniPulse 会通过当前通知通道发送一次数据源告警；同一轮故障不会重复打扰，恢复后会再发送一次恢复通知。详情页和 `anime show` 会显示排期来源、校准状态和降级原因。配置含义、升级步骤与冲突处理见 [`doc/deployment.md`](doc/deployment.md)。
 

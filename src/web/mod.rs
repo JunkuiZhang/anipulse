@@ -543,7 +543,11 @@ async fn dashboard(
                     local.format("%m月%d日"),
                     chinese_weekday(local.weekday())
                 ),
-                time: local.format("%H:%M").to_string(),
+                time: if release.schedule_confidence.as_deref() == Some("date_only") {
+                    "时间待公布".into()
+                } else {
+                    local.format("%H:%M").to_string()
+                },
                 enabled: release.enabled,
             }
         })
@@ -732,7 +736,13 @@ async fn anime_list(
             } else {
                 episode
                     .as_ref()
-                    .map(|episode| format_time(episode.expected_at, state.display_timezone))
+                    .map(|episode| {
+                        format_schedule_time(
+                            episode.expected_at,
+                            anime.schedule_confidence.as_deref(),
+                            state.display_timezone,
+                        )
+                    })
                     .unwrap_or_else(|| "—".into())
             },
             schedule: if anime.lifecycle == "archived" {
@@ -960,6 +970,11 @@ async fn anime_draft(
         episode_mapping,
         warning,
     ) = if let Some(resolved) = resolved {
+        let expected_at = format_schedule_time(
+            resolved.expected_at,
+            resolved.schedule_confidence.as_deref(),
+            state.display_timezone,
+        );
         let total_episodes = resolved
             .total_episodes
             .map(|total| {
@@ -1000,7 +1015,7 @@ async fn anime_draft(
                 .unwrap_or_else(|| "未使用".into()),
             resolved.next_episode,
             total_episodes,
-            format_time(resolved.expected_at, state.display_timezone),
+            expected_at,
             resolved
                 .schedule_source
                 .as_deref()
@@ -1327,8 +1342,13 @@ async fn anime_detail(
         } else {
             episode
                 .as_ref()
-                .and_then(|episode| episode.expected_at)
-                .map(|value| format_time(Some(value), state.display_timezone))
+                .map(|episode| {
+                    format_schedule_time(
+                        episode.expected_at,
+                        anime.anime.schedule_confidence.as_deref(),
+                        state.display_timezone,
+                    )
+                })
                 .unwrap_or_else(|| "未知".into())
         },
         schedule_source: anime
@@ -3224,7 +3244,7 @@ fn schedule_source_label(source: &str) -> String {
         "abema" => "ABEMA".into(),
         "gamer" => "巴哈姆特动画疯".into(),
         "gamer_hk" => "巴哈姆特动画疯（香港）".into(),
-        "anilist" => "AniList 精确播出时刻".into(),
+        "anilist" => "AniList".into(),
         "bangumi-data" => "bangumi-data 默认时段".into(),
         "unknown" => "未知".into(),
         value => value.to_string(),
@@ -3236,6 +3256,7 @@ fn schedule_confidence_label(confidence: &str) -> String {
         "calibrated" => "章节日期 + 网络时段校准".into(),
         "stale" => "保留上次校准值".into(),
         "estimated" => "估算".into(),
+        "date_only" => "仅开播日期，时间待公布".into(),
         "unavailable" => "时间不可用".into(),
         value => value.to_string(),
     }
@@ -3250,6 +3271,24 @@ fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "—".into())
+}
+
+fn format_schedule_time(
+    value: Option<DateTime<Utc>>,
+    confidence: Option<&str>,
+    timezone: Tz,
+) -> String {
+    if confidence == Some("date_only") {
+        return value
+            .map(|value| {
+                format!(
+                    "{}（时间待公布）",
+                    value.with_timezone(&timezone).format("%Y-%m-%d")
+                )
+            })
+            .unwrap_or_else(|| "日期待公布".into());
+    }
+    format_time(value, timezone)
 }
 
 fn chinese_weekday(weekday: Weekday) -> &'static str {
@@ -3745,6 +3784,10 @@ mod tests {
         assert_eq!(
             format_time(Some(value), chrono_tz::Asia::Shanghai),
             "2026-08-21 21:25:20"
+        );
+        assert_eq!(
+            format_schedule_time(Some(value), Some("date_only"), chrono_tz::Asia::Shanghai),
+            "2026-08-21（时间待公布）"
         );
     }
 
