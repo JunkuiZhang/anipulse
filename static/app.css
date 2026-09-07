@@ -556,32 +556,35 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .anime-detail-hero {
   display: grid;
-  grid-template-columns: minmax(270px, 320px) minmax(0, 1fr);
+  grid-template-columns: minmax(330px, 370px) minmax(0, 1fr);
   align-items: stretch;
-  gap: 28px;
+  gap: 0;
+  overflow: hidden;
   margin-bottom: 26px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(190, 211, 206, 0.26), transparent 25rem),
+    linear-gradient(145deg, rgba(255, 255, 255, 0.84), rgba(247, 248, 247, 0.66));
+  backdrop-filter: blur(20px) saturate(115%);
+  box-shadow: var(--shadow);
 }
 
 .detail-cover {
   width: 100%;
   min-height: 390px;
   aspect-ratio: 2 / 3;
-  border-radius: 18px;
-  box-shadow: 0 20px 46px rgba(73, 84, 91, 0.15), 0 4px 12px rgba(73, 84, 91, 0.08);
+  border: 0;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .detail-cover span { font-size: 4.2rem; }
 
 .anime-detail-content {
   min-width: 0;
-  padding: 28px;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background:
-    radial-gradient(circle at 100% 0, rgba(190, 211, 206, 0.26), transparent 25rem),
-    linear-gradient(145deg, rgba(255, 255, 255, 0.84), rgba(247, 248, 247, 0.66));
-  backdrop-filter: blur(20px) saturate(115%);
-  box-shadow: var(--shadow);
+  padding: 30px 32px;
 }
 
 .detail-title-row {
@@ -1548,8 +1551,9 @@ textarea:focus {
   .anime-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .uploader-form { grid-template-columns: 1fr 1fr; }
   .history-add-panel { grid-template-columns: 1fr; gap: 16px; }
-  .anime-detail-hero { grid-template-columns: minmax(190px, 230px) minmax(0, 1fr); }
+  .anime-detail-hero { grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); }
   .detail-cover { min-height: 330px; }
+  .anime-detail-content { padding: 24px; }
   .detail-title-row { display: grid; }
   .lifecycle-panel { grid-template-columns: 1fr; gap: 18px; }
 }
@@ -1630,7 +1634,15 @@ textarea:focus {
   .candidate-actions form button { width: 100%; }
   .inline-form { display: grid; }
   .anime-detail-hero { grid-template-columns: 1fr; }
-  .detail-cover { width: min(76vw, 300px); min-height: 0; margin: 0 auto; }
+  .detail-cover {
+    width: 100%;
+    min-height: 0;
+    aspect-ratio: 16 / 10;
+    margin: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .detail-cover img { object-position: center 24%; }
   .anime-detail-content { padding: 20px; }
   .detail-title-row h1 { font-size: 2.25rem; }
   .detail-title-row .page-description { display: block; }
