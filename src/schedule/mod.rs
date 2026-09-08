@@ -155,6 +155,10 @@ struct AnimeScheduleAnime {
     #[serde(default)]
     premier: Option<DateTime<Utc>>,
     #[serde(default)]
+    month: Option<String>,
+    #[serde(default)]
+    year: Option<i32>,
+    #[serde(default)]
     episode_override: Option<AnimeScheduleEpisodeOverride>,
     #[serde(default)]
     delayed_from: Option<DateTime<Utc>>,
@@ -586,18 +590,10 @@ impl ScheduleProvider {
                 total_episodes,
             });
         }
-        let airdate = episode
-            .airdate
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
-                    AppError::Schedule(format!(
-                        "Bangumi episode API returned invalid airdate: {value}"
-                    ))
-                })
-            })
-            .transpose()?;
+        let airdate = parse_metadata_date(
+            episode.airdate.as_deref(),
+            "Bangumi episode API returned invalid airdate",
+        )?;
         Ok(EpisodeLookup {
             airdate,
             total_episodes,
@@ -629,18 +625,10 @@ impl ScheduleProvider {
         let episode = self
             .episode_airdate(subject_id, subject_episode_index, bangumi_episode_no)
             .await?;
-        let subject_date = subject
-            .date
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
-                    AppError::Schedule(format!(
-                        "Bangumi subject API returned invalid date: {value}"
-                    ))
-                })
-            })
-            .transpose()?;
+        let subject_date = parse_metadata_date(
+            subject.date.as_deref(),
+            "Bangumi subject API returned invalid date",
+        )?;
         let media = self
             .resolve_anime_schedule_media(
                 &subject,
@@ -649,34 +637,37 @@ impl ScheduleProvider {
                 anime_schedule_route,
             )
             .await?;
-        let (mut expected_at, mut confidence, mut timing_warning) = anime_schedule_estimate(
-            episode.airdate,
-            subject_date,
-            &media,
-            subject_episode_index,
-            timezone,
-        )?;
+        let (mut expected_at, mut confidence, mut timing_warning, query_timetable) =
+            anime_schedule_estimate(
+                episode.airdate,
+                subject_date,
+                &media,
+                subject_episode_index,
+                timezone,
+            )?;
         let mut source_health_error = None;
-        match self
-            .anime_schedule_timetable(expected_at, &media.route, subject_episode_index)
-            .await
-        {
-            Ok(Some(exact)) => {
-                expected_at = exact.episode_date;
-                confidence = "calibrated";
-                timing_warning = exact
-                    .delayed_text
-                    .map(|detail| format!("AnimeSchedule 标记本集排期有变动：{detail}"));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                source_health_error = Some(error.to_string());
-                timing_warning = merge_warnings(
-                    timing_warning,
-                    Some(format!(
-                        "AnimeSchedule 周排期暂时不可用，已保留首播时间推算值：{error}"
-                    )),
-                );
+        if query_timetable {
+            match self
+                .anime_schedule_timetable(expected_at, &media.route, subject_episode_index)
+                .await
+            {
+                Ok(Some(exact)) => {
+                    expected_at = exact.episode_date;
+                    confidence = "calibrated";
+                    timing_warning = exact
+                        .delayed_text
+                        .map(|detail| format!("AnimeSchedule 标记本集排期有变动：{detail}"));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    source_health_error = Some(error.to_string());
+                    timing_warning = merge_warnings(
+                        timing_warning,
+                        Some(format!(
+                            "AnimeSchedule 周排期暂时不可用，已保留首播时间推算值：{error}"
+                        )),
+                    );
+                }
             }
         }
         let batch_release = anime_schedule_is_ona(&media);
@@ -852,7 +843,7 @@ async fn decode_metadata_response<T: for<'de> Deserialize<'de>>(
                 "; set {ANIME_SCHEDULE_TOKEN_ENV} for direct access, or configure the Cloudflare Worker secret"
             )
         } else if label.starts_with("AnimeSchedule") && status.as_u16() == 502 {
-            "; verify that the Worker has ANIME_SCHEDULE_TOKEN and the new AnimeSchedule routes"
+            "; inspect the Worker logs; common causes are an upstream error or stale Worker routes/token"
                 .into()
         } else {
             String::new()
@@ -890,7 +881,7 @@ fn anime_schedule_estimate(
     media: &AnimeScheduleAnime,
     subject_episode_index: i64,
     timezone: Tz,
-) -> Result<(DateTime<Utc>, &'static str, Option<String>)> {
+) -> Result<(DateTime<Utc>, &'static str, Option<String>, bool)> {
     let premier = anime_schedule_premier(media);
     if let Some(override_entry) = media.episode_override.filter(|entry| {
         let first = entry
@@ -904,6 +895,7 @@ fn anime_schedule_estimate(
             Some(format!(
                 "AnimeSchedule 提供了 EP{subject_episode_index} 的调档时间。"
             )),
+            true,
         ));
     }
 
@@ -962,46 +954,102 @@ fn anime_schedule_estimate(
                 "estimated"
             },
             warning,
+            true,
         ));
     }
 
-    let date = if let Some(airdate) = episode_airdate {
-        airdate
+    let (start_date, month_only) = match (episode_airdate, subject_date) {
+        (Some(airdate), _) => (airdate, false),
+        (None, Some(subject_date)) => (subject_date, false),
+        (None, None) => (
+            anime_schedule_month_start(media)?.ok_or_else(|| {
+                AppError::Schedule(format!(
+                    "AnimeSchedule '{}' matched '{}', but neither source has a usable premiere date or month",
+                    media.route,
+                    anime_schedule_display_title(media)
+                ))
+            })?,
+            true,
+        ),
+    };
+    let date = if subject_episode_index == 1 || anime_schedule_is_ona(media) {
+        start_date
     } else {
-        let start_date = subject_date.ok_or_else(|| {
-            AppError::Schedule(format!(
-                "AnimeSchedule '{}' matched '{}', but neither source has a precise premiere date",
-                media.route,
-                anime_schedule_display_title(media)
-            ))
-        })?;
-        if subject_episode_index == 1 || anime_schedule_is_ona(media) {
-            start_date
-        } else {
-            let day_offset = subject_episode_index
-                .checked_sub(1)
-                .and_then(|value| value.checked_mul(7))
-                .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?;
-            start_date
-                .checked_add_signed(Duration::days(day_offset))
-                .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?
-        }
+        let day_offset = subject_episode_index
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(7))
+            .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?;
+        start_date
+            .checked_add_signed(Duration::days(day_offset))
+            .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?
     };
     let local = timezone
         .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
         .single()
         .ok_or_else(|| AppError::Schedule("cannot construct date-only schedule boundary".into()))?;
+    let warning = if month_only {
+        format!(
+            "AnimeSchedule 目前仅公布 {}年{}月，尚无具体日期和时刻；系统将从 {date} 起检查，并每日同步正式排期。",
+            start_date.year(),
+            start_date.month()
+        )
+    } else {
+        format!(
+            "当前来源仅公布 {date} 的开播日期，尚无精确上线时刻；系统将从当天开始检查并每日同步。"
+        )
+    };
     Ok((
         local.with_timezone(&Utc),
         "date_only",
-        Some(format!(
-            "当前来源仅公布 {date} 的开播日期，尚无精确上线时刻；系统将从当天开始检查并每日同步。"
-        )),
+        Some(warning),
+        !month_only,
     ))
 }
 
 fn valid_anime_schedule_time(value: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-    value.filter(|time| time.year() >= 1900)
+    value.filter(|time| valid_metadata_year(time.year()))
+}
+
+fn parse_metadata_date(value: Option<&str>, error_context: &str) -> Result<Option<NaiveDate>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| AppError::Schedule(format!("{error_context}: {value}")))?;
+    Ok(valid_metadata_year(date.year()).then_some(date))
+}
+
+fn valid_metadata_year(year: i32) -> bool {
+    year >= 1900 && year != 2099
+}
+
+fn anime_schedule_month_start(media: &AnimeScheduleAnime) -> Result<Option<NaiveDate>> {
+    let (Some(year), Some(month)) = (media.year, media.month.as_deref()) else {
+        return Ok(None);
+    };
+    if !valid_metadata_year(year) {
+        return Ok(None);
+    }
+    let month_number = match month.trim().to_ascii_lowercase().as_str() {
+        "1" | "01" | "jan" | "january" => 1,
+        "2" | "02" | "feb" | "february" => 2,
+        "3" | "03" | "mar" | "march" => 3,
+        "4" | "04" | "apr" | "april" => 4,
+        "5" | "05" | "may" => 5,
+        "6" | "06" | "jun" | "june" => 6,
+        "7" | "07" | "jul" | "july" => 7,
+        "8" | "08" | "aug" | "august" => 8,
+        "9" | "09" | "sep" | "sept" | "september" => 9,
+        "10" | "oct" | "october" => 10,
+        "11" | "nov" | "november" => 11,
+        "12" | "dec" | "december" => 12,
+        _ => {
+            return Err(AppError::Schedule(format!(
+                "AnimeSchedule returned an invalid premiere month: {month}"
+            )));
+        }
+    };
+    Ok(NaiveDate::from_ymd_opt(year, month_number, 1))
 }
 
 fn anime_schedule_premier(media: &AnimeScheduleAnime) -> Option<DateTime<Utc>> {
@@ -1885,6 +1933,8 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc),
             ),
+            month: Some("October".into()),
+            year: Some(2026),
             episode_override: None,
             delayed_from: None,
             delayed_until: None,
@@ -2066,6 +2116,50 @@ mod tests {
                 .is_some_and(|warning| warning.contains("尚无精确上线时刻"))
         );
         assert_eq!(requests.await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn placeholder_dates_use_anime_schedule_month_without_querying_a_future_timetable() {
+        let (base_url, requests) = month_only_anime_schedule_mock_server().await;
+        let provider = ScheduleProvider::new(ScheduleConfig {
+            bangumi_data_url: format!("{base_url}/data.json"),
+            bangumi_api_base_url: base_url.clone(),
+            anime_schedule_api_url: format!("{base_url}/anime-schedule"),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        })
+        .unwrap();
+        let catalog = provider.load_catalog().await.unwrap();
+
+        let resolved = provider
+            .resolve_auto(
+                &catalog,
+                AutoScheduleRequest {
+                    title: "拥有超强装备与宇宙飞船的我",
+                    subject_id: Some(536_270),
+                    next_episode: 1,
+                    episode_mapping: None,
+                    anilist_media_id: None,
+                    anime_schedule_route: Some(
+                        "mezametara-saikyou-soubi-to-uchuusenmochi-datta-node-ikkodate-mezashite-youhei-toshite-jiyuu-ni-ikitai",
+                    ),
+                    timezone: "Asia/Shanghai",
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.schedule_confidence, "date_only");
+        assert_eq!(resolved.expected_time, None);
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-09-30T16:00:00+00:00"
+        );
+        let warning = resolved.schedule_warning.unwrap();
+        assert!(warning.contains("2026年10月"));
+        assert!(!warning.contains("2099-01-01"));
+        assert!(!warning.contains("周排期暂时不可用"));
+        assert_eq!(requests.await.unwrap(), 4);
     }
 
     #[tokio::test]
@@ -2698,6 +2792,44 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             5
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn month_only_anime_schedule_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let response_body = match index {
+                    0 => {
+                        r#"{"items":[{"title":"別の作品","titleTranslate":{},"type":"tv","begin":"2026-10-01T15:00:00.000Z","sites":[{"site":"bangumi","id":"999999"}]}]}"#
+                    }
+                    1 => {
+                        assert!(headers.contains("/v0/subjects/536270"));
+                        r#"{"id":536270,"name":"目覚めたら最強装備と宇宙船持ちだったので","name_cn":"拥有超强装备与宇宙飞船的我","date":"2099-01-01","platform":"TV","total_episodes":null}"#
+                    }
+                    2 => {
+                        assert!(headers.contains("/v0/episodes?"));
+                        assert!(headers.contains("subject_id=536270"));
+                        r#"{"total":null,"data":[{"airdate":"2099-01-01","sort":1,"ep":1}]}"#
+                    }
+                    _ => {
+                        assert!(headers.starts_with("GET /anime-schedule/anime/mezametara-"));
+                        r#"{"title":"目覚めたら最強装備と宇宙船持ちだったので","route":"mezametara-saikyou-soubi-to-uchuusenmochi-datta-node-ikkodate-mezashite-youhei-toshite-jiyuu-ni-ikitai","premier":null,"month":"October","year":2026,"episodes":null,"status":"Upcoming","names":{"english":"Reborn as a Space Mercenary","native":"目覚めたら最強装備と宇宙船持ちだったので"},"mediaTypes":[{"route":"tv"}]}"#
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            4
         });
         (format!("http://{address}"), task)
     }

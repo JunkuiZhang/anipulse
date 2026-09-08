@@ -608,7 +608,7 @@ impl ApplicationService {
             .any(|value| normalize_title(value) == input);
         let title_warning = (!matched).then(|| {
             format!(
-                "输入标题与 Bangumi #{} 的标题差异较大，请确认没有选错季度或作品。",
+                "输入标题未与 Bangumi #{} 提供的标题完全一致，请确认没有选错季度或作品。",
                 resolved.bangumi_subject_id
             )
         });
