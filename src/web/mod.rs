@@ -513,6 +513,8 @@ struct UpcomingReleaseView {
     has_cover: bool,
     cover_initial: String,
     episode: String,
+    episode_total: String,
+    has_episode_total: bool,
     day: String,
     time: String,
     enabled: bool,
@@ -558,6 +560,11 @@ async fn dashboard(
                 has_cover: cover_url.is_some(),
                 cover_url: cover_url.unwrap_or_default(),
                 episode: format!("EP{}", release.episode_no),
+                episode_total: release
+                    .total_episodes
+                    .map(|total| format!("全 {total} 集"))
+                    .unwrap_or_default(),
+                has_episode_total: release.total_episodes.is_some(),
                 day: format!(
                     "{} · {}",
                     local.format("%m月%d日"),
@@ -661,6 +668,8 @@ struct AnimeListItem {
     has_cover: bool,
     cover_initial: String,
     episode: String,
+    episode_total: String,
+    has_episode_total: bool,
     time_label: String,
     time_value: String,
     schedule: String,
@@ -739,6 +748,11 @@ async fn anime_list(
                     })
                     .unwrap_or_else(|| "—".into())
             },
+            episode_total: anime
+                .total_episodes
+                .map(|total| format!("全 {total} 集"))
+                .unwrap_or_default(),
+            has_episode_total: anime.lifecycle == "tracking" && anime.total_episodes.is_some(),
             time_label: if anime.lifecycle == "archived" {
                 "归档时间".into()
             } else if anime.lifecycle == "released_complete" {
@@ -3664,6 +3678,21 @@ mod tests {
         assert_eq!(
             cookie_value(&headers, SESSION_COOKIE).as_deref(),
             Some("token")
+        );
+    }
+
+    #[test]
+    fn new_anime_form_defaults_maximum_duration_to_forty_minutes() {
+        let html = AnimeNewTemplate {
+            username: "admin".into(),
+            csrf_token: "test-token".into(),
+        }
+        .render()
+        .unwrap();
+
+        assert!(
+            html.contains("name=\"duration_max\" min=\"1\" max=\"360\" value=\"40\" required"),
+            "rendered form did not contain the expected 40-minute default"
         );
     }
 

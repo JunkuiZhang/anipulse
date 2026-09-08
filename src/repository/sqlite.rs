@@ -129,6 +129,7 @@ pub struct UpcomingReleaseRow {
     pub anime_id: i64,
     pub title: String,
     pub bangumi_subject_id: Option<i64>,
+    pub total_episodes: Option<i64>,
     pub schedule_confidence: Option<String>,
     pub enabled: bool,
     pub episode_no: i64,
@@ -454,7 +455,8 @@ impl Repository {
     ) -> Result<Vec<UpcomingReleaseRow>> {
         Ok(sqlx::query_as::<_, UpcomingReleaseRow>(
             r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id,
-                      a.schedule_confidence, a.enabled, e.episode_no, e.expected_at
+                      a.total_episodes, a.schedule_confidence, a.enabled,
+                      e.episode_no, e.expected_at
                FROM anime a
                JOIN episode e ON e.anime_id = a.id
                WHERE a.lifecycle = 'tracking'
@@ -4008,6 +4010,11 @@ mod tests {
             .add_anime(add("两天后", now + chrono::Duration::days(2)))
             .await
             .unwrap();
+        sqlx::query("UPDATE anime SET total_episodes = 12 WHERE id = ?")
+            .bind(later)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
         let paused = repository
             .add_anime(add("明天", now + chrono::Duration::days(1)))
             .await
@@ -4034,6 +4041,7 @@ mod tests {
         assert_eq!(releases[0].anime_id, paused);
         assert!(!releases[0].enabled);
         assert_eq!(releases[1].anime_id, later);
+        assert_eq!(releases[1].total_episodes, Some(12));
     }
 
     fn candidate() -> (VideoCandidate, Evaluation) {

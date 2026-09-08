@@ -16,7 +16,7 @@
     <div class="upcoming-main">
       <div class="upcoming-date"><strong>{{ item.day }}</strong><span>{{ item.time }}</span></div>
       <h2>{{ item.title }}</h2>
-      <div class="upcoming-meta"><span>{{ item.episode }} · 预计更新</span>{% if !item.enabled %}<span class="paused-label">监控已暂停</span>{% endif %}</div>
+      <div class="upcoming-meta"><span class="episode-progress"><strong>{{ item.episode }}</strong>{% if item.has_episode_total %}<small>{{ item.episode_total }}</small>{% endif %}</span><span class="upcoming-kind">预计更新</span>{% if !item.enabled %}<span class="paused-label">监控已暂停</span>{% endif %}</div>
     </div>
   </a>
 {% endfor %}
