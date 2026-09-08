@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    sync::LazyLock,
     time::Duration as StdDuration,
 };
 
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::{Asia::Tokyo, Tz};
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -25,6 +27,15 @@ const STREAM_CONSENSUS_WINDOW_SECS: i64 = 2 * 60 * 60;
 const MIN_STREAM_SOURCE_FAMILIES: usize = 2;
 const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 const ANIME_SCHEDULE_TOKEN_ENV: &str = "ANIME_SCHEDULE_TOKEN";
+
+static EAST_ASIAN_SEASON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:第\s*)?([0-9一二两三四五六七八九十]+)\s*[期季]")
+        .expect("valid East Asian season regex")
+});
+static LATIN_SEASON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:season[\s.\-]*(\d{1,2})|(\d{1,2})(?:st|nd|rd|th)?[\s.\-]*season)")
+        .expect("valid Latin season regex")
+});
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
@@ -1103,6 +1114,15 @@ fn anime_schedule_display_title(media: &AnimeScheduleAnime) -> &str {
         .unwrap_or(&media.title)
 }
 
+fn anime_schedule_identity_title(media: &AnimeScheduleAnime) -> String {
+    let display = anime_schedule_display_title(media);
+    if display == media.title {
+        display.into()
+    } else {
+        format!("{display} / {}", media.title)
+    }
+}
+
 fn anime_schedule_anilist_id(media: &AnimeScheduleAnime) -> Option<i64> {
     media
         .websites
@@ -1116,17 +1136,108 @@ fn anime_schedule_anilist_id(media: &AnimeScheduleAnime) -> Option<i64> {
         .ok()
 }
 
+fn parse_chinese_number(value: &str) -> Option<i64> {
+    let digit = |character| match character {
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    };
+    let characters = value.chars().collect::<Vec<_>>();
+    match characters.as_slice() {
+        [single] => digit(*single).or_else(|| (*single == '十').then_some(10)),
+        [left, '十'] => digit(*left).map(|value| value * 10),
+        ['十', right] => digit(*right).map(|value| 10 + value),
+        [left, '十', right] => Some(digit(*left)? * 10 + digit(*right)?),
+        _ => None,
+    }
+}
+
+fn season_numbers(values: impl IntoIterator<Item = impl AsRef<str>>) -> HashSet<i64> {
+    let mut numbers = HashSet::new();
+    for value in values {
+        let normalized = normalize_title(value.as_ref());
+        for captures in EAST_ASIAN_SEASON.captures_iter(&normalized) {
+            let value = &captures[1];
+            if let Some(number) = value
+                .parse::<i64>()
+                .ok()
+                .or_else(|| parse_chinese_number(value))
+                .filter(|number| (1..=99).contains(number))
+            {
+                numbers.insert(number);
+            }
+        }
+        for captures in LATIN_SEASON.captures_iter(&normalized) {
+            if let Some(number) = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .and_then(|value| value.as_str().parse::<i64>().ok())
+                .filter(|number| (1..=99).contains(number))
+            {
+                numbers.insert(number);
+            }
+        }
+    }
+    numbers
+}
+
+fn title_without_season(value: &str) -> String {
+    let normalized = normalize_title(value);
+    let without_east_asian = EAST_ASIAN_SEASON.replace_all(&normalized, " ");
+    let without_latin = LATIN_SEASON.replace_all(&without_east_asian, " ");
+    normalize_title(&without_latin)
+}
+
+fn anime_schedule_release_label(media: &AnimeScheduleAnime) -> String {
+    if let Some(date) = anime_schedule_premier_date(media) {
+        return date.to_string();
+    }
+    anime_schedule_month_start(media)
+        .ok()
+        .flatten()
+        .map(|date| date.format("%Y-%m").to_string())
+        .unwrap_or_else(|| "unknown date".into())
+}
+
+fn anime_schedule_release_conflicts(
+    subject_date: Option<NaiveDate>,
+    media: &AnimeScheduleAnime,
+) -> bool {
+    let Some(subject_date) = subject_date else {
+        return false;
+    };
+    if let Some(media_date) = anime_schedule_premier_date(media) {
+        return subject_date != media_date;
+    }
+    anime_schedule_month_start(media)
+        .ok()
+        .flatten()
+        .is_some_and(|month| {
+            subject_date.year() != month.year() || subject_date.month() != month.month()
+        })
+}
+
 fn anime_schedule_matches_subject(
     subject: &BangumiSubject,
     subject_date: Option<NaiveDate>,
     media: &AnimeScheduleAnime,
     expected_anilist_id: Option<i64>,
 ) -> bool {
-    if let (Some(expected), Some(actual)) = (expected_anilist_id, anime_schedule_anilist_id(media))
+    let actual_anilist_id = anime_schedule_anilist_id(media);
+    if let (Some(expected), Some(actual)) = (expected_anilist_id, actual_anilist_id)
         && expected != actual
     {
         return false;
     }
+    let anilist_id_matches =
+        expected_anilist_id.is_some() && expected_anilist_id == actual_anilist_id;
     let subject_titles = [&subject.name, &subject.name_cn]
         .into_iter()
         .map(|value| normalize_title(value))
@@ -1145,32 +1256,7 @@ fn anime_schedule_matches_subject(
     if subject_titles.is_empty() || media_titles.is_empty() {
         return false;
     }
-    let exact_title = subject_titles
-        .iter()
-        .any(|subject| media_titles.iter().any(|media| subject == media));
-    let exact_primary_title = subject_titles
-        .iter()
-        .any(|subject| media_primary_titles.iter().any(|media| subject == media));
-    let equivalent_title = exact_title
-        || subject_titles.iter().any(|subject| {
-            media_titles
-                .iter()
-                .any(|media| equivalent_title_spelling(subject, media))
-        });
-    if !equivalent_title {
-        return false;
-    }
-    let media_date = anime_schedule_premier_date(media);
-    if !exact_primary_title
-        && subject_date
-            .zip(media_date)
-            .is_none_or(|(left, right)| left != right)
-    {
-        return false;
-    }
-    if let (Some(subject_date), Some(media_date)) = (subject_date, media_date)
-        && subject_date != media_date
-    {
+    if anime_schedule_release_conflicts(subject_date, media) {
         return false;
     }
     let platform = subject.platform.as_deref().unwrap_or_default();
@@ -1183,7 +1269,67 @@ fn anime_schedule_matches_subject(
     {
         return false;
     }
-    true
+    let subject_seasons = season_numbers([subject.name.as_str(), subject.name_cn.as_str()]);
+    let media_seasons = season_numbers(
+        anime_schedule_titles(media)
+            .into_iter()
+            .chain(std::iter::once(media.route.as_str())),
+    );
+    if subject_seasons.len() > 1
+        || media_seasons.len() > 1
+        || (!subject_seasons.is_empty()
+            && !media_seasons.is_empty()
+            && subject_seasons != media_seasons)
+    {
+        return false;
+    }
+    let exact_title = subject_titles
+        .iter()
+        .any(|subject| media_titles.iter().any(|media| subject == media));
+    let exact_primary_title = subject_titles
+        .iter()
+        .any(|subject| media_primary_titles.iter().any(|media| subject == media));
+    let equivalent_title = exact_title
+        || subject_titles.iter().any(|subject| {
+            media_titles
+                .iter()
+                .any(|media| equivalent_title_spelling(subject, media))
+        });
+    let media_date = anime_schedule_premier_date(media);
+    let exact_date_matches = subject_date
+        .zip(media_date)
+        .is_some_and(|(left, right)| left == right);
+    let only_one_side_declares_season = subject_seasons.is_empty() != media_seasons.is_empty();
+    if exact_primary_title
+        && (!only_one_side_declares_season || exact_date_matches || anilist_id_matches)
+    {
+        return true;
+    }
+    if equivalent_title && exact_date_matches {
+        return true;
+    }
+
+    let matching_season =
+        subject_seasons.len() == 1 && media_seasons.len() == 1 && subject_seasons == media_seasons;
+    if !matching_season {
+        return false;
+    }
+
+    let subject_cores = [&subject.name, &subject.name_cn]
+        .into_iter()
+        .map(|value| title_without_season(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let media_cores = anime_schedule_titles(media)
+        .into_iter()
+        .map(title_without_season)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    subject_cores.iter().any(|subject| {
+        media_cores
+            .iter()
+            .any(|media| subject == media || equivalent_title_spelling(subject, media))
+    })
 }
 
 fn equivalent_title_spelling(left: &str, right: &str) -> bool {
@@ -1214,10 +1360,8 @@ fn validate_anime_schedule_mapping(
     Err(AppError::Schedule(format!(
         "AnimeSchedule '{}' ('{}', {}) does not match Bangumi #{} ('{}', {}); verify the season and route",
         media.route,
-        anime_schedule_display_title(media),
-        anime_schedule_premier_date(media)
-            .map(|date| date.to_string())
-            .unwrap_or_else(|| "unknown date".into()),
+        anime_schedule_identity_title(media),
+        anime_schedule_release_label(media),
         subject.id,
         subject.name,
         subject_date
@@ -1249,10 +1393,8 @@ fn select_anime_schedule_candidate(
             format!(
                 "{} {} ({}, {}, {})",
                 media.route,
-                anime_schedule_display_title(media),
-                anime_schedule_premier_date(media)
-                    .map(|date| date.to_string())
-                    .unwrap_or_else(|| "date unknown".into()),
+                anime_schedule_identity_title(media),
+                anime_schedule_release_label(media),
                 media
                     .media_types
                     .first()
@@ -1973,6 +2115,97 @@ mod tests {
             &wrong_date,
             Some(195_539),
         ));
+    }
+
+    #[test]
+    fn anime_schedule_mapping_uses_multilingual_core_title_and_explicit_season() {
+        let subject = BangumiSubject {
+            id: 616_808,
+            name: "野生のラスボスが現れた！第2期".into(),
+            name_cn: "野生的大魔王出现了 第二季".into(),
+            date: None,
+            platform: Some("TV".into()),
+            total_episodes: None,
+        };
+        let media = AnimeScheduleAnime {
+            title: "Yasei no Last Boss ga Arawareta! 2nd Season".into(),
+            route: "yasei-no-last-boss-ga-arawareta-2nd-season".into(),
+            premier: None,
+            month: Some("October".into()),
+            year: Some(2027),
+            episode_override: None,
+            delayed_from: None,
+            delayed_until: None,
+            episodes: None,
+            status: Some("Upcoming".into()),
+            names: Some(AnimeScheduleNames {
+                romaji: Some("Yasei no Last Boss ga Arawareta! 2nd Season".into()),
+                english: Some("A Wild Last Boss Appeared! 2nd Season".into()),
+                native: Some("野生のラスボスが現れた！".into()),
+                synonyms: Some(vec!["A Wild Last Boss Appeared! Season 2".into()]),
+                ..AnimeScheduleNames::default()
+            }),
+            websites: Some(AnimeScheduleWebsites {
+                ani_list: Some("https://anilist.co/anime/200001".into()),
+            }),
+            media_types: vec![AnimeScheduleCategory { route: "tv".into() }],
+        };
+
+        assert!(anime_schedule_matches_subject(
+            &subject,
+            None,
+            &media,
+            Some(200_001),
+        ));
+        assert!(anime_schedule_matches_subject(
+            &subject,
+            NaiveDate::from_ymd_opt(2027, 10, 18),
+            &media,
+            Some(200_001),
+        ));
+        assert!(!anime_schedule_matches_subject(
+            &subject,
+            NaiveDate::from_ymd_opt(2027, 11, 1),
+            &media,
+            Some(200_001),
+        ));
+        let timezone = "Asia/Shanghai".parse::<Tz>().unwrap();
+        let (expected_at, confidence, warning, precise) =
+            anime_schedule_estimate(None, None, &media, 1, timezone).unwrap();
+        assert_eq!(expected_at.to_rfc3339(), "2027-09-30T16:00:00+00:00");
+        assert_eq!(confidence, "date_only");
+        assert!(!precise);
+        assert!(warning.unwrap().contains("2027年10月"));
+
+        let mut wrong_season = media.clone();
+        wrong_season.title = "Yasei no Last Boss ga Arawareta! 3rd Season".into();
+        wrong_season.route = "yasei-no-last-boss-ga-arawareta-3rd-season".into();
+        wrong_season.names.as_mut().unwrap().romaji =
+            Some("Yasei no Last Boss ga Arawareta! 3rd Season".into());
+        wrong_season.names.as_mut().unwrap().english =
+            Some("A Wild Last Boss Appeared! 3rd Season".into());
+        wrong_season.names.as_mut().unwrap().synonyms = None;
+        assert!(!anime_schedule_matches_subject(
+            &subject,
+            None,
+            &wrong_season,
+            Some(200_001),
+        ));
+
+        let mut contradictory_season = wrong_season.clone();
+        contradictory_season.names.as_mut().unwrap().native = Some(subject.name.clone());
+        assert!(!anime_schedule_matches_subject(
+            &subject,
+            None,
+            &contradictory_season,
+            Some(200_001),
+        ));
+
+        let error = validate_anime_schedule_mapping(&subject, None, &wrong_season, Some(200_001))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2027-10"));
+        assert!(error.contains("3rd Season"));
     }
 
     #[tokio::test]
