@@ -3945,6 +3945,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn date_only_schedule_confidence_is_persisted() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("date-only-schedule.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "一觉醒来坐拥神装和飞船".into(),
+                aliases: Vec::new(),
+                next_episode: 1,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 2_400,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 536_270,
+                    anilist_media_id: Some(186_541),
+                    anime_schedule_route: Some(
+                        "mezametara-saikyou-soubi-to-uchuusenmochi-datta-node-ikkodate-mezashite-youhei-toshite-jiyuu-ni-ikitai".into(),
+                    ),
+                    total_episodes: None,
+                    broadcast_pattern: "R/2026-10-01T00:00:00Z/P1D".into(),
+                    schedule_source: "anime_schedule".into(),
+                    schedule_confidence: "date_only".into(),
+                    schedule_warning: Some("仅公布月份".into()),
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        assert_eq!(
+            anime.anime.schedule_confidence.as_deref(),
+            Some("date_only")
+        );
+    }
+
+    #[tokio::test]
     async fn upcoming_releases_are_ordered_windowed_and_keep_paused_schedules() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("upcoming.db");
