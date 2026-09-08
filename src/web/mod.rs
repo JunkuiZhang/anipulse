@@ -3567,13 +3567,41 @@ impl From<AppError> for WebError {
                 message,
             },
             AppError::NotFound(_) => Self::not_found("目标不存在或已经被删除"),
-            AppError::Database(_) => Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "数据库暂时忙，请稍后重试".into(),
-            },
+            AppError::Database(error) if sqlite_database_is_busy(&error) => {
+                tracing::warn!(%error, "SQLite database is busy or locked");
+                Self {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "数据库暂时忙，请稍后重试".into(),
+                }
+            }
+            AppError::Database(error) => {
+                tracing::error!(%error, "database operation failed");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "数据库操作失败，详细原因已写入服务日志".into(),
+                }
+            }
             _ => Self::internal(),
         }
     }
+}
+
+fn sqlite_database_is_busy(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(error) = error else {
+        return false;
+    };
+    let code = error.code();
+    let busy_code = sqlite_error_code_is_busy(code.as_deref());
+    if busy_code {
+        return true;
+    }
+    let message = error.message().to_ascii_lowercase();
+    message.contains("database is locked") || message.contains("database is busy")
+}
+
+fn sqlite_error_code_is_busy(code: Option<&str>) -> bool {
+    code.and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 impl IntoResponse for WebError {
@@ -3614,6 +3642,17 @@ mod tests {
         auth::create_admin,
         domain::{AutoScheduleMetadata, NewAnime},
     };
+
+    #[test]
+    fn only_sqlite_busy_and_locked_codes_are_classified_as_database_busy() {
+        assert!(sqlite_error_code_is_busy(Some("5")));
+        assert!(sqlite_error_code_is_busy(Some("6")));
+        assert!(sqlite_error_code_is_busy(Some("517")));
+        assert!(sqlite_error_code_is_busy(Some("773")));
+        assert!(!sqlite_error_code_is_busy(Some("19")));
+        assert!(!sqlite_error_code_is_busy(Some("787")));
+        assert!(!sqlite_error_code_is_busy(None));
+    }
 
     #[test]
     fn cookie_parser_only_reads_exact_name() {
@@ -3804,6 +3843,65 @@ mod tests {
         );
 
         drop((repository, config, auth));
+    }
+
+    #[tokio::test]
+    async fn upcoming_anime_form_creates_a_draft_and_background_job() {
+        let (_directory, repository, _config, auth, app) = test_app().await;
+        create_admin(&repository, "admin", "correct-password-1234".to_string())
+            .await
+            .unwrap();
+        let token = match auth
+            .login(
+                "admin",
+                "correct-password-1234".to_string(),
+                "127.0.0.1",
+                Some("test"),
+            )
+            .await
+            .unwrap()
+        {
+            LoginOutcome::Success(session) => session.token,
+            _ => panic!("test login should succeed"),
+        };
+        let identity = auth.authenticate(&token).await.unwrap().unwrap();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in [
+            ("csrf_token", identity.csrf_token.as_str()),
+            ("title", "一觉醒来坐拥神装和飞船"),
+            ("next_episode", "1"),
+            ("duration_min", "20"),
+            ("duration_max", "40"),
+            ("timezone", "Asia/Shanghai"),
+            ("auto_schedule", "yes"),
+            ("bangumi_id", "536270"),
+            ("anilist_id", "186541"),
+        ] {
+            form.append_pair(name, value);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/anime/resolve")
+                    .header(header::ORIGIN, "https://anime.example.com")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form.finish()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        let draft_id = location.strip_prefix("/anime/drafts/").unwrap();
+        let draft = repository
+            .anime_draft(draft_id, identity.admin_id, &identity.token_hmac)
+            .await
+            .unwrap();
+        assert_eq!(draft.state, "queued");
     }
 
     #[tokio::test]
