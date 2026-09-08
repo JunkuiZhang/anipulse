@@ -823,6 +823,7 @@ struct AnimeResolveForm {
     auto_schedule: Option<String>,
     bangumi_id: Option<String>,
     anilist_id: Option<String>,
+    anime_schedule_route: Option<String>,
     search_episode_start: Option<String>,
     bangumi_episode_start: Option<String>,
 }
@@ -901,6 +902,12 @@ async fn anime_resolve(
     let auto_schedule = form.auto_schedule.as_deref() == Some("yes");
     let bangumi_id = parse_optional_bangumi_id(form.bangumi_id.as_deref())?;
     let anilist_id = parse_optional_anilist_id(form.anilist_id.as_deref())?;
+    let anime_schedule_route = form
+        .anime_schedule_route
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let episode_mapping = parse_episode_mapping(
         form.search_episode_start.as_deref(),
         form.bangumi_episode_start.as_deref(),
@@ -919,6 +926,7 @@ async fn anime_resolve(
                 auto_schedule,
                 bangumi_id: auto_schedule.then_some(bangumi_id).flatten(),
                 anilist_id: auto_schedule.then_some(anilist_id).flatten(),
+                anime_schedule_route: auto_schedule.then_some(anime_schedule_route).flatten(),
                 episode_mapping,
             },
         )
@@ -948,6 +956,7 @@ struct AnimeDraftTemplate {
     matched_title: String,
     bangumi_id: String,
     anilist_id: String,
+    anime_schedule_route: String,
     next_episode: i64,
     total_episodes: String,
     has_total_episodes: bool,
@@ -980,6 +989,7 @@ async fn anime_draft(
         matched_title,
         bangumi_id,
         anilist_id,
+        anime_schedule_route,
         next_episode,
         total_episodes,
         expected_at,
@@ -1033,6 +1043,9 @@ async fn anime_draft(
                 .anilist_media_id
                 .map(|id| format!("#{id}"))
                 .unwrap_or_else(|| "未使用".into()),
+            resolved
+                .anime_schedule_route
+                .unwrap_or_else(|| "自动匹配".into()),
             resolved.next_episode,
             total_episodes,
             expected_at,
@@ -1065,6 +1078,7 @@ async fn anime_draft(
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
             0,
             String::new(),
             String::new(),
@@ -1087,6 +1101,7 @@ async fn anime_draft(
         matched_title,
         bangumi_id,
         anilist_id,
+        anime_schedule_route,
         next_episode,
         has_total_episodes: !total_episodes.is_empty(),
         total_episodes,
@@ -1159,6 +1174,7 @@ struct AnimeDetailTemplate {
     duration: String,
     bangumi: String,
     anilist: String,
+    anime_schedule_route: String,
     total_episodes: String,
     has_total_episodes: bool,
     episode_mapping: String,
@@ -1416,6 +1432,10 @@ async fn anime_detail(
             .anilist_media_id
             .map(|id| format!("#{id}"))
             .unwrap_or_else(|| "未使用".into()),
+        anime_schedule_route: anime
+            .anime
+            .anime_schedule_route
+            .unwrap_or_else(|| "未绑定".into()),
         has_total_episodes: !total_episodes.is_empty(),
         total_episodes,
         has_episode_mapping: !episode_mapping.is_empty(),
@@ -3435,7 +3455,8 @@ fn schedule_source_label(source: &str) -> String {
         "abema" => "ABEMA".into(),
         "gamer" => "巴哈姆特动画疯".into(),
         "gamer_hk" => "巴哈姆特动画疯（香港）".into(),
-        "anilist" => "AniList".into(),
+        "anime_schedule" => "AnimeSchedule".into(),
+        "anilist" => "AniList（旧数据）".into(),
         "bangumi-data" => "bangumi-data 默认时段".into(),
         "unknown" => "未知".into(),
         value => value.to_string(),
@@ -3820,6 +3841,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 633_836,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),

@@ -1,18 +1,6 @@
 const BANGUMI_DATA_URL = "https://unpkg.com/bangumi-data@0.3/dist/data.json";
 const BANGUMI_API_ORIGIN = "https://api.bgm.tv";
-const ANILIST_API_URL = "https://graphql.anilist.co";
-const ANILIST_QUERIES = {
-  AniPulseSearch: `query AniPulseSearch($search: String!, $seasonYear: Int) {
-    Page(page: 1, perPage: 10) { media(search: $search, seasonYear: $seasonYear, type: ANIME, sort: SEARCH_MATCH) {
-      id title { romaji english native } synonyms format status startDate { year month day }
-      episodes nextAiringEpisode { episode airingAt }
-    } }
-  }`,
-  AniPulseMedia: `query AniPulseMedia($id: Int!) {
-    Media(id: $id, type: ANIME) { id title { romaji english native } synonyms format status
-      startDate { year month day } episodes nextAiringEpisode { episode airingAt } }
-  }`,
-};
+const ANIME_SCHEDULE_API_ORIGIN = "https://animeschedule.net";
 
 const ROUTES = {
   data: {
@@ -39,6 +27,20 @@ const ROUTES = {
     maximumBytes: 5 * 1024 * 1024,
     kind: "image",
   },
+  animeScheduleAnime: {
+    edgeTtl: 15 * 60,
+    clientTtl: 60,
+    maximumBytes: 2 * 1024 * 1024,
+    kind: "json",
+    requiresAnimeScheduleToken: true,
+  },
+  animeScheduleTimetable: {
+    edgeTtl: 5 * 60,
+    clientTtl: 60,
+    maximumBytes: 4 * 1024 * 1024,
+    kind: "json",
+    requiresAnimeScheduleToken: true,
+  },
 };
 
 export default {
@@ -60,15 +62,6 @@ export async function handleRequest(request, env = {}, context = {}, dependencie
     return errorResponse(403, "forbidden");
   }
   const incomingUrl = new URL(request.url);
-  if (incomingUrl.pathname === "/anilist/graphql") {
-    if ([...incomingUrl.searchParams].length !== 0) {
-      return errorResponse(404, "not found");
-    }
-    if (request.method !== "POST") {
-      return errorResponse(405, "method not allowed", { Allow: "POST" });
-    }
-    return proxyAniList(request, env, runtimeFetch);
-  }
   if (!["GET", "HEAD"].includes(request.method)) {
     return errorResponse(405, "method not allowed", { Allow: "GET, HEAD" });
   }
@@ -82,6 +75,10 @@ export async function handleRequest(request, env = {}, context = {}, dependencie
   const route = resolveRoute(incomingUrl);
   if (!route) {
     return errorResponse(404, "not found");
+  }
+  const animeScheduleToken = env.ANIME_SCHEDULE_TOKEN?.trim();
+  if (route.requiresAnimeScheduleToken && !animeScheduleToken) {
+    return errorResponse(503, "AnimeSchedule token is not configured");
   }
 
   const cacheKeyUrl = new URL(request.url);
@@ -105,6 +102,9 @@ export async function handleRequest(request, env = {}, context = {}, dependencie
         || request.headers.get("User-Agent")
         || "AniPulse/0.1 (personal self-hosted)",
     );
+    if (route.requiresAnimeScheduleToken) {
+      headers.set("Authorization", `Bearer ${animeScheduleToken}`);
+    }
     upstreamResponse = await runtimeFetch(route.upstreamUrl, {
       method: "GET",
       headers,
@@ -201,84 +201,42 @@ export function resolveRoute(url) {
     };
   }
 
+  if (url.pathname === "/anime-schedule/anime" && validAnimeScheduleSearch(url.searchParams)) {
+    const upstream = new URL("/api/v3/anime", ANIME_SCHEDULE_API_ORIGIN);
+    upstream.search = url.search;
+    return {
+      ...ROUTES.animeScheduleAnime,
+      accept: "application/json",
+      upstreamUrl: upstream.toString(),
+    };
+  }
+
+  const animeScheduleRoute = url.pathname.match(
+    /^\/anime-schedule\/anime\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)$/,
+  );
+  if (animeScheduleRoute && [...url.searchParams].length === 0) {
+    return {
+      ...ROUTES.animeScheduleAnime,
+      accept: "application/json",
+      upstreamUrl: new URL(
+        `/api/v3/anime/${animeScheduleRoute[1]}`,
+        ANIME_SCHEDULE_API_ORIGIN,
+      ).toString(),
+    };
+  }
+
+  if (url.pathname === "/anime-schedule/timetables/raw"
+    && validAnimeScheduleTimetable(url.searchParams)) {
+    const upstream = new URL("/api/v3/timetables/raw", ANIME_SCHEDULE_API_ORIGIN);
+    upstream.search = url.search;
+    return {
+      ...ROUTES.animeScheduleTimetable,
+      accept: "application/json",
+      upstreamUrl: upstream.toString(),
+    };
+  }
+
   return null;
-}
-
-async function proxyAniList(request, env, runtimeFetch) {
-  const declaredLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > 16 * 1024) {
-    return errorResponse(413, "request body is too large");
-  }
-  let input;
-  try {
-    const text = await request.text();
-    if (text.length > 16 * 1024) return errorResponse(413, "request body is too large");
-    input = JSON.parse(text);
-  } catch (_error) {
-    return errorResponse(400, "invalid JSON body");
-  }
-  const validated = validateAniListRequest(input);
-  if (!validated) return errorResponse(400, "unsupported AniList operation or variables");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  let upstream;
-  try {
-    upstream = await runtimeFetch(ANILIST_API_URL, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": env.UPSTREAM_USER_AGENT?.trim() || "AniPulse/0.1 (personal self-hosted)",
-      },
-      body: JSON.stringify(validated),
-      signal: controller.signal,
-    });
-  } catch (error) {
-    return errorResponse(504, error?.name === "AbortError" ? "upstream timeout" : "upstream unavailable");
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!upstream.ok) return errorResponse(502, `upstream returned HTTP ${upstream.status}`);
-  const contentType = upstream.headers.get("content-type")?.toLowerCase() || "";
-  if (!validContentType("json", contentType)) {
-    return errorResponse(502, "upstream returned an unexpected content type");
-  }
-  let body;
-  try {
-    body = await upstream.arrayBuffer();
-  } catch (_error) {
-    return errorResponse(502, "upstream response could not be read");
-  }
-  if (body.byteLength > 2 * 1024 * 1024) return errorResponse(502, "upstream response is too large");
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Cache-Control": "no-store",
-      "Content-Type": contentType,
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
-}
-
-function validateAniListRequest(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const operationName = input.operationName;
-  const variables = input.variables;
-  if (!variables || typeof variables !== "object" || Array.isArray(variables)) return null;
-  if (operationName === "AniPulseSearch") {
-    const keys = Object.keys(variables).sort();
-    if (keys.join(",") !== "search,seasonYear") return null;
-    if (typeof variables.search !== "string" || !variables.search.trim() || variables.search.length > 300) return null;
-    if (variables.seasonYear !== null
-      && (!Number.isInteger(variables.seasonYear) || variables.seasonYear < 1900 || variables.seasonYear > 2200)) return null;
-  } else if (operationName === "AniPulseMedia") {
-    if (Object.keys(variables).join(",") !== "id"
-      || !Number.isInteger(variables.id) || variables.id <= 0) return null;
-  } else {
-    return null;
-  }
-  return { operationName, query: ANILIST_QUERIES[operationName], variables };
 }
 
 export function allowedClientIps(value) {
@@ -297,6 +255,23 @@ function validEpisodeQuery(parameters) {
 
 function onlyMediumCoverQuery(parameters) {
   return [...parameters.keys()].length === 1 && parameters.get("type") === "medium";
+}
+
+function validAnimeScheduleSearch(parameters) {
+  if ([...parameters.keys()].length !== 1) return false;
+  const query = parameters.get("q");
+  if (query !== null) return query.trim().length > 0 && query.length <= 200;
+  return /^[1-9]\d*$/.test(parameters.get("anilist-ids") || "");
+}
+
+function validAnimeScheduleTimetable(parameters) {
+  const keys = [...parameters.keys()].sort();
+  if (keys.join(",") !== "tz,week,year") return false;
+  const year = Number(parameters.get("year"));
+  const week = Number(parameters.get("week"));
+  return Number.isInteger(year) && year >= 1900 && year <= 2200
+    && Number.isInteger(week) && week >= 1 && week <= 53
+    && parameters.get("tz") === "UTC";
 }
 
 function validContentType(kind, contentType) {

@@ -33,6 +33,7 @@ pub struct Anime {
     pub title: String,
     pub bangumi_subject_id: Option<i64>,
     pub anilist_media_id: Option<i64>,
+    pub anime_schedule_route: Option<String>,
     pub expected_weekday: Option<i64>,
     pub expected_time: Option<String>,
     pub timezone: String,
@@ -102,6 +103,7 @@ pub struct NewAnime {
 pub struct AutoScheduleMetadata {
     pub bangumi_subject_id: i64,
     pub anilist_media_id: Option<i64>,
+    pub anime_schedule_route: Option<String>,
     pub total_episodes: Option<i64>,
     pub broadcast_pattern: String,
     pub schedule_source: String,
@@ -167,6 +169,7 @@ impl EpisodeNumberMapping {
 pub struct ScheduleUpdate {
     pub bangumi_subject_id: i64,
     pub anilist_media_id: Option<i64>,
+    pub anime_schedule_route: Option<String>,
     pub total_episodes: Option<i64>,
     pub aliases: Vec<String>,
     pub expected_at: Option<DateTime<Utc>>,

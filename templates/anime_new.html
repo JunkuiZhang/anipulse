@@ -13,8 +13,9 @@
   <label>Bangumi ID（可选，用于同名或多季消歧）<input type="number" name="bangumi_id" min="1"></label>
   <details class="mapping-options">
     <summary>高级匹配与特殊集数映射（可选）</summary>
-    <p class="muted">未上映作品尚未进入 bangumi-data 时，系统会自动用 Bangumi 标题、日期和类型匹配 AniList。只有自动匹配不唯一时，才需要在这里填写核对后的 AniList Media ID。</p>
-    <label>AniList Media ID<input type="number" name="anilist_id" min="1" placeholder="通常留空"></label>
+    <p class="muted">未上映作品尚未进入 bangumi-data 时，系统会用 Bangumi 标题、日期和类型匹配 AnimeSchedule。AniList Media ID 只作为更可靠的跨站检索键，不会请求 AniList API；自动匹配不唯一时，也可以填写 AnimeSchedule 页面网址末尾的 route。</p>
+    <label>AniList Media ID（检索提示）<input type="number" name="anilist_id" min="1" placeholder="通常留空"></label>
+    <label>AnimeSchedule route<input name="anime_schedule_route" maxlength="200" pattern="[A-Za-z0-9-]+" placeholder="通常留空，例如 kusuriya-no-hitorigoto-3rd-season"></label>
     <p class="muted">当站内搜索集数和 Bangumi 编号不同才填写。两个起点必须同时填写，后续集数会保持相同偏移。</p>
     <div class="two-column">
       <label>站内起始集数<input type="number" name="search_episode_start" min="1" max="10000" placeholder="例如 12"></label>

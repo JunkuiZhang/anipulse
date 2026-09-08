@@ -174,7 +174,7 @@ review_grace_secs = 3600
 [schedule]
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
-anilist_api_url = "https://graphql.anilist.co"
+anime_schedule_api_url = "https://animeschedule.net/api/v3"
 preferred_site = "bilibili"
 stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
 excluded_stream_sites = ["unext"]
@@ -195,7 +195,15 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 
-尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的正式标题、中文名、首播日期和类型，再与 AniList 的日文、罗马字、英文标题及同义词进行高置信匹配；成功后把 AniList Media ID 持久化，后续不再依赖模糊标题搜索。若没有唯一结果，添加会停止并列出候选，核对后可在网页高级选项或 CLI 的 `--anilist-id` 中指定。AniList ID 不能脱离 Bangumi ID 单独填写，两者会在保存前交叉校验。AniList 尚无 `nextAiringEpisode` 但已有开播日期时可以正常添加：页面显示“仅开播日期，时间待公布”，系统从该日期开始检查并每日同步；精确时刻发布后会自动校准。若连开播日期都没有，才会要求暂用手工排期。
+尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的正式标题、中文名、首播日期和类型，再与 AnimeSchedule 的日文、罗马字、英文标题及别名进行高置信匹配；成功后把 AnimeSchedule route 持久化，后续直接按 route 同步。若已有 AniList Media ID，可在网页高级选项或 CLI 的 `--anilist-id` 中填写，作为 AnimeSchedule 的精确检索键；AniPulse 不再请求 AniList API。若仍没有唯一结果，核对 AnimeSchedule 条目 URL 末尾的 route，再填写 `--anime-schedule-route`。这两个辅助字段都不能脱离 Bangumi ID 单独填写。AnimeSchedule 没有精确时刻、但 Bangumi 已有开播日期时可以正常添加：页面显示“仅开播日期，时间待公布”，系统从该日期开始检查并每日同步；精确周排期发布后会自动校准。若连开播日期都没有，才需要暂用手工排期。
+
+直连 AnimeSchedule API 需要先在 AnimeSchedule 网站注册并在账户设置的 **API / Applications** 中创建应用，然后把 application token 写入 `/etc/anipulse/anipulse.env`：
+
+```text
+ANIME_SCHEDULE_TOKEN=你的_application_token
+```
+
+环境文件继续保持 `root:anipulse`、权限 `0640`，不要把 token 写进 `config.toml`、Git 或截图。如果 `anime_schedule_api_url` 指向 Cloudflare Worker，则只在 Worker Secret 中保存 token，ECS 环境文件不需要这一项。完整 Worker 步骤见 [`cloudflare-worker.md`](cloudflare-worker.md)。
 
 AniPulse 的“预计更新”表示**适合开始寻找网络视频的时间**，不等同于日本电视台开播时间。显式的 `preferred_site` 有具体时刻时优先使用它；否则程序会比较 `stream_site_priority` 中的全部可用排期，采用至少两个独立平台在 2 小时内相互印证的最早档期。列表顺序只用于同时间决胜，或完全没有平台共识时的保守回退；`gamer` 与 `gamer_hk` 属于同一平台，不会被错误算作两票。`excluded_stream_sites` 会在选择前排除不可信来源，默认禁用 U-NEXT；旧配置没有这个字段时也会继承该默认值。这里读取的只是 `bangumi-data` JSON 元数据，阿里云服务器不会直接访问 d Anime、ABEMA 或动画疯的网站。
 
@@ -424,7 +432,7 @@ sudo systemctl --no-pager --full status anipulse.service anipulse-web.service
 sudo journalctl -u anipulse.service -u anipulse-web.service -n 100 --no-pager
 ```
 
-SQLite migration 会在启动时自动执行。本次升级会保留追番、候选和历史视频，并新增可空的 AniList 映射列。升级 Worker 后，建议按第 5 节补上 `anilist_api_url`；旧配置缺少该字段时会使用官方直连地址。对于正在使用 U-NEXT 的旧条目，迁移仍会清除其旧预计时间并标记为“尽快重新同步”，避免同步失败时继续展示不可信时间。同步成功后网页详情会显示新的“排期来源”和“校准状态”。
+SQLite migration 会在启动时自动执行。本次升级会保留追番、候选和历史视频，并新增可空的 AnimeSchedule route 列；原有 AniList Media ID 继续作为 AnimeSchedule 检索键，不再用于访问 AniList。先按 `cloudflare-worker.md` 更新 Worker 并添加 `ANIME_SCHEDULE_TOKEN` Secret，再把配置改为 `anime_schedule_api_url = "https://你的代理域名/anime-schedule"`。旧配置里的 `anilist_api_url` 可以保留但已不再使用。同步成功后网页详情会显示 AnimeSchedule route、排期来源和校准状态。
 
 如需立即核对单个条目，可执行：
 

@@ -315,6 +315,7 @@ impl Repository {
         let (
             bangumi_subject_id,
             anilist_media_id,
+            anime_schedule_route,
             total_episodes,
             auto_schedule,
             broadcast_pattern,
@@ -333,6 +334,7 @@ impl Repository {
                 (
                     Some(metadata.bangumi_subject_id),
                     metadata.anilist_media_id,
+                    metadata.anime_schedule_route.as_deref(),
                     metadata.total_episodes,
                     true,
                     Some(metadata.broadcast_pattern.as_str()),
@@ -346,21 +348,23 @@ impl Repository {
                 )
             })
             .unwrap_or((
-                None, None, None, false, None, None, None, None, None, None, None, None,
+                None, None, None, None, false, None, None, None, None, None, None, None, None,
             ));
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"INSERT INTO anime(
-                title, bangumi_subject_id, anilist_media_id, expected_weekday, expected_time, timezone,
+                title, bangumi_subject_id, anilist_media_id, anime_schedule_route,
+                expected_weekday, expected_time, timezone,
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
                 auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
                 schedule_source, schedule_confidence, schedule_warning,
                 local_episode_origin, bangumi_episode_origin, total_episodes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
         .bind(anilist_media_id)
+        .bind(anime_schedule_route)
         .bind(new.expected_weekday)
         .bind(new.expected_time.as_deref())
         .bind(&new.timezone)
@@ -1519,6 +1523,7 @@ impl Repository {
         let result = sqlx::query(
             r#"UPDATE anime SET
                 bangumi_subject_id = ?, anilist_media_id = COALESCE(?, anilist_media_id),
+                anime_schedule_route = COALESCE(?, anime_schedule_route),
                 expected_weekday = ?, expected_time = ?, timezone = ?,
                 broadcast_pattern = ?, schedule_sync_at = ?, schedule_next_sync_at = ?,
                 schedule_source = ?, schedule_confidence = ?, schedule_warning = ?,
@@ -1528,6 +1533,7 @@ impl Repository {
         )
         .bind(update.bangumi_subject_id)
         .bind(update.anilist_media_id)
+        .bind(update.anime_schedule_route.as_deref())
         .bind(update.expected_weekday)
         .bind(&update.expected_time)
         .bind(&update.timezone)
@@ -4190,6 +4196,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 328_609,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2022-10-08T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now(),
@@ -4467,6 +4474,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 501_000,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
@@ -4508,6 +4516,7 @@ mod tests {
                 &ScheduleUpdate {
                     bangumi_subject_id: 501_000,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: Some(8),
                     aliases: vec![],
                     expected_at: None,
@@ -4549,6 +4558,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 633_836,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: Some(8),
                     broadcast_pattern: "R/2026-08-12T13:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
@@ -4750,6 +4760,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 506_677,
                     anilist_media_id: Some(195_516),
+                    anime_schedule_route: Some("silent-witch".into()),
                     total_episodes: None,
                     broadcast_pattern: "R/2025-07-04T15:00:00Z/P7D".into(),
                     next_sync_at: Utc::now() + chrono::Duration::days(1),
@@ -4771,6 +4782,7 @@ mod tests {
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: Some(12),
                     aliases: vec!["沉默魔女".into(), "サイレント・ウィッチ".into()],
                     expected_at: Some(updated_expected),
@@ -4791,6 +4803,10 @@ mod tests {
         assert!(anime.anime.auto_schedule);
         assert_eq!(anime.anime.bangumi_subject_id, Some(506_677));
         assert_eq!(anime.anime.anilist_media_id, Some(195_516));
+        assert_eq!(
+            anime.anime.anime_schedule_route.as_deref(),
+            Some("silent-witch")
+        );
         assert_eq!(anime.anime.local_episode_origin, Some(8));
         assert_eq!(anime.anime.bangumi_episode_origin, Some(80));
         assert_eq!(anime.anime.total_episodes, Some(12));
@@ -4810,6 +4826,7 @@ mod tests {
                 &ScheduleUpdate {
                     bangumi_subject_id: 506_677,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: None,
                     aliases: vec![],
                     expected_at: None,

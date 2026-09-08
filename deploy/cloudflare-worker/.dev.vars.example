@@ -1,3 +1,4 @@
 ALLOWED_CLIENT_IPS="127.0.0.1,::1"
 UPSTREAM_USER_AGENT="你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted via Cloudflare Worker)"
 CACHE_VERSION="v1"
+ANIME_SCHEDULE_TOKEN="在 AnimeSchedule 账户设置的 API 页面创建应用后复制 token"

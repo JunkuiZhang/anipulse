@@ -20,8 +20,8 @@ use feishu_app::FeishuAppNotifier;
 fn source_alert_label(source: &str) -> String {
     if let Some(subject_id) = source.strip_prefix("bangumi-schedule:") {
         format!("Bangumi #{subject_id} 章节排期")
-    } else if let Some(subject_id) = source.strip_prefix("anilist-schedule:") {
-        format!("未上映条目 #{subject_id} 的 Bangumi/AniList 排期")
+    } else if let Some(subject_id) = source.strip_prefix("anime-schedule:") {
+        format!("未上映条目 #{subject_id} 的 Bangumi/AnimeSchedule 排期")
     } else {
         source.to_string()
     }

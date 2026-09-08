@@ -49,6 +49,8 @@ pub struct AnimeDraftRequest {
     #[serde(default)]
     pub anilist_id: Option<i64>,
     #[serde(default)]
+    pub anime_schedule_route: Option<String>,
+    #[serde(default)]
     pub episode_mapping: Option<EpisodeNumberMapping>,
 }
 
@@ -67,6 +69,8 @@ pub struct AnimeDraftResolution {
     pub bangumi_subject_id: Option<i64>,
     #[serde(default)]
     pub anilist_media_id: Option<i64>,
+    #[serde(default)]
+    pub anime_schedule_route: Option<String>,
     #[serde(default)]
     pub total_episodes: Option<i64>,
     pub broadcast_pattern: Option<String>,
@@ -97,6 +101,7 @@ impl AnimeDraftResolution {
                 |(bangumi_subject_id, broadcast_pattern)| AutoScheduleMetadata {
                     bangumi_subject_id,
                     anilist_media_id: self.anilist_media_id,
+                    anime_schedule_route: self.anime_schedule_route,
                     total_episodes: self.total_episodes,
                     broadcast_pattern,
                     schedule_source: self.schedule_source.unwrap_or_else(|| "unknown".into()),
@@ -549,6 +554,7 @@ impl ApplicationService {
                 duration_max_sec: request.duration_max_sec,
                 bangumi_subject_id: None,
                 anilist_media_id: None,
+                anime_schedule_route: None,
                 total_episodes: None,
                 broadcast_pattern: None,
                 schedule_source: None,
@@ -591,6 +597,7 @@ impl ApplicationService {
                     next_episode: request.next_episode,
                     episode_mapping: request.episode_mapping,
                     anilist_media_id: request.anilist_id,
+                    anime_schedule_route: request.anime_schedule_route.as_deref(),
                     timezone: &request.timezone,
                 },
             )
@@ -623,6 +630,7 @@ impl ApplicationService {
             duration_max_sec: request.duration_max_sec,
             bangumi_subject_id: Some(resolved.bangumi_subject_id),
             anilist_media_id: resolved.anilist_media_id,
+            anime_schedule_route: resolved.anime_schedule_route,
             total_episodes: resolved.total_episodes,
             broadcast_pattern: Some(resolved.broadcast_pattern),
             schedule_source: Some(resolved.schedule_source),
@@ -691,15 +699,35 @@ fn validate_anime_draft(request: &AnimeDraftRequest) -> Result<()> {
         .timezone
         .parse::<Tz>()
         .map_err(|_| AppError::InvalidInput("timezone is invalid".into()))?;
-    if !request.auto_schedule && (request.bangumi_id.is_some() || request.anilist_id.is_some()) {
+    if !request.auto_schedule
+        && (request.bangumi_id.is_some()
+            || request.anilist_id.is_some()
+            || request.anime_schedule_route.is_some())
+    {
         return Err(AppError::InvalidInput(
-            "Bangumi/AniList ID requires automatic scheduling".into(),
+            "Bangumi/AniList ID/AnimeSchedule route requires automatic scheduling".into(),
         ));
     }
-    if request.anilist_id.is_some() && request.bangumi_id.is_none() {
+    if (request.anilist_id.is_some() || request.anime_schedule_route.is_some())
+        && request.bangumi_id.is_none()
+    {
         return Err(AppError::InvalidInput(
-            "AniList ID requires a Bangumi ID so the mapping can be verified".into(),
+            "AniList ID and AnimeSchedule route require a Bangumi ID so the mapping can be verified"
+                .into(),
         ));
+    }
+    if let Some(route) = request.anime_schedule_route.as_deref() {
+        let route = route.trim();
+        if route.is_empty()
+            || route.len() > 200
+            || !route
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(AppError::InvalidInput(
+                "AnimeSchedule route must contain only letters, numbers, and hyphens".into(),
+            ));
+        }
     }
     if let Some(mapping) = request.episode_mapping {
         if !request.auto_schedule {

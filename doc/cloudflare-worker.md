@@ -1,6 +1,6 @@
 # 使用 Cloudflare Worker 转发排期元数据
 
-这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的多语言标题、首播日期和类型匹配 AniList 的精确开播时刻；上游只有开播日期时则保存为“时间待公布”的日期级排期。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
+这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule 的首播及周排期；上游只有开播日期时则保存为“时间待公布”的日期级排期。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
 新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 d Anime、ABEMA 或动画疯等网络时段，并默认排除不可靠的 U-NEXT 排期。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
 
@@ -11,10 +11,10 @@
         ├── /bangumi/v0/episodes        → api.bgm.tv 章节 API
         ├── /bangumi/v0/subjects/:id    → api.bgm.tv 条目元数据
         ├── /bangumi/v0/subjects/...    → api.bgm.tv，并在 Worker 内跟随封面重定向
-        └── /anilist/graphql            → AniList，仅允许两个固定只读查询
+        └── /anime-schedule/...         → AnimeSchedule，仅允许搜索、条目和周排期
 ```
 
-Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不是通用反向代理：只接受 AniPulse 当前使用的固定路由、严格校验查询参数和 AniList 操作名，并只允许配置的服务器出口 IP。客户端传来的 GraphQL 文本不会原样转发，Worker 会按操作名重新构造仓库内置的只读查询，因此不能借它执行任意 GraphQL 请求或 mutation。
+Worker 位于 [`deploy/cloudflare-worker`](../deploy/cloudflare-worker)。它不是通用反向代理：只接受 AniPulse 当前使用的固定只读路由、严格校验查询参数，并只允许配置的服务器出口 IP。AnimeSchedule application token 由 Worker Secret 注入上游请求，不会返回给 ECS 或浏览器。
 
 ## 1. 前提
 
@@ -53,6 +53,7 @@ Workers Free 当前包含每天 100,000 次请求，对个人 AniPulse 足够使
 |---|---|---:|---|
 | `ALLOWED_CLIENT_IPS` | Secret | 是 | ECS 或 NAT 网关的实际公网出口 IP；多个地址用英文逗号分隔 |
 | `UPSTREAM_USER_AGENT` | Secret | 是 | 例如 `你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted via Cloudflare Worker)` |
+| `ANIME_SCHEDULE_TOKEN` | Secret | 是 | AnimeSchedule 账户设置的 **API / Applications** 中创建应用后得到的 application token |
 | `CACHE_VERSION` | Text | 否 | 初次可填 `v1`，需要绕过旧缓存时改成 `v2` |
 
 保存后按界面提示重新部署。不要把实际公网 IP、User-Agent 身份或 Secret 写入 Git、截图或公开文档。
@@ -87,7 +88,7 @@ cd deploy/cloudflare-worker
 cp .dev.vars.example .dev.vars
 ```
 
-将 `.dev.vars` 中的 `UPSTREAM_USER_AGENT` 改成自己的稳定标识。`.dev.vars` 已被 Git 忽略，不要提交实际配置。
+将 `.dev.vars` 中的 `UPSTREAM_USER_AGENT` 改成自己的稳定标识，并填入 AnimeSchedule application token。`.dev.vars` 已被 Git 忽略，不要提交实际配置。
 
 运行不需要网络和第三方测试库的单元测试：
 
@@ -137,6 +138,12 @@ npx wrangler@latest secret put UPSTREAM_USER_AGENT
 
 ```text
 你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted via Cloudflare Worker)
+```
+
+登录 [AnimeSchedule](https://animeschedule.net/) 后，在账户设置的 **API / Applications** 中创建一个仅供 AniPulse 使用的应用，再把 application token 保存为 Worker Secret：
+
+```bash
+npx wrangler@latest secret put ANIME_SCHEDULE_TOKEN
 ```
 
 Worker 没有配置 `ALLOWED_CLIENT_IPS` 时会 fail closed，所有请求返回 HTTP 503；IP 不在名单中时返回 HTTP 403。
@@ -194,12 +201,20 @@ curl -fsS \
 curl -fsS https://bgm-proxy.example.com/bangumi/v0/subjects/568244
 ```
 
-检查 AniList 固定 ID 查询。请求体里的 `query` 只是兼容 GraphQL 客户端；Worker 会丢弃它并使用内置只读查询：
+检查 AnimeSchedule 的 AniList ID 精确检索。这里的 AniList ID 只是 AnimeSchedule 支持的跨站索引，Worker 不会访问 AniList：
 
 ```bash
-curl -fsS -X POST https://bgm-proxy.example.com/anilist/graphql \
-  -H 'content-type: application/json' \
-  --data '{"operationName":"AniPulseMedia","query":"query placeholder","variables":{"id":195516}}'
+curl -fsS \
+  'https://bgm-proxy.example.com/anime-schedule/anime?anilist-ids=195516'
+```
+
+从返回结果复制 `route` 后，再检查条目详情和所在周排期（示例 route、年份和周数需按实际返回值替换）：
+
+```bash
+curl -fsS \
+  'https://bgm-proxy.example.com/anime-schedule/anime/kusuriya-no-hitorigoto-3rd-season'
+curl -fsS \
+  'https://bgm-proxy.example.com/anime-schedule/timetables/raw?year=2026&week=40&tz=UTC'
 ```
 
 排期校准会分别读取目标集和本季起始集，因此也要确认 `offset=0` 可用。Worker 允许的是经过校验的任意非负 `offset`，不是只放行某一个集数：
@@ -235,7 +250,7 @@ sudo cp -a /etc/anipulse/config.toml /etc/anipulse/config.toml.before-worker
 [schedule]
 bangumi_data_url = "https://bgm-proxy.example.com/data.json"
 bangumi_api_base_url = "https://bgm-proxy.example.com/bangumi"
-anilist_api_url = "https://bgm-proxy.example.com/anilist/graphql"
+anime_schedule_api_url = "https://bgm-proxy.example.com/anime-schedule"
 preferred_site = "bilibili"
 stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
 excluded_stream_sites = ["unext"]
@@ -243,7 +258,7 @@ max_stream_offset_days = 14
 max_catalog_offset_days = 1
 ```
 
-`bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加章节、条目和封面路径。`anilist_api_url` 必须写完整的 `/anilist/graphql`。
+`bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加章节、条目和封面路径。`anime_schedule_api_url` 必须写到 `/anime-schedule`，不要再追加 `/api/v3`。旧的 `anilist_api_url` 已不再使用，可以从配置中删除。
 
 `stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。`excluded_stream_sites` 会先排除不可信来源，默认禁用 U-NEXT；即使旧配置的优先列表里还保留 `unext`，缺省排除规则仍会生效。AniPulse 会在本地比较 `/data.json` 中的其余候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
 
@@ -280,7 +295,8 @@ Worker 使用以下边缘缓存时间：
 | 章节日期 | 15 分钟 | 1 分钟 |
 | Bangumi 条目元数据 | 15 分钟 | 1 分钟 |
 | 封面 | 30 天 | 1 天 |
-| AniList 查询 | 不缓存 | 不缓存 |
+| AnimeSchedule 条目/搜索 | 15 分钟 | 1 分钟 |
+| AnimeSchedule 周排期 | 5 分钟 | 1 分钟 |
 
 封面下载到 AniPulse 服务器后，还有现有的 7 天服务器缓存和浏览器条件缓存。删除番剧时，AniPulse 会按现有清理逻辑删除不再被数据库引用的本地封面；Cloudflare 上的匿名公共封面缓存会在 TTL 到期后自然淘汰。
 
@@ -288,16 +304,16 @@ Worker 使用以下边缘缓存时间：
 
 ### 更新 Worker
 
-本次“未上映作品 AniList fallback”增加了 Bangumi 条目和 AniList 两条固定路由。升级 AniPulse 二进制前，必须先把新版 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 完整粘贴到网页编辑器并 Deploy；旧 Worker 会令新功能返回 404/405。
+本次升级移除了 AniList GraphQL 转发，新增 AnimeSchedule 的三个固定只读路由。升级 AniPulse 二进制前，必须先添加 `ANIME_SCHEDULE_TOKEN` Secret，再把新版 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 完整粘贴到网页编辑器并 Deploy；旧 Worker 会令新功能返回 404。
 
 以后仓库中的 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 有更新时，可完全通过网页升级：
 
 1. 打开 Cloudflare Dashboard → **Workers & Pages** → `anipulse-bangumi-proxy`；
-2. 先在 **Settings → Variables and Secrets** 确认 `ALLOWED_CLIENT_IPS` 和 `UPSTREAM_USER_AGENT` 仍存在；不要把它们复制进源代码；
+2. 先在 **Settings → Variables and Secrets** 确认 `ALLOWED_CLIENT_IPS`、`UPSTREAM_USER_AGENT` 和 `ANIME_SCHEDULE_TOKEN` 仍存在；不要把它们复制进源代码；
 3. 点击 **Edit code**，用仓库中 `src/index.js` 的完整内容替换旧代码；
 4. 点击 **Deploy**；域名、Secret 和现有变量会保留；
 5. 如果路由/解析逻辑改变或怀疑命中了旧缓存，把 `CACHE_VERSION` 从例如 `v1` 改成 `v2`，然后再次部署；
-6. 回到 ECS，依次验证 `/healthz`、`/data.json`、Bangumi 条目、两个章节 offset、AniList 查询和封面，再重启 AniPulse 两个服务。
+6. 回到 ECS，依次验证 `/healthz`、`/data.json`、Bangumi 条目、两个章节 offset、AnimeSchedule 三类路由和封面，再重启 AniPulse 两个服务。
 
 更新前可把网页编辑器中的旧代码保存到本地作为回滚副本。若新版本异常，重新粘贴旧代码并 Deploy；不要在文档、Git、截图或聊天记录中暴露实际出口 IP 与 Secret。
 
@@ -313,11 +329,11 @@ npx wrangler@latest secret put ALLOWED_CLIENT_IPS
 
 ### HTTP 503
 
-Worker 没有配置 `ALLOWED_CLIENT_IPS`，或者配置值为空。
+Worker 没有配置 `ALLOWED_CLIENT_IPS`，或者访问 AnimeSchedule 路由时尚未配置 `ANIME_SCHEDULE_TOKEN`。响应正文会区分这两种情况。
 
 ### HTTP 404
 
-路径或查询参数不属于 AniPulse allowlist。章节 API 只允许 `subject_id`、`type=0`、`limit=1`、`offset`；封面只允许 `type=medium`。
+路径或查询参数不属于 AniPulse allowlist。章节 API 只允许 `subject_id`、`type=0`、`limit=1`、`offset`；封面只允许 `type=medium`；AnimeSchedule 只允许单独的 `q`/`anilist-ids` 搜索、合法 route 和 `year`/`week`/`tz=UTC` 周排期。
 
 ### HTTP 502/504
 

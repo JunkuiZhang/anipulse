@@ -444,6 +444,7 @@ mod tests {
                 title: "尼古喵喵".into(),
                 bangumi_subject_id: None,
                 anilist_media_id: None,
+                anime_schedule_route: None,
                 expected_weekday: None,
                 expected_time: None,
                 timezone: "Asia/Shanghai".into(),

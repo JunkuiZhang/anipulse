@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     time::Duration as StdDuration,
 };
 
@@ -23,27 +24,13 @@ const SOURCE_ALERT_FAILURE_THRESHOLD: i64 = 2;
 const STREAM_CONSENSUS_WINDOW_SECS: i64 = 2 * 60 * 60;
 const MIN_STREAM_SOURCE_FAMILIES: usize = 2;
 const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
-const ANILIST_SEARCH_QUERY: &str = r#"query AniPulseSearch($search: String!, $seasonYear: Int) {
-  Page(page: 1, perPage: 10) {
-    media(search: $search, seasonYear: $seasonYear, type: ANIME, sort: SEARCH_MATCH) {
-      id title { romaji english native } synonyms format status
-      startDate { year month day } episodes
-      nextAiringEpisode { episode airingAt }
-    }
-  }
-}"#;
-const ANILIST_MEDIA_QUERY: &str = r#"query AniPulseMedia($id: Int!) {
-  Media(id: $id, type: ANIME) {
-    id title { romaji english native } synonyms format status
-    startDate { year month day } episodes
-    nextAiringEpisode { episode airingAt }
-  }
-}"#;
+const ANIME_SCHEDULE_TOKEN_ENV: &str = "ANIME_SCHEDULE_TOKEN";
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
     client: Client,
     config: ScheduleConfig,
+    anime_schedule_token: Option<String>,
 }
 
 pub struct ScheduleCatalog {
@@ -56,6 +43,7 @@ pub struct AutoScheduleRequest<'a> {
     pub next_episode: i64,
     pub episode_mapping: Option<EpisodeNumberMapping>,
     pub anilist_media_id: Option<i64>,
+    pub anime_schedule_route: Option<&'a str>,
     pub timezone: &'a str,
 }
 
@@ -63,6 +51,7 @@ pub struct AutoScheduleRequest<'a> {
 pub struct ResolvedSchedule {
     pub bangumi_subject_id: i64,
     pub anilist_media_id: Option<i64>,
+    pub anime_schedule_route: Option<String>,
     pub total_episodes: Option<i64>,
     pub matched_title: String,
     pub aliases: Vec<String>,
@@ -152,76 +141,82 @@ struct BangumiSubject {
 }
 
 #[derive(Debug, Deserialize)]
-struct AniListResponse<T> {
-    data: Option<T>,
+#[serde(rename_all = "camelCase")]
+struct AnimeSchedulePage {
     #[serde(default)]
-    errors: Vec<AniListError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AniListError {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AniListSearchData {
-    #[serde(rename = "Page")]
-    page: AniListPage,
-}
-
-#[derive(Debug, Deserialize)]
-struct AniListMediaData {
-    #[serde(rename = "Media")]
-    media: Option<AniListMedia>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AniListPage {
-    #[serde(default)]
-    media: Vec<AniListMedia>,
+    anime: Vec<AnimeScheduleAnime>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AniListMedia {
-    id: i64,
-    title: AniListTitle,
+struct AnimeScheduleAnime {
+    title: String,
+    route: String,
     #[serde(default)]
-    synonyms: Vec<String>,
+    premier: Option<DateTime<Utc>>,
     #[serde(default)]
-    format: Option<String>,
+    episode_override: Option<AnimeScheduleEpisodeOverride>,
     #[serde(default)]
-    status: Option<String>,
+    delayed_from: Option<DateTime<Utc>>,
     #[serde(default)]
-    start_date: AniListDate,
+    delayed_until: Option<DateTime<Utc>>,
     #[serde(default)]
     episodes: Option<i64>,
     #[serde(default)]
-    next_airing_episode: Option<AniListAiring>,
+    status: Option<String>,
+    #[serde(default)]
+    names: Option<AnimeScheduleNames>,
+    #[serde(default)]
+    websites: Option<AnimeScheduleWebsites>,
+    #[serde(default)]
+    media_types: Vec<AnimeScheduleCategory>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct AniListTitle {
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AnimeScheduleNames {
     #[serde(default)]
     romaji: Option<String>,
     #[serde(default)]
     english: Option<String>,
     #[serde(default)]
     native: Option<String>,
+    #[serde(default)]
+    abbreviation: Option<String>,
+    #[serde(default)]
+    synonyms: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct AniListDate {
-    year: Option<i32>,
-    month: Option<u32>,
-    day: Option<u32>,
+#[serde(rename_all = "camelCase")]
+struct AnimeScheduleWebsites {
+    #[serde(default)]
+    ani_list: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AnimeScheduleCategory {
+    route: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AniListAiring {
-    episode: i64,
-    airing_at: i64,
+struct AnimeScheduleEpisodeOverride {
+    override_date: DateTime<Utc>,
+    override_episode: i64,
+    #[serde(default)]
+    episodes_aired: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimeScheduleTimetableEntry {
+    route: String,
+    episode_date: DateTime<Utc>,
+    episode_number: i64,
+    #[serde(default)]
+    subtracted_episode_number: Option<i64>,
+    #[serde(default)]
+    delayed_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,7 +253,15 @@ impl ScheduleProvider {
             .map_err(|error| {
                 AppError::Schedule(format!("cannot build schedule HTTP client: {error}"))
             })?;
-        Ok(Self { client, config })
+        let anime_schedule_token = env::var(ANIME_SCHEDULE_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Ok(Self {
+            client,
+            config,
+            anime_schedule_token,
+        })
     }
 
     pub async fn load_catalog(&self) -> Result<ScheduleCatalog> {
@@ -343,8 +346,8 @@ impl ScheduleProvider {
     }
 
     /// Resolves from bangumi-data when possible. An explicit Bangumi subject that
-    /// is not in the catalog falls back to Bangumi subject metadata plus AniList.
-    /// `anilist_media_id` is a previously persisted or explicitly selected mapping.
+    /// is not in the catalog falls back to Bangumi metadata plus AnimeSchedule.
+    /// AniList IDs are lookup keys only; AniList itself is never contacted.
     pub async fn resolve_auto(
         &self,
         catalog: &ScheduleCatalog,
@@ -361,10 +364,11 @@ impl ScheduleProvider {
                 .any(|item| item_subject_id(item) == Some(subject_id))
         {
             return self
-                .resolve_anilist_fallback(
+                .resolve_anime_schedule_fallback(
                     subject_id,
                     target,
                     request.anilist_media_id,
+                    request.anime_schedule_route,
                     request.timezone,
                 )
                 .await;
@@ -509,6 +513,7 @@ impl ScheduleProvider {
         Ok(ResolvedSchedule {
             bangumi_subject_id,
             anilist_media_id: None,
+            anime_schedule_route: None,
             total_episodes,
             matched_title: item.title.clone(),
             aliases: item_aliases(item),
@@ -599,11 +604,12 @@ impl ScheduleProvider {
         })
     }
 
-    async fn resolve_anilist_fallback(
+    async fn resolve_anime_schedule_fallback(
         &self,
         subject_id: i64,
         episode_target: EpisodeScheduleTarget,
         anilist_media_id: Option<i64>,
+        anime_schedule_route: Option<&str>,
         timezone: &str,
     ) -> Result<ResolvedSchedule> {
         if episode_target.local_episode <= 0 {
@@ -635,88 +641,45 @@ impl ScheduleProvider {
                 })
             })
             .transpose()?;
-        let media = match anilist_media_id {
-            Some(media_id) => {
-                let media = self.anilist_media(media_id).await?;
-                validate_anilist_mapping(&subject, subject_date, &media)?;
-                media
-            }
-            None => {
-                let candidates = self
-                    .anilist_search(&subject.name, subject_date.map(|date| date.year()))
-                    .await?;
-                select_anilist_candidate(&subject, subject_date, candidates)?
-            }
-        };
-        let (expected_at, confidence, timing_warning) = if let Some(airing) =
-            media.next_airing_episode
-        {
-            let reported_at = Utc
-                .timestamp_opt(airing.airing_at, 0)
-                .single()
-                .ok_or_else(|| {
-                    AppError::Schedule(format!(
-                        "AniList #{} returned an invalid airing timestamp",
-                        media.id
-                    ))
-                })?;
-            if airing.episode == subject_episode_index {
-                let warning = episode.airdate.and_then(|airdate| {
-                        let reported_date = reported_at.with_timezone(&Tokyo).date_naive();
-                        (reported_date != airdate).then(|| {
-                            format!(
-                                "Bangumi 章节日期为 {airdate}，AniList 精确时刻对应日本日期 {reported_date}；已采用 AniList 时刻。"
-                            )
-                        })
-                    });
-                (reported_at, "calibrated", warning)
-            } else if let Some(airdate) = episode.airdate {
-                let tokyo_time = reported_at.with_timezone(&Tokyo).time();
-                let local = Tokyo
-                    .with_ymd_and_hms(
-                        airdate.year(),
-                        airdate.month(),
-                        airdate.day(),
-                        tokyo_time.hour(),
-                        tokyo_time.minute(),
-                        tokyo_time.second(),
-                    )
-                    .single()
-                    .ok_or_else(|| {
-                        AppError::Schedule("cannot construct AniList airing time".into())
-                    })?;
-                (
-                    local.with_timezone(&Utc),
-                    "estimated",
-                    Some(format!(
-                        "AniList 当前报告 EP{}，目标为 Bangumi EP{}；已用 Bangumi 章节日期和 AniList 的日本时刻组合，待后续同步校准。",
-                        airing.episode, subject_episode_index
-                    )),
-                )
-            } else {
-                let offset = subject_episode_index
-                    .checked_sub(airing.episode)
-                    .and_then(|delta| delta.checked_mul(7))
-                    .ok_or_else(|| AppError::Schedule("episode offset overflowed".into()))?;
-                (
-                    reported_at + Duration::days(offset),
-                    "estimated",
-                    Some(format!(
-                        "Bangumi 暂无目标章节日期；已从 AniList EP{} 按周推算 EP{}，每日同步会继续校准。",
-                        airing.episode, subject_episode_index
-                    )),
-                )
-            }
-        } else {
-            anilist_date_only_schedule(
-                episode.airdate,
+        let media = self
+            .resolve_anime_schedule_media(
+                &subject,
                 subject_date,
-                &media,
-                subject_episode_index,
-                timezone,
-            )?
-        };
-        let batch_release = confidence == "date_only" && media.format.as_deref() == Some("ONA");
+                anilist_media_id,
+                anime_schedule_route,
+            )
+            .await?;
+        let (mut expected_at, mut confidence, mut timing_warning) = anime_schedule_estimate(
+            episode.airdate,
+            subject_date,
+            &media,
+            subject_episode_index,
+            timezone,
+        )?;
+        let mut source_health_error = None;
+        match self
+            .anime_schedule_timetable(expected_at, &media.route, subject_episode_index)
+            .await
+        {
+            Ok(Some(exact)) => {
+                expected_at = exact.episode_date;
+                confidence = "calibrated";
+                timing_warning = exact
+                    .delayed_text
+                    .map(|detail| format!("AnimeSchedule 标记本集排期有变动：{detail}"));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                source_health_error = Some(error.to_string());
+                timing_warning = merge_warnings(
+                    timing_warning,
+                    Some(format!(
+                        "AnimeSchedule 周排期暂时不可用，已保留首播时间推算值：{error}"
+                    )),
+                );
+            }
+        }
+        let batch_release = anime_schedule_is_ona(&media);
         let anchor = if batch_release {
             expected_at
         } else {
@@ -731,14 +694,16 @@ impl ScheduleProvider {
         if let (Some(mapping), Some(total)) = (episode_target.mapping, total_episodes) {
             mapping.final_local_episode(total)?;
         }
-        let aliases = anilist_aliases(&subject, &media);
+        let aliases = anime_schedule_aliases(&subject, &media);
+        let resolved_anilist_id = anilist_media_id.or_else(|| anime_schedule_anilist_id(&media));
         let fallback_warning = format!(
-            "bangumi-data 尚未收录 Bangumi #{}；已绑定 AniList #{}，系统会每日复查并在正式目录收录后自动切回平台排期。",
-            subject.id, media.id
+            "bangumi-data 尚未收录 Bangumi #{}；已绑定 AnimeSchedule '{}'，系统会每日复查并在正式目录收录后自动切回平台排期。",
+            subject.id, media.route
         );
         Ok(ResolvedSchedule {
             bangumi_subject_id: subject.id,
-            anilist_media_id: Some(media.id),
+            anilist_media_id: resolved_anilist_id,
+            anime_schedule_route: Some(media.route),
             total_episodes,
             matched_title: subject.name,
             aliases,
@@ -747,10 +712,10 @@ impl ScheduleProvider {
             expected_time: (confidence != "date_only").then(|| local.format("%H:%M").to_string()),
             timezone: timezone.name().to_string(),
             broadcast_pattern: format!("R/{}/P7D", anchor.to_rfc3339()),
-            schedule_source: "anilist".into(),
+            schedule_source: "anime_schedule".into(),
             schedule_confidence: confidence.into(),
             schedule_warning: merge_warnings(Some(fallback_warning), timing_warning),
-            source_health_error: None,
+            source_health_error,
         })
     }
 
@@ -762,53 +727,113 @@ impl ScheduleProvider {
         self.get_json(&url, "Bangumi subject API").await
     }
 
-    async fn anilist_search(&self, title: &str, year: Option<i32>) -> Result<Vec<AniListMedia>> {
-        let body = serde_json::json!({
-            "operationName": "AniPulseSearch",
-            "query": ANILIST_SEARCH_QUERY,
-            "variables": { "search": title, "seasonYear": year }
-        });
-        let response: AniListResponse<AniListSearchData> = self
-            .post_json(&self.config.anilist_api_url, &body, "AniList API")
-            .await?;
-        let data = anilist_data(response)?;
-        Ok(data.page.media)
+    async fn resolve_anime_schedule_media(
+        &self,
+        subject: &BangumiSubject,
+        subject_date: Option<NaiveDate>,
+        anilist_media_id: Option<i64>,
+        persisted_route: Option<&str>,
+    ) -> Result<AnimeScheduleAnime> {
+        if let Some(route) = persisted_route {
+            validate_anime_schedule_route(route)?;
+            let media = self.anime_schedule_media(route).await?;
+            validate_anime_schedule_mapping(subject, subject_date, &media, anilist_media_id)?;
+            return Ok(media);
+        }
+
+        let candidates = if let Some(media_id) = anilist_media_id {
+            self.anime_schedule_search(None, Some(media_id)).await?
+        } else {
+            self.anime_schedule_search(Some(&subject.name), None)
+                .await?
+        };
+        select_anime_schedule_candidate(subject, subject_date, anilist_media_id, candidates)
     }
 
-    async fn anilist_media(&self, media_id: i64) -> Result<AniListMedia> {
-        let body = serde_json::json!({
-            "operationName": "AniPulseMedia",
-            "query": ANILIST_MEDIA_QUERY,
-            "variables": { "id": media_id }
-        });
-        let response: AniListResponse<AniListMediaData> = self
-            .post_json(&self.config.anilist_api_url, &body, "AniList API")
-            .await?;
-        anilist_data(response)?
-            .media
-            .ok_or_else(|| AppError::Schedule(format!("AniList media #{media_id} was not found")))
+    async fn anime_schedule_search(
+        &self,
+        title: Option<&str>,
+        anilist_media_id: Option<i64>,
+    ) -> Result<Vec<AnimeScheduleAnime>> {
+        let url = format!(
+            "{}/anime",
+            self.config.anime_schedule_api_url.trim_end_matches('/')
+        );
+        let mut request = self.anime_schedule_request(&url);
+        if let Some(title) = title {
+            request = request.query(&[("q", title)]);
+        }
+        if let Some(media_id) = anilist_media_id {
+            request = request.query(&[("anilist-ids", media_id)]);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| safe_request_error(error, "AnimeSchedule API"))?;
+        let page: AnimeSchedulePage =
+            decode_metadata_response(response, "AnimeSchedule API").await?;
+        Ok(page.anime)
+    }
+
+    async fn anime_schedule_media(&self, route: &str) -> Result<AnimeScheduleAnime> {
+        validate_anime_schedule_route(route)?;
+        let url = format!(
+            "{}/anime/{route}",
+            self.config.anime_schedule_api_url.trim_end_matches('/')
+        );
+        let response = self
+            .anime_schedule_request(&url)
+            .send()
+            .await
+            .map_err(|error| safe_request_error(error, "AnimeSchedule API"))?;
+        decode_metadata_response(response, "AnimeSchedule API").await
+    }
+
+    async fn anime_schedule_timetable(
+        &self,
+        expected_at: DateTime<Utc>,
+        route: &str,
+        target_episode: i64,
+    ) -> Result<Option<AnimeScheduleTimetableEntry>> {
+        // The upstream query is explicitly UTC, so derive its ISO week in UTC as
+        // well. Tokyo and UTC can fall into different weeks around Sunday night.
+        let week = expected_at.iso_week();
+        let url = format!(
+            "{}/timetables/raw",
+            self.config.anime_schedule_api_url.trim_end_matches('/')
+        );
+        let response = self
+            .anime_schedule_request(&url)
+            .query(&[
+                ("year", week.year().to_string()),
+                ("week", week.week().to_string()),
+                ("tz", "UTC".to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|error| safe_request_error(error, "AnimeSchedule timetable API"))?;
+        let timetable: Vec<AnimeScheduleTimetableEntry> =
+            decode_metadata_response(response, "AnimeSchedule timetable API").await?;
+        Ok(timetable.into_iter().find(|entry| {
+            let first = entry
+                .subtracted_episode_number
+                .unwrap_or(entry.episode_number);
+            entry.route == route && (first..=entry.episode_number).contains(&target_episode)
+        }))
+    }
+
+    fn anime_schedule_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let request = self.client.get(url).header("Accept", "application/json");
+        match self.anime_schedule_token.as_deref() {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str, label: &str) -> Result<T> {
         let response = self
             .client
             .get(url)
-            .send()
-            .await
-            .map_err(|error| safe_request_error(error, label))?;
-        decode_metadata_response(response, label).await
-    }
-
-    async fn post_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-        label: &str,
-    ) -> Result<T> {
-        let response = self
-            .client
-            .post(url)
-            .json(body)
             .send()
             .await
             .map_err(|error| safe_request_error(error, label))?;
@@ -822,8 +847,18 @@ async fn decode_metadata_response<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
+        let hint = if label.starts_with("AnimeSchedule") && matches!(status.as_u16(), 401 | 403) {
+            format!(
+                "; set {ANIME_SCHEDULE_TOKEN_ENV} for direct access, or configure the Cloudflare Worker secret"
+            )
+        } else if label.starts_with("AnimeSchedule") && status.as_u16() == 502 {
+            "; verify that the Worker has ANIME_SCHEDULE_TOKEN and the new AnimeSchedule routes"
+                .into()
+        } else {
+            String::new()
+        };
         return Err(AppError::Schedule(format!(
-            "{label} returned HTTP {status}"
+            "{label} returned HTTP {status}{hint}"
         )));
     }
     if response
@@ -849,46 +884,98 @@ async fn decode_metadata_response<T: for<'de> Deserialize<'de>>(
         .map_err(|error| AppError::Schedule(format!("{label} returned invalid JSON: {error}")))
 }
 
-fn anilist_data<T>(response: AniListResponse<T>) -> Result<T> {
-    if let Some(data) = response.data {
-        return Ok(data);
-    }
-    let errors = response
-        .errors
-        .into_iter()
-        .map(|error| error.message)
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(AppError::Schedule(if errors.is_empty() {
-        "AniList API returned no data".into()
-    } else {
-        format!("AniList API error: {errors}")
-    }))
-}
-
-fn anilist_date(value: &AniListDate) -> Option<NaiveDate> {
-    NaiveDate::from_ymd_opt(value.year?, value.month?, value.day?)
-}
-
-fn anilist_date_only_schedule(
+fn anime_schedule_estimate(
     episode_airdate: Option<NaiveDate>,
     subject_date: Option<NaiveDate>,
-    media: &AniListMedia,
+    media: &AnimeScheduleAnime,
     subject_episode_index: i64,
     timezone: Tz,
 ) -> Result<(DateTime<Utc>, &'static str, Option<String>)> {
-    let start_date = subject_date.or_else(|| anilist_date(&media.start_date));
+    let premier = anime_schedule_premier(media);
+    if let Some(override_entry) = media.episode_override.filter(|entry| {
+        let first = entry
+            .override_episode
+            .saturating_sub(entry.episodes_aired.max(0));
+        (first..=entry.override_episode).contains(&subject_episode_index)
+    }) {
+        return Ok((
+            override_entry.override_date,
+            "calibrated",
+            Some(format!(
+                "AnimeSchedule 提供了 EP{subject_episode_index} 的调档时间。"
+            )),
+        ));
+    }
+
+    if let Some(premier) = premier {
+        let mut expected_at = if anime_schedule_is_ona(media) {
+            premier
+        } else if let Some(airdate) = episode_airdate {
+            let time = premier.with_timezone(&Tokyo).time();
+            Tokyo
+                .with_ymd_and_hms(
+                    airdate.year(),
+                    airdate.month(),
+                    airdate.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second(),
+                )
+                .single()
+                .ok_or_else(|| {
+                    AppError::Schedule("cannot combine AnimeSchedule time with Bangumi date".into())
+                })?
+                .with_timezone(&Utc)
+        } else {
+            let offset = subject_episode_index
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(7))
+                .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?;
+            premier + Duration::days(offset)
+        };
+        let mut warning = if subject_episode_index == 1 || anime_schedule_is_ona(media) {
+            None
+        } else if episode_airdate.is_some() {
+            Some("已用 Bangumi 章节日期和 AnimeSchedule 日本首播时刻组合，等待周排期确认。".into())
+        } else {
+            Some(format!(
+                "AnimeSchedule 尚未列出目标周的 EP{subject_episode_index}，暂按首播时刻每周推算。"
+            ))
+        };
+        if let (Some(delayed_from), Some(delayed_until)) = (
+            valid_anime_schedule_time(media.delayed_from),
+            valid_anime_schedule_time(media.delayed_until),
+        ) && (expected_at - delayed_from).num_hours().abs() <= 36
+        {
+            expected_at = delayed_until;
+            warning = Some(format!(
+                "AnimeSchedule 标记本集由 {} 调整至 {}。",
+                delayed_from.to_rfc3339(),
+                delayed_until.to_rfc3339()
+            ));
+        }
+        return Ok((
+            expected_at,
+            if subject_episode_index == 1 || anime_schedule_is_ona(media) {
+                "calibrated"
+            } else {
+                "estimated"
+            },
+            warning,
+        ));
+    }
+
     let date = if let Some(airdate) = episode_airdate {
         airdate
     } else {
-        let start_date = start_date.ok_or_else(|| {
+        let start_date = subject_date.ok_or_else(|| {
             AppError::Schedule(format!(
-                "AniList #{} matched '{}', but it has neither a next airing timestamp nor a start date",
-                media.id,
-                anilist_display_title(media)
+                "AnimeSchedule '{}' matched '{}', but neither source has a precise premiere date",
+                media.route,
+                anime_schedule_display_title(media)
             ))
         })?;
-        if subject_episode_index == 1 || media.format.as_deref() == Some("ONA") {
+        if subject_episode_index == 1 || anime_schedule_is_ona(media) {
             start_date
         } else {
             let day_offset = subject_episode_index
@@ -908,57 +995,103 @@ fn anilist_date_only_schedule(
         local.with_timezone(&Utc),
         "date_only",
         Some(format!(
-            "当前来源仅公布 {date} 的开播日期，尚无精确上线时刻；系统将从当天开始检查并每日同步，获得精确时刻后会自动校准。"
+            "当前来源仅公布 {date} 的开播日期，尚无精确上线时刻；系统将从当天开始检查并每日同步。"
         )),
     ))
 }
 
-fn anilist_titles(media: &AniListMedia) -> Vec<&str> {
+fn valid_anime_schedule_time(value: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    value.filter(|time| time.year() >= 1900)
+}
+
+fn anime_schedule_premier(media: &AnimeScheduleAnime) -> Option<DateTime<Utc>> {
+    valid_anime_schedule_time(media.premier)
+}
+
+fn anime_schedule_premier_date(media: &AnimeScheduleAnime) -> Option<NaiveDate> {
+    anime_schedule_premier(media).map(|time| time.with_timezone(&Tokyo).date_naive())
+}
+
+fn anime_schedule_is_ona(media: &AnimeScheduleAnime) -> bool {
     media
-        .title
-        .native
+        .media_types
         .iter()
-        .chain(media.title.romaji.iter())
-        .chain(media.title.english.iter())
-        .chain(media.synonyms.iter())
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .collect()
+        .any(|kind| kind.route.eq_ignore_ascii_case("ona"))
 }
 
-fn anilist_display_title(media: &AniListMedia) -> &str {
+fn anime_schedule_primary_titles(media: &AnimeScheduleAnime) -> Vec<&str> {
+    let mut values = vec![media.title.as_str()];
+    if let Some(names) = &media.names {
+        values.extend(
+            names
+                .native
+                .iter()
+                .chain(names.romaji.iter())
+                .chain(names.english.iter())
+                .map(String::as_str),
+        );
+    }
+    values.retain(|value| !value.trim().is_empty());
+    values
+}
+
+fn anime_schedule_titles(media: &AnimeScheduleAnime) -> Vec<&str> {
+    let mut values = anime_schedule_primary_titles(media);
+    if let Some(names) = &media.names {
+        values.extend(names.abbreviation.iter().map(String::as_str));
+        if let Some(synonyms) = &names.synonyms {
+            values.extend(synonyms.iter().map(String::as_str));
+        }
+    }
+    values.retain(|value| !value.trim().is_empty());
+    values
+}
+
+fn anime_schedule_display_title(media: &AnimeScheduleAnime) -> &str {
     media
-        .title
-        .native
-        .as_deref()
-        .or(media.title.romaji.as_deref())
-        .or(media.title.english.as_deref())
-        .unwrap_or("unknown title")
+        .names
+        .as_ref()
+        .and_then(|names| names.native.as_deref())
+        .unwrap_or(&media.title)
 }
 
-fn anilist_matches_subject(
+fn anime_schedule_anilist_id(media: &AnimeScheduleAnime) -> Option<i64> {
+    media
+        .websites
+        .as_ref()?
+        .ani_list
+        .as_deref()?
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn anime_schedule_matches_subject(
     subject: &BangumiSubject,
     subject_date: Option<NaiveDate>,
-    media: &AniListMedia,
+    media: &AnimeScheduleAnime,
+    expected_anilist_id: Option<i64>,
 ) -> bool {
+    if let (Some(expected), Some(actual)) = (expected_anilist_id, anime_schedule_anilist_id(media))
+        && expected != actual
+    {
+        return false;
+    }
     let subject_titles = [&subject.name, &subject.name_cn]
         .into_iter()
         .map(|value| normalize_title(value))
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    let media_primary_titles = media
-        .title
-        .native
-        .iter()
-        .chain(media.title.romaji.iter())
-        .chain(media.title.english.iter())
-        .map(|value| normalize_title(value))
+    let media_primary_titles = anime_schedule_primary_titles(media)
+        .into_iter()
+        .map(normalize_title)
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    let media_titles = media_primary_titles
-        .iter()
-        .cloned()
-        .chain(media.synonyms.iter().map(|value| normalize_title(value)))
+    let media_titles = anime_schedule_titles(media)
+        .into_iter()
+        .map(normalize_title)
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     if subject_titles.is_empty() || media_titles.is_empty() {
@@ -979,11 +1112,7 @@ fn anilist_matches_subject(
     if !equivalent_title {
         return false;
     }
-    let media_date = anilist_date(&media.start_date);
-    // Synonyms and one-character spelling variants are accepted only with an
-    // exact date match. This covers Japanese old/new glyph variants such as
-    // 藥/薬 without allowing a nearby season title to bind when either source
-    // has incomplete metadata.
+    let media_date = anime_schedule_premier_date(media);
     if !exact_primary_title
         && subject_date
             .zip(media_date)
@@ -998,7 +1127,11 @@ fn anilist_matches_subject(
     }
     let platform = subject.platform.as_deref().unwrap_or_default();
     if platform.eq_ignore_ascii_case("TV")
-        && !matches!(media.format.as_deref(), Some("TV" | "TV_SHORT"))
+        && !media.media_types.is_empty()
+        && !media
+            .media_types
+            .iter()
+            .any(|kind| matches!(kind.route.to_ascii_lowercase().as_str(), "tv" | "tv-short"))
     {
         return false;
     }
@@ -1021,19 +1154,20 @@ fn equivalent_title_spelling(left: &str, right: &str) -> bool {
             == 1
 }
 
-fn validate_anilist_mapping(
+fn validate_anime_schedule_mapping(
     subject: &BangumiSubject,
     subject_date: Option<NaiveDate>,
-    media: &AniListMedia,
+    media: &AnimeScheduleAnime,
+    expected_anilist_id: Option<i64>,
 ) -> Result<()> {
-    if anilist_matches_subject(subject, subject_date, media) {
+    if anime_schedule_matches_subject(subject, subject_date, media, expected_anilist_id) {
         return Ok(());
     }
     Err(AppError::Schedule(format!(
-        "AniList #{} ('{}', {}) does not match Bangumi #{} ('{}', {}); verify the season and ID",
-        media.id,
-        anilist_display_title(media),
-        anilist_date(&media.start_date)
+        "AnimeSchedule '{}' ('{}', {}) does not match Bangumi #{} ('{}', {}); verify the season and route",
+        media.route,
+        anime_schedule_display_title(media),
+        anime_schedule_premier_date(media)
             .map(|date| date.to_string())
             .unwrap_or_else(|| "unknown date".into()),
         subject.id,
@@ -1044,14 +1178,17 @@ fn validate_anilist_mapping(
     )))
 }
 
-fn select_anilist_candidate(
+fn select_anime_schedule_candidate(
     subject: &BangumiSubject,
     subject_date: Option<NaiveDate>,
-    candidates: Vec<AniListMedia>,
-) -> Result<AniListMedia> {
+    expected_anilist_id: Option<i64>,
+    candidates: Vec<AnimeScheduleAnime>,
+) -> Result<AnimeScheduleAnime> {
     let mut matches = candidates
         .iter()
-        .filter(|media| anilist_matches_subject(subject, subject_date, media))
+        .filter(|media| {
+            anime_schedule_matches_subject(subject, subject_date, media, expected_anilist_id)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if matches.len() == 1 {
@@ -1062,13 +1199,17 @@ fn select_anilist_candidate(
         .take(8)
         .map(|media| {
             format!(
-                "#{} {} ({}, {}, {})",
-                media.id,
-                anilist_display_title(media),
-                anilist_date(&media.start_date)
+                "{} {} ({}, {}, {})",
+                media.route,
+                anime_schedule_display_title(media),
+                anime_schedule_premier_date(media)
                     .map(|date| date.to_string())
                     .unwrap_or_else(|| "date unknown".into()),
-                media.format.as_deref().unwrap_or("format unknown"),
+                media
+                    .media_types
+                    .first()
+                    .map(|kind| kind.route.as_str())
+                    .unwrap_or("format unknown"),
                 media.status.as_deref().unwrap_or("status unknown")
             )
         })
@@ -1076,26 +1217,26 @@ fn select_anilist_candidate(
         .join(", ");
     if matches.is_empty() {
         Err(AppError::Schedule(format!(
-            "no high-confidence AniList match for Bangumi #{} '{}'. Search candidates: {}. Enter the correct AniList ID manually after checking the season",
+            "no high-confidence AnimeSchedule match for Bangumi #{} '{}'. Search candidates: {}. Enter the correct AnimeSchedule route manually after checking the season",
             subject.id,
             subject.name,
             if choices.is_empty() { "none" } else { &choices }
         )))
     } else {
         Err(AppError::Schedule(format!(
-            "multiple high-confidence AniList matches for Bangumi #{} '{}': {}. Enter the correct AniList ID manually",
+            "multiple high-confidence AnimeSchedule matches for Bangumi #{} '{}': {}. Enter the correct AnimeSchedule route manually",
             subject.id, subject.name, choices
         )))
     }
 }
 
-fn anilist_aliases(subject: &BangumiSubject, media: &AniListMedia) -> Vec<String> {
+fn anime_schedule_aliases(subject: &BangumiSubject, media: &AnimeScheduleAnime) -> Vec<String> {
     let mut values = Vec::new();
     values.push(subject.name.clone());
     if !subject.name_cn.trim().is_empty() {
         values.push(subject.name_cn.clone());
     }
-    values.extend(anilist_titles(media).into_iter().map(str::to_string));
+    values.extend(anime_schedule_titles(media).into_iter().map(str::to_string));
     let mut seen = HashSet::new();
     values
         .into_iter()
@@ -1104,6 +1245,20 @@ fn anilist_aliases(subject: &BangumiSubject, media: &AniListMedia) -> Vec<String
             !normalized.is_empty() && seen.insert(normalized)
         })
         .collect()
+}
+
+fn validate_anime_schedule_route(route: &str) -> Result<()> {
+    if route.is_empty()
+        || route.len() > 200
+        || !route
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err(AppError::InvalidInput(
+            "AnimeSchedule route must contain only ASCII letters, digits, and '-'".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl ScheduleSynchronizer {
@@ -1201,7 +1356,7 @@ impl ScheduleSynchronizer {
                     .iter()
                     .any(|item| item_subject_id(item) == Some(*subject_id))
             })
-            .map(|subject_id| format!("anilist-schedule:{subject_id}"));
+            .map(|subject_id| format!("anime-schedule:{subject_id}"));
         let resolved = match self
             .provider
             .resolve_auto(
@@ -1212,6 +1367,7 @@ impl ScheduleSynchronizer {
                     next_episode: episode.episode_no,
                     episode_mapping,
                     anilist_media_id: anime.anime.anilist_media_id,
+                    anime_schedule_route: anime.anime.anime_schedule_route.as_deref(),
                     timezone: &anime.anime.timezone,
                 },
             )
@@ -1250,14 +1406,17 @@ impl ScheduleSynchronizer {
                 resolved.schedule_warning.as_deref().unwrap_or_default()
             ));
         }
-        let schedule_health_source = if resolved.schedule_source == "anilist" {
-            format!("anilist-schedule:{}", resolved.bangumi_subject_id)
+        let schedule_health_source = if resolved.schedule_source == "anime_schedule" {
+            format!("anime-schedule:{}", resolved.bangumi_subject_id)
         } else {
             format!("bangumi-schedule:{}", resolved.bangumi_subject_id)
         };
-        if resolved.schedule_source != "anilist" && anime.anime.anilist_media_id.is_some() {
+        if resolved.schedule_source != "anime_schedule"
+            && (anime.anime.anime_schedule_route.is_some()
+                || anime.anime.anilist_media_id.is_some())
+        {
             self.repository
-                .record_source_success(&format!("anilist-schedule:{}", resolved.bangumi_subject_id))
+                .record_source_success(&format!("anime-schedule:{}", resolved.bangumi_subject_id))
                 .await?;
         }
         if let Some(error) = &resolved.source_health_error {
@@ -1305,6 +1464,7 @@ impl ResolvedSchedule {
         ScheduleUpdate {
             bangumi_subject_id: self.bangumi_subject_id,
             anilist_media_id: self.anilist_media_id,
+            anime_schedule_route: self.anime_schedule_route.clone(),
             total_episodes: self.total_episodes,
             aliases: self.aliases.clone(),
             expected_at: self.expected_at,
@@ -1707,7 +1867,7 @@ mod tests {
     use crate::domain::{AutoScheduleMetadata, NewAnime};
 
     #[test]
-    fn anilist_mapping_compares_all_titles_without_weakening_date_checks() {
+    fn anime_schedule_mapping_compares_all_titles_without_weakening_date_checks() {
         let subject_date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let subject = BangumiSubject {
             id: 513_878,
@@ -1717,37 +1877,51 @@ mod tests {
             platform: Some("WEB".into()),
             total_episodes: Some(10),
         };
-        let media = AniListMedia {
-            id: 195_539,
-            title: AniListTitle {
+        let media = AnimeScheduleAnime {
+            title: "Cyberpunk: Edgerunners 2".into(),
+            route: "cyberpunk-edgerunners-2".into(),
+            premier: Some(
+                DateTime::parse_from_rfc3339("2026-10-20T07:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            episode_override: None,
+            delayed_from: None,
+            delayed_until: None,
+            episodes: Some(10),
+            status: Some("Upcoming".into()),
+            names: Some(AnimeScheduleNames {
                 romaji: Some("Cyberpunk: Edgerunners 2".into()),
                 english: Some("Cyberpunk: Edgerunners 2".into()),
                 native: Some("サイバーパンク: エッジランナーズ2".into()),
-            },
-            synonyms: Vec::new(),
-            format: Some("ONA".into()),
-            status: Some("NOT_YET_RELEASED".into()),
-            start_date: AniListDate {
-                year: Some(2026),
-                month: Some(10),
-                day: Some(20),
-            },
-            episodes: Some(10),
-            next_airing_episode: None,
+                ..AnimeScheduleNames::default()
+            }),
+            websites: Some(AnimeScheduleWebsites {
+                ani_list: Some("https://anilist.co/anime/195539".into()),
+            }),
+            media_types: vec![AnimeScheduleCategory {
+                route: "ona".into(),
+            }],
         };
 
-        assert!(anilist_matches_subject(
+        assert!(anime_schedule_matches_subject(
             &subject,
             Some(subject_date),
-            &media
+            &media,
+            Some(195_539),
         ));
 
         let mut wrong_date = media.clone();
-        wrong_date.start_date.day = Some(21);
-        assert!(!anilist_matches_subject(
+        wrong_date.premier = Some(
+            DateTime::parse_from_rfc3339("2026-10-21T07:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(!anime_schedule_matches_subject(
             &subject,
             Some(subject_date),
-            &wrong_date
+            &wrong_date,
+            Some(195_539),
         ));
     }
 
@@ -1792,12 +1966,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreleased_subject_falls_back_to_a_unique_anilist_match() {
+    async fn unreleased_subject_falls_back_to_a_unique_anime_schedule_match() {
         let (base_url, requests) = unreleased_mock_server().await;
         let provider = ScheduleProvider::new(ScheduleConfig {
             bangumi_data_url: format!("{base_url}/data.json"),
             bangumi_api_base_url: base_url.clone(),
-            anilist_api_url: format!("{base_url}/anilist/graphql"),
+            anime_schedule_api_url: format!("{base_url}/anime-schedule"),
             request_timeout_secs: 5,
             ..ScheduleConfig::default()
         })
@@ -1813,6 +1987,7 @@ mod tests {
                     next_episode: 1,
                     episode_mapping: None,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     timezone: "Asia/Shanghai",
                 },
             )
@@ -1821,8 +1996,12 @@ mod tests {
 
         assert_eq!(resolved.bangumi_subject_id, 568_244);
         assert_eq!(resolved.anilist_media_id, Some(195_516));
+        assert_eq!(
+            resolved.anime_schedule_route.as_deref(),
+            Some("kusuriya-no-hitorigoto-3rd-season")
+        );
         assert_eq!(resolved.total_episodes, Some(12));
-        assert_eq!(resolved.schedule_source, "anilist");
+        assert_eq!(resolved.schedule_source, "anime_schedule");
         assert_eq!(resolved.schedule_confidence, "calibrated");
         assert_eq!(resolved.expected_time.as_deref(), Some("22:00"));
         assert_eq!(
@@ -1833,18 +2012,18 @@ mod tests {
             resolved
                 .schedule_warning
                 .as_deref()
-                .is_some_and(|value| value.contains("AniList #195516"))
+                .is_some_and(|value| value.contains("kusuriya-no-hitorigoto-3rd-season"))
         );
-        assert_eq!(requests.await.unwrap(), 4);
+        assert_eq!(requests.await.unwrap(), 5);
     }
 
     #[tokio::test]
     async fn unreleased_ona_without_airing_timestamp_uses_date_only_schedule() {
-        let (base_url, requests) = date_only_anilist_mock_server().await;
+        let (base_url, requests) = date_only_anime_schedule_mock_server().await;
         let provider = ScheduleProvider::new(ScheduleConfig {
             bangumi_data_url: format!("{base_url}/data.json"),
             bangumi_api_base_url: base_url.clone(),
-            anilist_api_url: format!("{base_url}/anilist/graphql"),
+            anime_schedule_api_url: format!("{base_url}/anime-schedule"),
             request_timeout_secs: 5,
             ..ScheduleConfig::default()
         })
@@ -1860,6 +2039,7 @@ mod tests {
                     next_episode: 1,
                     episode_mapping: None,
                     anilist_media_id: Some(195_539),
+                    anime_schedule_route: None,
                     timezone: "Asia/Shanghai",
                 },
             )
@@ -1868,7 +2048,11 @@ mod tests {
 
         assert_eq!(resolved.anilist_media_id, Some(195_539));
         assert_eq!(resolved.total_episodes, Some(10));
-        assert_eq!(resolved.schedule_source, "anilist");
+        assert_eq!(resolved.schedule_source, "anime_schedule");
+        assert_eq!(
+            resolved.anime_schedule_route.as_deref(),
+            Some("cyberpunk-edgerunners-2")
+        );
         assert_eq!(resolved.schedule_confidence, "date_only");
         assert_eq!(resolved.expected_time, None);
         assert_eq!(
@@ -1881,7 +2065,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|warning| warning.contains("尚无精确上线时刻"))
         );
-        assert_eq!(requests.await.unwrap(), 4);
+        assert_eq!(requests.await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -1908,6 +2092,7 @@ mod tests {
                 auto_schedule: Some(AutoScheduleMetadata {
                     bangumi_subject_id: 501_000,
                     anilist_media_id: None,
+                    anime_schedule_route: None,
                     total_episodes: None,
                     broadcast_pattern: "R/2026-07-04T15:00:00Z/P7D".into(),
                     schedule_source: "danime".into(),
@@ -2428,7 +2613,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            for index in 0..4 {
+            for index in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let headers = String::from_utf8_lossy(request_headers(&request));
@@ -2450,9 +2635,15 @@ mod tests {
                         assert!(headers.contains("offset=0"));
                         r#"{"total":12,"data":[{"airdate":"2026-10-02","sort":1,"ep":1}]}"#
                     }
+                    3 => {
+                        assert!(headers.starts_with("GET /anime-schedule/anime?"));
+                        assert!(headers.contains("q="));
+                        r#"{"anime":[{"id":"as-1","title":"Kusuriya no Hitorigoto 3rd Season","route":"kusuriya-no-hitorigoto-3rd-season","premier":"2026-10-02T14:00:00Z","episodes":12,"status":"Upcoming","names":{"romaji":"Kusuriya no Hitorigoto 3rd Season","english":"The Apothecary Diaries Season 3","native":"薬屋のひとりごと 第3期","synonyms":["药屋少女的呢喃 第三季"]},"websites":{"aniList":"https://anilist.co/anime/195516"},"mediaTypes":[{"route":"tv"}]}]}"#
+                    }
                     _ => {
-                        assert!(headers.starts_with("POST /anilist/graphql"));
-                        r#"{"data":{"Page":{"media":[{"id":195516,"title":{"romaji":"Kusuriya no Hitorigoto 3rd Season","english":"The Apothecary Diaries Season 3","native":"藥屋のひとりごと 第3期"},"synonyms":[],"format":"TV","status":"NOT_YET_RELEASED","startDate":{"year":2026,"month":10,"day":2},"episodes":null,"nextAiringEpisode":{"episode":1,"airingAt":1790949600}}]}}}"#
+                        assert!(headers.starts_with("GET /anime-schedule/timetables/raw?"));
+                        assert!(headers.contains("tz=UTC"));
+                        r#"[{"route":"kusuriya-no-hitorigoto-3rd-season","episodeDate":"2026-10-02T14:00:00Z","episodeNumber":1}]"#
                     }
                 };
                 let response = format!(
@@ -2462,16 +2653,16 @@ mod tests {
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
-            4
+            5
         });
         (format!("http://{address}"), task)
     }
 
-    async fn date_only_anilist_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
+    async fn date_only_anime_schedule_mock_server() -> (String, tokio::task::JoinHandle<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            for index in 0..4 {
+            for index in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let headers = String::from_utf8_lossy(request_headers(&request));
@@ -2489,9 +2680,14 @@ mod tests {
                         assert!(headers.contains("offset=0"));
                         r#"{"total":10,"data":[{"airdate":"2026-10-20","sort":1,"ep":1}]}"#
                     }
+                    3 => {
+                        assert!(headers.starts_with("GET /anime-schedule/anime?"));
+                        assert!(headers.contains("anilist-ids=195539"));
+                        r#"{"anime":[{"id":"as-2","title":"Cyberpunk: Edgerunners 2","route":"cyberpunk-edgerunners-2","premier":null,"episodes":10,"status":"Upcoming","names":{"romaji":"Cyberpunk: Edgerunners 2","english":"Cyberpunk: Edgerunners 2","native":"サイバーパンク: エッジランナーズ2"},"websites":{"aniList":"https://anilist.co/anime/195539"},"mediaTypes":[{"route":"ona"}]}]}"#
+                    }
                     _ => {
-                        assert!(headers.starts_with("POST /anilist/graphql"));
-                        r#"{"data":{"Media":{"id":195539,"title":{"romaji":"Cyberpunk: Edgerunners 2","english":"Cyberpunk: Edgerunners 2","native":"サイバーパンク: エッジランナーズ2"},"synonyms":[],"format":"ONA","status":"NOT_YET_RELEASED","startDate":{"year":2026,"month":10,"day":20},"episodes":10,"nextAiringEpisode":null}}}"#
+                        assert!(headers.starts_with("GET /anime-schedule/timetables/raw?"));
+                        r#"[]"#
                     }
                 };
                 let response = format!(
@@ -2501,7 +2697,7 @@ mod tests {
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
-            4
+            5
         });
         (format!("http://{address}"), task)
     }

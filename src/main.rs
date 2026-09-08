@@ -133,9 +133,15 @@ struct AddAnimeArgs {
     #[arg(
         long,
         requires_all = ["auto_schedule", "bangumi_id"],
-        help = "explicit AniList media ID for a Bangumi subject missing from bangumi-data"
+        help = "AniList media ID used only as an AnimeSchedule lookup key"
     )]
     anilist_id: Option<i64>,
+    #[arg(
+        long,
+        requires_all = ["auto_schedule", "bangumi_id"],
+        help = "explicit AnimeSchedule route (slug) when automatic matching is ambiguous"
+    )]
+    anime_schedule_route: Option<String>,
     #[arg(
         long,
         requires_all = ["auto_schedule", "bangumi_episode_start"],
@@ -492,6 +498,7 @@ async fn handle_anime(
                             next_episode: args.next_episode,
                             episode_mapping,
                             anilist_media_id: args.anilist_id,
+                            anime_schedule_route: args.anime_schedule_route.as_deref(),
                             timezone: &args.timezone,
                         },
                     )
@@ -537,6 +544,7 @@ async fn handle_anime(
                     Some(AutoScheduleMetadata {
                         bangumi_subject_id: resolved.bangumi_subject_id,
                         anilist_media_id: resolved.anilist_media_id,
+                        anime_schedule_route: resolved.anime_schedule_route,
                         total_episodes: resolved.total_episodes,
                         broadcast_pattern: resolved.broadcast_pattern,
                         schedule_source: resolved.schedule_source,
@@ -631,6 +639,9 @@ async fn handle_anime(
             }
             if let Some(media_id) = anime.anime.anilist_media_id {
                 println!("AniList media: {media_id}");
+            }
+            if let Some(route) = &anime.anime.anime_schedule_route {
+                println!("AnimeSchedule route: {route}");
             }
             if let Some((local_origin, bangumi_origin)) = anime
                 .anime

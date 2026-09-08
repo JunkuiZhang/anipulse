@@ -29,41 +29,65 @@ test("only exposes the exact AniPulse upstream routes", () => {
   assert.equal(resolveRoute(new URL(
     "https://proxy.example.com/bangumi/v0/episodes?subject_id=622206&type=0&limit=100&offset=0",
   )), null);
+  assert.equal(
+    resolveRoute(new URL(
+      "https://proxy.example.com/anime-schedule/anime?anilist-ids=195539",
+    )).upstreamUrl,
+    "https://animeschedule.net/api/v3/anime?anilist-ids=195539",
+  );
+  assert.equal(
+    resolveRoute(new URL(
+      "https://proxy.example.com/anime-schedule/anime/cyberpunk-edgerunners-2",
+    )).upstreamUrl,
+    "https://animeschedule.net/api/v3/anime/cyberpunk-edgerunners-2",
+  );
+  assert.equal(
+    resolveRoute(new URL(
+      "https://proxy.example.com/anime-schedule/timetables/raw?year=2026&week=43&tz=UTC",
+    )).upstreamUrl,
+    "https://animeschedule.net/api/v3/timetables/raw?year=2026&week=43&tz=UTC",
+  );
+  assert.equal(resolveRoute(new URL(
+    "https://proxy.example.com/anime-schedule/anime?q=test&evil=https://example.com",
+  )), null);
 });
 
-test("only forwards AniPulse's two fixed AniList queries", async () => {
+test("only forwards fixed AnimeSchedule routes and injects the Worker secret", async () => {
   const calls = [];
-  const env = { ALLOWED_CLIENT_IPS: CLIENT_IP };
-  const request = new Request("https://proxy.example.com/anilist/graphql", {
-    method: "POST",
-    headers: {
-      "CF-Connecting-IP": CLIENT_IP,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      operationName: "AniPulseSearch",
-      query: "mutation Evil { DeleteEverything }",
-      variables: { search: "薬屋のひとりごと 第3期", seasonYear: 2026 },
-    }),
-  });
+  const env = {
+    ALLOWED_CLIENT_IPS: CLIENT_IP,
+    ANIME_SCHEDULE_TOKEN: "worker-only-token",
+  };
+  const request = authorizedRequest(
+    "https://proxy.example.com/anime-schedule/anime?anilist-ids=195539",
+  );
   const response = await worker.fetch(request, env, immediateContext(), {
     cache: null,
     fetch: async (url, init) => {
       calls.push({ url, init });
-      return new Response('{"data":{"Page":{"media":[]}}}', {
+      return new Response('{"anime":[]}', {
         headers: { "Content-Type": "application/json" },
       });
     },
   });
   assert.equal(response.status, 200);
-  assert.equal(calls[0].url, "https://graphql.anilist.co");
-  const forwarded = JSON.parse(calls[0].init.body);
-  assert.equal(forwarded.operationName, "AniPulseSearch");
-  assert.match(forwarded.query, /type: ANIME/);
-  assert.doesNotMatch(forwarded.query, /DeleteEverything/);
+  assert.equal(
+    calls[0].url,
+    "https://animeschedule.net/api/v3/anime?anilist-ids=195539",
+  );
+  assert.equal(calls[0].init.headers.get("Authorization"), "Bearer worker-only-token");
 
-  const rejected = authorizedRequest("https://proxy.example.com/anilist/graphql", "GET");
-  assert.equal((await worker.fetch(rejected, env, immediateContext())).status, 405);
+  const missingToken = authorizedRequest(
+    "https://proxy.example.com/anime-schedule/anime?anilist-ids=195539",
+  );
+  assert.equal((await worker.fetch(
+    missingToken,
+    { ALLOWED_CLIENT_IPS: CLIENT_IP },
+    immediateContext(),
+  )).status, 503);
+
+  const oldAniListRoute = authorizedRequest("https://proxy.example.com/anilist/graphql");
+  assert.equal((await worker.fetch(oldAniListRoute, env, immediateContext())).status, 404);
 });
 
 test("fails closed when the allowlist is missing and rejects other clients", async () => {
