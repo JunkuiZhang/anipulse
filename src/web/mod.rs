@@ -136,6 +136,7 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/resume", post(anime_resume_tracking))
         .route("/anime/{id}/archive-intent", post(anime_archive_intent))
         .route("/anime/{id}/archive", post(anime_archive))
+        .route("/anime/{id}/archive-memory", post(anime_archive_memory))
         .route("/anime/{id}/history/videos", post(history_video_add))
         .route(
             "/anime/{id}/history/videos/{video_id}/update",
@@ -676,6 +677,8 @@ struct AnimeListItem {
     enabled: bool,
     released_complete: bool,
     archived: bool,
+    archive_memory: String,
+    has_archive_memory: bool,
 }
 
 #[derive(Template)]
@@ -719,6 +722,19 @@ async fn anime_list(
         };
         let cover_url = anime.bangumi_subject_id.and_then(bangumi_cover_url);
         let cover_initial = title_initial(&anime.title);
+        let archive_memory = if anime.lifecycle == "archived" {
+            let memory = state.repository.get_anime_archive_memory(anime.id).await?;
+            let mut pieces = Vec::new();
+            if let Some(rating) = memory.rating {
+                pieces.push(format!("★ {rating}/10"));
+            }
+            if let Some(seconds) = memory.approximate_watch_seconds {
+                pieces.push(format_archive_duration(seconds));
+            }
+            pieces.join(" · ")
+        } else {
+            String::new()
+        };
         items.push(AnimeListItem {
             id: anime.id,
             display_no: index + 1,
@@ -795,6 +811,8 @@ async fn anime_list(
             enabled: anime.enabled,
             released_complete: anime.lifecycle == "released_complete",
             archived: anime.lifecycle == "archived",
+            has_archive_memory: !archive_memory.is_empty(),
+            archive_memory,
         });
     }
     let notice = match query.result.as_deref() {
@@ -1221,9 +1239,28 @@ struct AnimeArchiveDetailTemplate {
     aliases: String,
     summary: String,
     has_summary: bool,
-    total_episodes: String,
     archived_at: String,
     bangumi: String,
+    notice: String,
+    episode_stat: String,
+    watch_duration: String,
+    tracking_span: String,
+    completion_label: String,
+    completion_date: String,
+    rating_value: String,
+    rating_label: String,
+    has_rating: bool,
+    short_review: String,
+    has_short_review: bool,
+    tags: Vec<String>,
+    tags_input: String,
+    has_tags: bool,
+    has_memory: bool,
+    tracking_started_at: String,
+    first_confirmed_at: String,
+    has_first_confirmed_at: bool,
+    completed_at: String,
+    history_available: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -1268,6 +1305,28 @@ async fn anime_detail(
     let cover_url = anime.anime.bangumi_subject_id.and_then(bangumi_cover_url);
     let cover_initial = title_initial(&anime.anime.title);
     if anime.anime.lifecycle == "archived" {
+        let memory = state.repository.get_anime_archive_memory(id).await?;
+        let tags = serde_json::from_str::<Vec<String>>(&memory.tags_json).unwrap_or_default();
+        let rating_value = memory
+            .rating
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let completion_is_exact = memory.history_available;
+        let has_rating = memory.rating.is_some();
+        let has_short_review = !memory.short_review.is_empty();
+        let has_tags = !tags.is_empty();
+        let has_summary = !anime.anime.summary.is_empty();
+        let has_memory = has_rating || has_short_review || has_tags || has_summary;
+        let episode_stat = match (memory.watched_episodes, anime.anime.total_episodes) {
+            (_, Some(total)) => format!("全 {total} 集"),
+            (Some(watched), None) => format!("已记录 {watched} 集"),
+            (None, None) => "未知".into(),
+        };
+        let notice = match query.result.as_deref() {
+            Some("archive-memory-saved") => "观看记录已经保存。",
+            _ => "",
+        }
+        .to_string();
         return render(AnimeArchiveDetailTemplate {
             username: identity.username,
             csrf_token: identity.csrf_token,
@@ -1277,19 +1336,50 @@ async fn anime_detail(
             cover_url: cover_url.unwrap_or_default(),
             cover_initial,
             aliases: anime.aliases.join("、"),
-            has_summary: !anime.anime.summary.is_empty(),
+            has_summary,
             summary: anime.anime.summary,
-            total_episodes: anime
-                .anime
-                .total_episodes
-                .map(|value| format!("全 {value} 集"))
-                .unwrap_or_else(|| "未知".into()),
             archived_at: format_time(anime.anime.archived_at, state.display_timezone),
             bangumi: anime
                 .anime
                 .bangumi_subject_id
                 .map(|value| format!("#{value}"))
                 .unwrap_or_else(|| "未绑定".into()),
+            notice,
+            episode_stat,
+            watch_duration: memory
+                .approximate_watch_seconds
+                .map(format_archive_duration)
+                .unwrap_or_else(|| "暂无记录".into()),
+            tracking_span: format_tracking_span(memory.tracking_started_at, memory.completed_at),
+            completion_label: if completion_is_exact {
+                "完成日期".into()
+            } else {
+                "归档日期".into()
+            },
+            completion_date: format_date(memory.completed_at, state.display_timezone),
+            rating_label: memory
+                .rating
+                .map(|value| format!("★ {value} / 10"))
+                .unwrap_or_else(|| "尚未评分".into()),
+            has_rating,
+            rating_value,
+            has_short_review,
+            short_review: memory.short_review,
+            tags_input: tags.join("、"),
+            has_tags,
+            has_memory,
+            tags,
+            tracking_started_at: format_time(
+                Some(memory.tracking_started_at),
+                state.display_timezone,
+            ),
+            has_first_confirmed_at: memory.first_confirmed_at.is_some(),
+            first_confirmed_at: memory
+                .first_confirmed_at
+                .map(|value| format_time(Some(value), state.display_timezone))
+                .unwrap_or_else(|| "旧归档未保留".into()),
+            completed_at: format_time(Some(memory.completed_at), state.display_timezone),
+            history_available: memory.history_available,
         });
     }
     let episode = state.repository.active_episode(id).await.ok();
@@ -1997,6 +2087,12 @@ struct AnimeArchiveForm {
     nonce: String,
     total_episodes: i64,
     summary: String,
+    #[serde(default)]
+    rating: String,
+    #[serde(default)]
+    short_review: String,
+    #[serde(default)]
+    tags: String,
     confirm_watched: Option<String>,
 }
 
@@ -2019,9 +2115,18 @@ async fn anime_archive(
     {
         return Err(WebError::forbidden("归档确认已使用或过期，请重新开始"));
     }
+    let rating = parse_archive_rating(&form.rating)?;
+    let tags = parse_archive_tags(&form.tags);
     let archived = state
         .application
-        .archive_anime(id, Some(form.total_episodes), &form.summary)
+        .archive_anime_with_memory(
+            id,
+            Some(form.total_episodes),
+            &form.summary,
+            rating,
+            &form.short_review,
+            &tags,
+        )
         .await?;
     audit_success(
         &state,
@@ -2039,6 +2144,50 @@ async fn anime_archive(
     )
     .await?;
     Ok(Redirect::to("/anime?view=archived&result=archived").into_response())
+}
+
+#[derive(Deserialize)]
+struct AnimeArchiveMemoryForm {
+    csrf_token: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    rating: String,
+    #[serde(default)]
+    short_review: String,
+    #[serde(default)]
+    tags: String,
+}
+
+async fn anime_archive_memory(
+    State(state): State<WebState>,
+    Extension(identity): Extension<SessionIdentity>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<AnimeArchiveMemoryForm>,
+) -> WebResponse {
+    validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let rating = parse_archive_rating(&form.rating)?;
+    let tags = parse_archive_tags(&form.tags);
+    state
+        .application
+        .update_anime_archive_memory(id, &form.summary, rating, &form.short_review, &tags)
+        .await?;
+    audit_success(
+        &state,
+        &identity,
+        "anime.archive_memory.update",
+        "anime",
+        id,
+        serde_json::json!({
+            "rating": rating,
+            "has_short_review": !form.short_review.trim().is_empty(),
+            "tag_count": tags.len(),
+            "has_review": !form.summary.trim().is_empty()
+        }),
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/anime/{id}?result=archive-memory-saved")).into_response())
 }
 
 async fn anime_delete_intent(
@@ -3439,6 +3588,59 @@ fn format_duration(seconds: i64) -> String {
     }
 }
 
+fn format_archive_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    if hours > 0 && minutes > 0 {
+        format!("约 {hours} 小时 {minutes} 分")
+    } else if hours > 0 {
+        format!("约 {hours} 小时")
+    } else {
+        format!("约 {minutes} 分钟")
+    }
+}
+
+fn format_tracking_span(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    let days = end.signed_duration_since(start).num_days().max(0);
+    match days {
+        0 => "当天".into(),
+        1..=13 => format!("{days} 天"),
+        _ => {
+            let weeks = days / 7;
+            let remainder = days % 7;
+            if remainder == 0 {
+                format!("{weeks} 周")
+            } else {
+                format!("{weeks} 周 {remainder} 天")
+            }
+        }
+    }
+}
+
+fn parse_archive_rating(value: &str) -> Result<Option<i64>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let rating = value
+        .parse::<i64>()
+        .map_err(|_| AppError::InvalidInput("评分必须是 1 到 10 的整数".into()))?;
+    if !(1..=10).contains(&rating) {
+        return Err(AppError::InvalidInput("评分必须是 1 到 10 的整数".into()));
+    }
+    Ok(Some(rating))
+}
+
+fn parse_archive_tags(value: &str) -> Vec<String> {
+    value
+        .split([',', '，', '、'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn candidate_state_label(state: &str) -> &str {
     match state {
         "pending" => "待审核",
@@ -3497,6 +3699,13 @@ fn format_time(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "—".into())
+}
+
+fn format_date(value: DateTime<Utc>, timezone: Tz) -> String {
+    value
+        .with_timezone(&timezone)
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn format_schedule_time(
@@ -3694,6 +3903,26 @@ mod tests {
             html.contains("name=\"duration_max\" min=\"1\" max=\"360\" value=\"40\" required"),
             "rendered form did not contain the expected 40-minute default"
         );
+    }
+
+    #[test]
+    fn archive_memory_inputs_and_statistics_are_human_friendly() {
+        assert_eq!(parse_archive_rating("").unwrap(), None);
+        assert_eq!(parse_archive_rating(" 9 ").unwrap(), Some(9));
+        assert!(parse_archive_rating("11").is_err());
+        assert_eq!(
+            parse_archive_tags("推荐、 科幻,想重看，推荐"),
+            vec!["推荐", "科幻", "想重看", "推荐"]
+        );
+        assert_eq!(format_archive_duration(14_700), "约 4 小时 5 分");
+
+        let start = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(format_tracking_span(start, end), "10 周 1 天");
     }
 
     #[test]

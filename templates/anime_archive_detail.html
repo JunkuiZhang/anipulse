@@ -1,15 +1,70 @@
 {% extends "base.html" %}
 {% block title %}{{ title }} · 归档收藏 · AniPulse{% endblock %}
 {% block content %}
+{% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
 <section class="anime-detail-hero archive-detail-hero">
   <div class="anime-cover detail-cover">{% if has_cover %}<img src="{{ cover_url }}" alt="{{ title }} 封面" referrerpolicy="no-referrer">{% else %}<span aria-hidden="true">{{ cover_initial }}</span>{% endif %}</div>
   <div class="anime-detail-content">
     <div class="detail-title-row"><div><p class="eyebrow">ARCHIVED COLLECTION</p><h1>{{ title }}</h1></div><a class="button" href="/anime?view=archived">← 返回归档</a></div>
-    <span class="detail-status archived"><span class="status-dot"></span>已归档收藏</span>
-    <dl class="hero-meta archive-meta"><div><dt>集数</dt><dd>{{ total_episodes }}</dd></div><div><dt>归档时间</dt><dd>{{ archived_at }}</dd></div><div><dt>别名</dt><dd>{{ aliases }}</dd></div><div><dt>Bangumi</dt><dd>{{ bangumi }}</dd></div></dl>
-    <div class="archive-summary"><h2>简介与观看记录</h2>{% if has_summary %}<p>{{ summary }}</p>{% else %}<p class="muted">归档时没有填写简介或观看记录。</p>{% endif %}</div>
+    <span class="detail-status archived"><span class="status-dot"></span>已看完并收藏</span>
+
+    <div class="archive-stat-grid" aria-label="观看统计">
+      <article><span>本季集数</span><strong>{{ episode_stat }}</strong></article>
+      <article><span>约合时长</span><strong>{{ watch_duration }}</strong></article>
+      <article><span>追踪跨度</span><strong>{{ tracking_span }}</strong></article>
+      <article><span>{{ completion_label }}</span><strong>{{ completion_date }}</strong></article>
+    </div>
+
+    <dl class="hero-meta archive-meta">
+      <div class="meta-wide"><dt>别名</dt><dd>{{ aliases }}</dd></div>
+      <div><dt>Bangumi</dt><dd>{{ bangumi }}</dd></div>
+      <div><dt>归档时间</dt><dd>{{ archived_at }}</dd></div>
+    </dl>
   </div>
 </section>
-<section class="panel archive-note"><h2>已压缩运行数据</h2><p class="muted">候选、通知、检查任务、该番的 UP 信任和逐集运行记录已经清理；全局信任不受影响，标题、别名、封面、简介与总集数仍保存在收藏中。</p></section>
+
+<section class="panel archive-memory-panel">
+  <div class="section-heading archive-memory-heading">
+    <div><p class="eyebrow">MY MEMORY</p><h2>我的观看记录</h2><p class="muted">给看完的故事留下一点评价，而不只是一个归档编号。</p></div>
+    <span class="archive-rating{% if !has_rating %} empty-rating{% endif %}">{{ rating_label }}</span>
+  </div>
+
+  {% if has_memory %}
+  <div class="archive-memory-content">
+    {% if has_short_review %}<blockquote>{{ short_review }}</blockquote>{% endif %}
+    {% if has_tags %}<div class="archive-tags" aria-label="收藏标签">{% for tag in tags %}<span>{{ tag }}</span>{% endfor %}</div>{% endif %}
+    <div class="archive-summary"><h3>观后感</h3>{% if has_summary %}<p>{{ summary }}</p>{% else %}<p class="muted">还没有写观后感。</p>{% endif %}</div>
+  </div>
+  {% else %}
+  <div class="archive-memory-empty"><strong>这张收藏卡还没有你的文字。</strong><p>可以补一个评分、一句话短评，或者写下以后重看时想记得的感受。</p></div>
+  {% endif %}
+
+  <details class="archive-memory-editor"{% if !has_memory %} open{% endif %}>
+    <summary>{% if has_memory %}编辑观看记录{% else %}填写观看记录{% endif %}</summary>
+    <form method="post" action="/anime/{{ id }}/archive-memory" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="archive-memory-fields">
+        <label>我的评分（1–10，可选）<input type="number" name="rating" value="{{ rating_value }}" min="1" max="10" inputmode="numeric" placeholder="例如 8"></label>
+        <label>标签（可选）<input name="tags" value="{{ tags_input }}" maxlength="300" placeholder="例如 推荐、科幻、想重看"></label>
+      </div>
+      <label>一句话短评（可选）<input name="short_review" value="{{ short_review }}" maxlength="160" placeholder="最想为这部作品留下的一句话"></label>
+      <label>观后感（可选）<textarea name="summary" rows="7" maxlength="4000" placeholder="喜欢的角色、印象深刻的情节，或者看完后的想法。">{{ summary }}</textarea></label>
+      <button class="primary" type="submit">保存观看记录</button>
+    </form>
+  </details>
+</section>
+
+<section class="panel archive-timeline-panel">
+  <div class="section-heading"><div><p class="eyebrow">TIMELINE</p><h2>本季足迹</h2></div></div>
+  <ol class="archive-timeline">
+    <li class="complete"><span class="timeline-dot"></span><div><strong>加入追番</strong><time>{{ tracking_started_at }}</time></div></li>
+    <li class="{% if has_first_confirmed_at %}complete{% else %}unavailable{% endif %}"><span class="timeline-dot"></span><div><strong>首次确认更新</strong><time>{{ first_confirmed_at }}</time></div></li>
+    <li class="complete"><span class="timeline-dot"></span><div><strong>{% if history_available %}看完本季{% else %}完成时间未单独记录{% endif %}</strong><time>{{ completed_at }}</time></div></li>
+    <li class="complete"><span class="timeline-dot"></span><div><strong>归档收藏</strong><time>{{ archived_at }}</time></div></li>
+  </ol>
+  {% if !history_available %}<p class="archive-history-note">这部作品在观看统计上线前已经归档，逐集确认时间无法恢复；其余统计由仍保留的收藏信息生成。</p>{% endif %}
+</section>
+
+<section class="panel archive-note"><details><summary>关于已压缩的运行数据</summary><p class="muted">候选、通知、检查任务、该番的 UP 信任和逐集运行记录已经清理；全局信任不受影响。归档前生成的观看统计快照以及标题、别名、封面、观后感与总集数会一直保存在收藏中。</p></details></section>
 <section class="actions-grid"><form method="post" action="/anime/{{ id }}/delete-intent"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger-ghost" type="submit">永久删除此收藏</button></form></section>
 {% endblock %}

@@ -104,6 +104,31 @@ pub struct AnimeArchiveSummary {
     pub removed_jobs: u64,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct AnimeArchiveMemory {
+    pub anime_id: i64,
+    pub watched_episodes: Option<i64>,
+    pub approximate_watch_seconds: Option<i64>,
+    pub tracking_started_at: DateTime<Utc>,
+    pub first_confirmed_at: Option<DateTime<Utc>>,
+    pub first_watched_at: Option<DateTime<Utc>>,
+    pub completed_at: DateTime<Utc>,
+    pub rating: Option<i64>,
+    pub short_review: String,
+    pub tags_json: String,
+    pub history_available: bool,
+    pub snapshot_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct ArchiveEpisodeSnapshot {
+    watched_episodes: i64,
+    first_confirmed_at: Option<DateTime<Utc>>,
+    first_watched_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EpisodeWatchedResult {
     pub anime_id: i64,
@@ -968,17 +993,26 @@ impl Repository {
         total_episodes: Option<i64>,
         summary: &str,
     ) -> Result<AnimeArchiveSummary> {
+        self.archive_anime_with_memory(anime_id, total_episodes, summary, None, "", &[])
+            .await
+    }
+
+    pub async fn archive_anime_with_memory(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+        summary: &str,
+        rating: Option<i64>,
+        short_review: &str,
+        tags: &[String],
+    ) -> Result<AnimeArchiveSummary> {
         if total_episodes.is_some_and(|value| value <= 0 || value > 10_000) {
             return Err(AppError::InvalidInput(
                 "total episodes must be between 1 and 10000".into(),
             ));
         }
-        let summary = summary.trim();
-        if summary.chars().count() > 4_000 {
-            return Err(AppError::InvalidInput(
-                "archive summary must not exceed 4000 characters".into(),
-            ));
-        }
+        let (summary, short_review, tags_json) =
+            validate_archive_memory(summary, rating, short_review, tags)?;
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
@@ -1019,6 +1053,58 @@ impl Repository {
                 "archive total episodes is lower than the completed history".into(),
             ));
         }
+        let snapshot = sqlx::query_as::<_, ArchiveEpisodeSnapshot>(
+            r#"SELECT
+                   COALESCE(SUM(CASE WHEN watched_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+                       AS watched_episodes,
+                   MIN(COALESCE(confirmed_at, notified_at)) AS first_confirmed_at,
+                   MIN(watched_at) AS first_watched_at,
+                   MAX(watched_at) AS completed_at
+               FROM episode WHERE anime_id = ?"#,
+        )
+        .bind(anime_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let average_episode_seconds = anime
+            .duration_min_sec
+            .saturating_add(anime.duration_max_sec)
+            / 2;
+        let approximate_watch_seconds = total_episodes.saturating_mul(average_episode_seconds);
+        sqlx::query(
+            r#"INSERT INTO anime_archive_memory(
+                   anime_id, watched_episodes, approximate_watch_seconds,
+                   tracking_started_at, first_confirmed_at, first_watched_at,
+                   completed_at, rating, short_review, tags_json,
+                   history_available, snapshot_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+               ON CONFLICT(anime_id) DO UPDATE SET
+                   watched_episodes = excluded.watched_episodes,
+                   approximate_watch_seconds = excluded.approximate_watch_seconds,
+                   tracking_started_at = excluded.tracking_started_at,
+                   first_confirmed_at = excluded.first_confirmed_at,
+                   first_watched_at = excluded.first_watched_at,
+                   completed_at = excluded.completed_at,
+                   rating = excluded.rating,
+                   short_review = excluded.short_review,
+                   tags_json = excluded.tags_json,
+                   history_available = 1,
+                   snapshot_at = excluded.snapshot_at,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(anime_id)
+        .bind(snapshot.watched_episodes)
+        .bind(approximate_watch_seconds)
+        .bind(anime.created_at)
+        .bind(snapshot.first_confirmed_at)
+        .bind(snapshot.first_watched_at)
+        .bind(snapshot.completed_at.unwrap_or(now))
+        .bind(rating)
+        .bind(short_review)
+        .bind(tags_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
         let removed_candidates = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM candidate WHERE episode_id IN (SELECT id FROM episode WHERE anime_id = ?)",
         )
@@ -1068,6 +1154,79 @@ impl Repository {
             removed_notifications,
             removed_jobs,
         })
+    }
+
+    pub async fn get_anime_archive_memory(&self, anime_id: i64) -> Result<AnimeArchiveMemory> {
+        sqlx::query_as::<_, AnimeArchiveMemory>(
+            "SELECT * FROM anime_archive_memory WHERE anime_id = ?",
+        )
+        .bind(anime_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("archive memory for anime {anime_id}")))
+    }
+
+    pub async fn update_anime_archive_memory(
+        &self,
+        anime_id: i64,
+        summary: &str,
+        rating: Option<i64>,
+        short_review: &str,
+        tags: &[String],
+    ) -> Result<AnimeArchiveMemory> {
+        let (summary, short_review, tags_json) =
+            validate_archive_memory(summary, rating, short_review, tags)?;
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("anime {anime_id}")))?;
+        if anime.lifecycle != "archived" {
+            return Err(AppError::InvalidInput(
+                "only an archived anime has an editable viewing record".into(),
+            ));
+        }
+        sqlx::query("UPDATE anime SET summary = ?, updated_at = ? WHERE id = ?")
+            .bind(summary)
+            .bind(now)
+            .bind(anime_id)
+            .execute(&mut *tx)
+            .await?;
+        let approximate_watch_seconds = anime.total_episodes.map(|total| {
+            total.saturating_mul(
+                anime
+                    .duration_min_sec
+                    .saturating_add(anime.duration_max_sec)
+                    / 2,
+            )
+        });
+        sqlx::query(
+            r#"INSERT INTO anime_archive_memory(
+                   anime_id, approximate_watch_seconds, tracking_started_at,
+                   completed_at, rating, short_review, tags_json,
+                   history_available, snapshot_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+               ON CONFLICT(anime_id) DO UPDATE SET
+                   rating = excluded.rating,
+                   short_review = excluded.short_review,
+                   tags_json = excluded.tags_json,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(anime_id)
+        .bind(approximate_watch_seconds)
+        .bind(anime.created_at)
+        .bind(anime.archived_at.unwrap_or(now))
+        .bind(rating)
+        .bind(short_review)
+        .bind(tags_json)
+        .bind(anime.archived_at.unwrap_or(now))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_anime_archive_memory(anime_id).await
     }
 
     pub async fn active_episode(&self, anime_id: i64) -> Result<Episode> {
@@ -3842,6 +4001,55 @@ impl Repository {
     }
 }
 
+fn validate_archive_memory(
+    summary: &str,
+    rating: Option<i64>,
+    short_review: &str,
+    tags: &[String],
+) -> Result<(String, String, String)> {
+    let summary = summary.trim().to_string();
+    if summary.chars().count() > 4_000 {
+        return Err(AppError::InvalidInput(
+            "archive review must not exceed 4000 characters".into(),
+        ));
+    }
+    if rating.is_some_and(|value| !(1..=10).contains(&value)) {
+        return Err(AppError::InvalidInput(
+            "archive rating must be between 1 and 10".into(),
+        ));
+    }
+    let short_review = short_review.trim().to_string();
+    if short_review.chars().count() > 160 {
+        return Err(AppError::InvalidInput(
+            "archive short review must not exceed 160 characters".into(),
+        ));
+    }
+    let mut normalized_tags = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > 24 {
+            return Err(AppError::InvalidInput(
+                "each archive tag must not exceed 24 characters".into(),
+            ));
+        }
+        if seen.insert(tag.to_lowercase()) {
+            normalized_tags.push(tag.to_string());
+        }
+    }
+    if normalized_tags.len() > 12 {
+        return Err(AppError::InvalidInput(
+            "an archive may have at most 12 tags".into(),
+        ));
+    }
+    let tags_json = serde_json::to_string(&normalized_tags)
+        .map_err(|error| AppError::InvalidInput(format!("archive tags are invalid: {error}")))?;
+    Ok((summary, short_review, tags_json))
+}
+
 async fn transition_released_complete_if_final_released(
     tx: &mut Transaction<'_, Sqlite>,
     anime_id: i64,
@@ -4346,7 +4554,14 @@ mod tests {
             .await
             .unwrap();
         let archived = repository
-            .archive_anime(anime_id, Some(12), "乐队成长故事；已看完。")
+            .archive_anime_with_memory(
+                anime_id,
+                Some(12),
+                "乐队成长故事；已看完。",
+                Some(9),
+                "值得再看一次",
+                &["音乐".into(), "想重看".into()],
+            )
             .await
             .unwrap();
         assert_eq!(archived.total_episodes, 12);
@@ -4363,6 +4578,33 @@ mod tests {
         assert_eq!(collection.summary, "乐队成长故事；已看完。");
         assert_eq!(collection.bangumi_subject_id, Some(328_609));
         assert!(collection.archived_at.is_some());
+        let memory = repository.get_anime_archive_memory(anime_id).await.unwrap();
+        assert_eq!(memory.rating, Some(9));
+        assert_eq!(memory.short_review, "值得再看一次");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&memory.tags_json).unwrap(),
+            vec!["音乐", "想重看"]
+        );
+        assert_eq!(memory.approximate_watch_seconds, Some(12 * 1_440));
+        assert!(memory.first_confirmed_at.is_some());
+        assert!(memory.history_available);
+        repository
+            .update_anime_archive_memory(
+                anime_id,
+                "第二次想法",
+                Some(8),
+                "依然喜欢",
+                &["科幻".into()],
+            )
+            .await
+            .unwrap();
+        let edited = repository.get_anime_archive_memory(anime_id).await.unwrap();
+        assert_eq!(edited.rating, Some(8));
+        assert_eq!(edited.short_review, "依然喜欢");
+        assert_eq!(
+            repository.get_anime(anime_id).await.unwrap().anime.summary,
+            "第二次想法"
+        );
         assert!(
             repository
                 .list_episode_videos(anime_id)
@@ -4491,6 +4733,10 @@ mod tests {
         let watched = repository.mark_episode_watched(episode.id).await.unwrap();
         let archived = watched.auto_archive.expect("final episode auto archives");
         assert_eq!(archived.total_episodes, episode.episode_no);
+        let memory = repository.get_anime_archive_memory(anime_id).await.unwrap();
+        assert_eq!(memory.watched_episodes, Some(1));
+        assert_eq!(memory.completed_at, memory.first_watched_at.unwrap());
+        assert!(memory.history_available);
         assert_eq!(
             repository
                 .get_anime(anime_id)

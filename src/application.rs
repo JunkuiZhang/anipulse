@@ -173,6 +173,41 @@ impl ApplicationService {
             .await
     }
 
+    pub async fn archive_anime_with_memory(
+        &self,
+        anime_id: i64,
+        total_episodes: Option<i64>,
+        summary: &str,
+        rating: Option<i64>,
+        short_review: &str,
+        tags: &[String],
+    ) -> Result<AnimeArchiveSummary> {
+        self.repository
+            .archive_anime_with_memory(
+                anime_id,
+                total_episodes,
+                summary,
+                rating,
+                short_review,
+                tags,
+            )
+            .await
+    }
+
+    pub async fn update_anime_archive_memory(
+        &self,
+        anime_id: i64,
+        summary: &str,
+        rating: Option<i64>,
+        short_review: &str,
+        tags: &[String],
+    ) -> Result<()> {
+        self.repository
+            .update_anime_archive_memory(anime_id, summary, rating, short_review, tags)
+            .await?;
+        Ok(())
+    }
+
     pub async fn rename_anime(&self, anime_id: i64, title: &str) -> Result<Anime> {
         self.repository.rename_anime(anime_id, title).await
     }

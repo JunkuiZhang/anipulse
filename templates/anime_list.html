@@ -16,6 +16,7 @@
     <div class="library-card-body">
       <h2>{{ item.title }}</h2>
       <div class="library-episode"><span>{{ item.episode }}</span>{% if item.has_episode_total %}<small>{{ item.episode_total }}</small>{% endif %}</div>
+      {% if item.has_archive_memory %}<p class="library-memory">{{ item.archive_memory }}</p>{% endif %}
       <dl class="library-meta"><dt>{{ item.time_label }}</dt><dd>{{ item.time_value }}</dd><dt>排期</dt><dd>{{ item.schedule }}</dd></dl>
     </div>
   </a>
