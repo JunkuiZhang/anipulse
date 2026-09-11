@@ -677,8 +677,17 @@ struct AnimeListItem {
     enabled: bool,
     released_complete: bool,
     archived: bool,
-    archive_memory: String,
-    has_archive_memory: bool,
+    archive: AnimeArchiveCardView,
+}
+
+#[derive(Default)]
+struct AnimeArchiveCardView {
+    has_rating: bool,
+    has_my_rating: bool,
+    my_rating: String,
+    has_bangumi_rating: bool,
+    has_bangumi_score: bool,
+    bangumi_rating: String,
     archive_start_label: String,
     archive_start_date: String,
     archive_completion_label: String,
@@ -728,54 +737,43 @@ async fn anime_list(
         };
         let cover_url = anime.bangumi_subject_id.and_then(bangumi_cover_url);
         let cover_initial = title_initial(&anime.title);
-        let (
-            archive_memory,
-            archive_start_label,
-            archive_start_date,
-            archive_completion_label,
-            archive_completion_date,
-            archive_span_label,
-            archive_span,
-        ) = if anime.lifecycle == "archived" {
+        let archive = if anime.lifecycle == "archived" {
             let memory = state.repository.get_anime_archive_memory(anime.id).await?;
-            let mut pieces = Vec::new();
-            if let Some(rating) = memory.rating {
-                pieces.push(format!("我的评分 {rating}/10"));
-            }
-            if let Some(score) = memory.bangumi_score {
-                pieces.push(format!("Bangumi {score:.1}"));
+            let has_bangumi_rating = anime.bangumi_subject_id.is_some();
+            let bangumi_rating = if let Some(score) = memory.bangumi_score {
+                format!("{score:.1}")
+            } else if has_bangumi_rating && memory.bangumi_rating_updated_at.is_some() {
+                "暂无评分".into()
             } else if anime.bangumi_subject_id.is_some() {
-                pieces.push(if memory.bangumi_rating_updated_at.is_some() {
-                    "Bangumi 暂无评分".into()
-                } else {
-                    "Bangumi 评分待同步".into()
-                });
-            }
+                "待同步".into()
+            } else {
+                String::new()
+            };
             let (start_label, span_label, start_at) = archive_start(&memory);
             let completion_label = if memory.history_available {
                 "看完"
             } else {
                 "归档"
             };
-            (
-                pieces.join(" · "),
-                start_label.into(),
-                format_date(start_at, state.display_timezone),
-                completion_label.into(),
-                format_date(memory.completed_at, state.display_timezone),
-                span_label.into(),
-                format_tracking_span(start_at, memory.completed_at),
-            )
+            AnimeArchiveCardView {
+                has_rating: memory.rating.is_some() || has_bangumi_rating,
+                has_my_rating: memory.rating.is_some(),
+                my_rating: memory
+                    .rating
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                has_bangumi_rating,
+                has_bangumi_score: memory.bangumi_score.is_some(),
+                bangumi_rating,
+                archive_start_label: start_label.into(),
+                archive_start_date: format_date(start_at, state.display_timezone),
+                archive_completion_label: completion_label.into(),
+                archive_completion_date: format_date(memory.completed_at, state.display_timezone),
+                archive_span_label: span_label.into(),
+                archive_span: format_tracking_span(start_at, memory.completed_at),
+            }
         } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
+            AnimeArchiveCardView::default()
         };
         items.push(AnimeListItem {
             id: anime.id,
@@ -853,14 +851,7 @@ async fn anime_list(
             enabled: anime.enabled,
             released_complete: anime.lifecycle == "released_complete",
             archived: anime.lifecycle == "archived",
-            has_archive_memory: !archive_memory.is_empty(),
-            archive_memory,
-            archive_start_label,
-            archive_start_date,
-            archive_completion_label,
-            archive_completion_date,
-            archive_span_label,
-            archive_span,
+            archive,
         });
     }
     let notice = match query.result.as_deref() {

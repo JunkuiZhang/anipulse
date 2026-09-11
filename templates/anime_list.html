@@ -16,11 +16,14 @@
     <div class="library-card-body">
       <h2>{{ item.title }}</h2>
       <div class="library-episode"><span>{{ item.episode }}</span>{% if item.has_episode_total %}<small>{{ item.episode_total }}</small>{% endif %}</div>
-      {% if item.has_archive_memory %}<p class="library-memory">{{ item.archive_memory }}</p>{% endif %}
+      {% if item.archive.has_rating %}<div class="library-score-row" aria-label="收藏评分">
+        {% if item.archive.has_my_rating %}<span class="library-score-card personal"><small>我的评分</small><strong><b aria-hidden="true">★</b> {{ item.archive.my_rating }} <i>/10</i></strong></span>{% endif %}
+        {% if item.archive.has_bangumi_rating %}<span class="library-score-card bangumi{% if !item.archive.has_bangumi_score %} pending{% endif %}"><small>Bangumi</small>{% if item.archive.has_bangumi_score %}<strong><b aria-hidden="true">★</b> {{ item.archive.bangumi_rating }} <i>/10</i></strong>{% else %}<strong class="rating-state">{{ item.archive.bangumi_rating }}</strong>{% endif %}</span>{% endif %}
+      </div>{% endif %}
       {% if item.archived %}<dl class="library-archive-stats">
-        <div><dt>{{ item.archive_start_label }}</dt><dd>{{ item.archive_start_date }}</dd></div>
-        <div><dt>{{ item.archive_completion_label }}</dt><dd>{{ item.archive_completion_date }}</dd></div>
-        <div class="archive-span"><dt>{{ item.archive_span_label }}</dt><dd>{{ item.archive_span }}</dd></div>
+        <div><dt>{{ item.archive.archive_start_label }}</dt><dd>{{ item.archive.archive_start_date }}</dd></div>
+        <div><dt>{{ item.archive.archive_completion_label }}</dt><dd>{{ item.archive.archive_completion_date }}</dd></div>
+        <div class="archive-span"><dt>{{ item.archive.archive_span_label }}</dt><dd>{{ item.archive.archive_span }}</dd></div>
       </dl>{% endif %}
       <dl class="library-meta"><dt>{{ item.time_label }}</dt><dd>{{ item.time_value }}</dd><dt>排期</dt><dd>{{ item.schedule }}</dd></dl>
     </div>

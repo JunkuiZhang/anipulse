@@ -911,11 +911,61 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 
 .archive-note details[open] summary { margin-bottom: 7px; }
-.library-memory {
-  margin: 9px 0 -3px;
-  color: #8f624f;
-  font-size: 0.75rem;
-  font-weight: 700;
+.library-score-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.library-score-card {
+  display: grid;
+  min-width: 106px;
+  padding: 8px 11px 9px;
+  border: 1px solid rgba(79, 138, 114, 0.2);
+  border-radius: 11px;
+  background: linear-gradient(145deg, rgba(225, 239, 233, 0.72), rgba(255, 255, 255, 0.64));
+  color: #47715f;
+  box-shadow: 0 6px 17px rgba(54, 75, 67, 0.07);
+}
+
+.library-score-card.personal {
+  border-color: rgba(216, 138, 104, 0.24);
+  background: linear-gradient(145deg, rgba(248, 226, 216, 0.82), rgba(255, 255, 255, 0.66));
+  color: #9a593f;
+}
+
+.library-score-card.pending {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.48);
+  color: var(--subtle);
+  box-shadow: none;
+}
+
+.library-score-card small {
+  font-size: 0.62rem;
+  font-weight: 720;
+  letter-spacing: 0.035em;
+}
+
+.library-score-card strong {
+  margin-top: 1px;
+  font-size: 1.08rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.library-score-card strong b { font-size: 0.76em; }
+.library-score-card strong i {
+  font-size: 0.58em;
+  font-style: normal;
+  font-weight: 650;
+  opacity: 0.68;
+}
+
+.library-score-card strong.rating-state {
+  margin-top: 3px;
+  font-size: 0.76rem;
 }
 
 .library-archive-stats {
@@ -1951,6 +2001,7 @@ textarea:focus {
   .anime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .library-card-body { padding: 13px; }
   .library-card h2 { font-size: 0.94rem; }
+  .library-score-card { flex: 1 1 100%; }
   .library-meta { grid-template-columns: 1fr; }
   .library-meta dd { margin-bottom: 4px; }
   .rule-row { align-items: stretch; flex-direction: column; }
