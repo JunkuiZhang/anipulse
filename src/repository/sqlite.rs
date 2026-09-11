@@ -114,6 +114,10 @@ pub struct AnimeArchiveMemory {
     pub first_watched_at: Option<DateTime<Utc>>,
     pub completed_at: DateTime<Utc>,
     pub rating: Option<i64>,
+    pub bangumi_score: Option<f64>,
+    pub bangumi_rating_total: Option<i64>,
+    pub bangumi_rank: Option<i64>,
+    pub bangumi_rating_updated_at: Option<DateTime<Utc>>,
     pub short_review: String,
     pub tags_json: String,
     pub history_available: bool,
@@ -1146,6 +1150,19 @@ impl Repository {
         .bind(anime_id)
         .execute(&mut *tx)
         .await?;
+        if anime.bangumi_subject_id.is_some() {
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO management_job(
+                       kind, target_type, target_id, payload_json, state,
+                       requested_by, dedupe_key, created_at
+                   ) VALUES ('sync_schedule', 'anime', ?, '{}', 'queued', NULL, ?, ?)"#,
+            )
+            .bind(anime_id.to_string())
+            .bind(format!("archive_rating:{anime_id}"))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(AnimeArchiveSummary {
             total_episodes,
@@ -1226,6 +1243,47 @@ impl Repository {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.get_anime_archive_memory(anime_id).await
+    }
+
+    pub async fn update_anime_archive_bangumi_rating(
+        &self,
+        anime_id: i64,
+        score: Option<f64>,
+        rating_total: i64,
+        rank: Option<i64>,
+    ) -> Result<AnimeArchiveMemory> {
+        if score.is_some_and(|value| !value.is_finite() || !(0.0..=10.0).contains(&value))
+            || rating_total < 0
+            || rank.is_some_and(|value| value <= 0)
+        {
+            return Err(AppError::InvalidInput(
+                "Bangumi rating metadata is invalid".into(),
+            ));
+        }
+        let updated = sqlx::query(
+            r#"UPDATE anime_archive_memory
+               SET bangumi_score = ?, bangumi_rating_total = ?, bangumi_rank = ?,
+                   bangumi_rating_updated_at = ?
+               WHERE anime_id = ?
+                 AND EXISTS(
+                     SELECT 1 FROM anime
+                     WHERE anime.id = anime_archive_memory.anime_id
+                       AND anime.lifecycle = 'archived'
+                 )"#,
+        )
+        .bind(score)
+        .bind(rating_total)
+        .bind(rank)
+        .bind(Utc::now())
+        .bind(anime_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::NotFound(format!(
+                "archived anime memory {anime_id}"
+            )));
+        }
         self.get_anime_archive_memory(anime_id).await
     }
 
@@ -4614,13 +4672,20 @@ mod tests {
         );
         assert!(repository.list_candidates(None).await.unwrap().is_empty());
         assert!(repository.pending_notifications().await.unwrap().is_empty());
-        assert!(
-            repository
-                .list_management_jobs(10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let jobs = repository.list_management_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, "sync_schedule");
+        let anime_target = anime_id.to_string();
+        assert_eq!(jobs[0].target_id.as_deref(), Some(anime_target.as_str()));
+
+        let rated = repository
+            .update_anime_archive_bangumi_rating(anime_id, Some(8.7), 12_345, Some(42))
+            .await
+            .unwrap();
+        assert_eq!(rated.bangumi_score, Some(8.7));
+        assert_eq!(rated.bangumi_rating_total, Some(12_345));
+        assert_eq!(rated.bangumi_rank, Some(42));
+        assert!(rated.bangumi_rating_updated_at.is_some());
     }
 
     #[tokio::test]

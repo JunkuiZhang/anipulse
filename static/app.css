@@ -695,7 +695,7 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .archive-stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
   gap: 9px;
   margin-top: 23px;
 }
@@ -746,6 +746,43 @@ tbody tr:last-child td { border-bottom: 0; }
   background: var(--surface-soft);
   color: var(--subtle);
   font-weight: 650;
+}
+
+.archive-ratings {
+  display: flex;
+  flex: 0 1 540px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 7px;
+}
+
+.archive-rating.bangumi-rating {
+  border-color: rgba(79, 138, 114, 0.24);
+  background: var(--ok-soft);
+  color: #4d7565;
+}
+
+.archive-rating.bangumi-rating.empty-rating {
+  border-color: var(--line);
+  background: var(--surface-soft);
+  color: var(--subtle);
+}
+
+.archive-ratings .text-button {
+  padding: 7px 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.7rem;
+  box-shadow: none;
+}
+
+.archive-ratings small {
+  flex-basis: 100%;
+  color: var(--subtle);
+  font-size: 0.68rem;
+  text-align: right;
 }
 
 .archive-memory-content blockquote {
@@ -813,7 +850,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .archive-timeline {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 14px;
   margin: 4px 0 0;
   padding: 0;
@@ -879,6 +916,26 @@ tbody tr:last-child td { border-bottom: 0; }
   color: #8f624f;
   font-size: 0.75rem;
   font-weight: 700;
+}
+
+.library-archive-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 12px 0 0;
+  padding: 11px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.48);
+}
+
+.library-archive-stats > div { min-width: 0; }
+.library-archive-stats .archive-span { grid-column: 1 / -1; }
+.library-archive-stats dt { color: var(--subtle); font-size: 0.66rem; }
+.library-archive-stats dd {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .title-link {
@@ -1908,7 +1965,8 @@ textarea:focus {
   .mapping-form > span { display: none; }
   .mapping-form button { width: 100%; }
   .archive-memory-heading { align-items: flex-start; }
-  .archive-memory-heading .archive-rating { margin-top: 4px; }
+  .archive-ratings { flex-basis: auto; justify-content: flex-start; margin-top: 4px; }
+  .archive-ratings small { text-align: left; }
   .archive-memory-fields { grid-template-columns: 1fr; }
   .archive-memory-editor button { width: 100%; }
   .archive-timeline {

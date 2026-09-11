@@ -10,9 +10,10 @@
 
     <div class="archive-stat-grid" aria-label="观看统计">
       <article><span>本季集数</span><strong>{{ episode_stat }}</strong></article>
-      <article><span>约合时长</span><strong>{{ watch_duration }}</strong></article>
-      <article><span>追踪跨度</span><strong>{{ tracking_span }}</strong></article>
+      <article><span>片长合计</span><strong>{{ watch_duration }}</strong></article>
+      <article><span>{{ start_label }}</span><strong>{{ start_date }}</strong></article>
       <article><span>{{ completion_label }}</span><strong>{{ completion_date }}</strong></article>
+      <article><span>{{ span_label }}</span><strong>{{ tracking_span }}</strong></article>
     </div>
 
     <dl class="hero-meta archive-meta">
@@ -26,7 +27,12 @@
 <section class="panel archive-memory-panel">
   <div class="section-heading archive-memory-heading">
     <div><p class="eyebrow">MY MEMORY</p><h2>我的观看记录</h2><p class="muted">给看完的故事留下一点评价，而不只是一个归档编号。</p></div>
-    <span class="archive-rating{% if !has_rating %} empty-rating{% endif %}">{{ rating_label }}</span>
+    <div class="archive-ratings">
+      <span class="archive-rating{% if !has_rating %} empty-rating{% endif %}">{{ rating_label }}</span>
+      {% if has_bangumi %}<span class="archive-rating bangumi-rating{% if !has_bangumi_rating %} empty-rating{% endif %}">{{ bangumi_rating_label }}</span>{% endif %}
+      {% if has_bangumi %}<form method="post" action="/anime/{{ id }}/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="text-button" type="submit">{% if has_bangumi_rating_updated_at %}刷新公开评分{% else %}同步公开评分{% endif %}</button></form>{% endif %}
+      {% if has_bangumi_rating_updated_at %}<small>更新于 {{ bangumi_rating_updated_at }}</small>{% endif %}
+    </div>
   </div>
 
   {% if has_memory %}
@@ -59,6 +65,7 @@
   <ol class="archive-timeline">
     <li class="complete"><span class="timeline-dot"></span><div><strong>加入追番</strong><time>{{ tracking_started_at }}</time></div></li>
     <li class="{% if has_first_confirmed_at %}complete{% else %}unavailable{% endif %}"><span class="timeline-dot"></span><div><strong>首次确认更新</strong><time>{{ first_confirmed_at }}</time></div></li>
+    <li class="{% if has_first_watched_at %}complete{% else %}unavailable{% endif %}"><span class="timeline-dot"></span><div><strong>{% if has_first_watched_at %}开始观看{% else %}首次观看未保留{% endif %}</strong><time>{{ first_watched_at }}</time></div></li>
     <li class="complete"><span class="timeline-dot"></span><div><strong>{% if history_available %}看完本季{% else %}完成时间未单独记录{% endif %}</strong><time>{{ completed_at }}</time></div></li>
     <li class="complete"><span class="timeline-dot"></span><div><strong>归档收藏</strong><time>{{ archived_at }}</time></div></li>
   </ol>

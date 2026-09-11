@@ -77,6 +77,13 @@ pub struct ResolvedSchedule {
     source_health_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BangumiPublicRating {
+    pub score: Option<f64>,
+    pub total: i64,
+    pub rank: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct ScheduleSynchronizer {
     repository: Repository,
@@ -149,6 +156,18 @@ struct BangumiSubject {
     platform: Option<String>,
     #[serde(default)]
     total_episodes: Option<i64>,
+    #[serde(default)]
+    rating: Option<BangumiRating>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BangumiRating {
+    #[serde(default)]
+    total: i64,
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    rank: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -727,6 +746,20 @@ impl ScheduleProvider {
             self.config.bangumi_api_base_url.trim_end_matches('/')
         );
         self.get_json(&url, "Bangumi subject API").await
+    }
+
+    pub async fn bangumi_public_rating(&self, subject_id: i64) -> Result<BangumiPublicRating> {
+        let rating = self.bangumi_subject(subject_id).await?.rating;
+        let total = rating.as_ref().map(|value| value.total.max(0)).unwrap_or(0);
+        let score = rating
+            .as_ref()
+            .filter(|value| value.total > 0 && value.score.is_finite())
+            .map(|value| value.score)
+            .filter(|score| *score > 0.0 && *score <= 10.0);
+        let rank = rating
+            .and_then(|value| value.rank)
+            .filter(|value| *value > 0);
+        Ok(BangumiPublicRating { score, total, rank })
     }
 
     async fn resolve_anime_schedule_media(
@@ -1489,8 +1522,51 @@ impl ScheduleSynchronizer {
     }
 
     pub async fn sync_now(&self, anime_id: i64) -> Result<()> {
+        let anime = self.repository.get_anime(anime_id).await?.anime;
+        if anime.lifecycle == "archived" {
+            return self
+                .sync_archive_rating(anime_id, anime.bangumi_subject_id)
+                .await;
+        }
         let catalog = self.load_catalog_with_health().await?;
         self.sync_with_catalog(anime_id, &catalog).await
+    }
+
+    async fn sync_archive_rating(&self, anime_id: i64, subject_id: Option<i64>) -> Result<()> {
+        let subject_id = subject_id.ok_or_else(|| {
+            AppError::Schedule(format!(
+                "archived anime {anime_id} has no Bangumi subject ID"
+            ))
+        })?;
+        let health_source = format!("bangumi-rating:{subject_id}");
+        let rating = match self.provider.bangumi_public_rating(subject_id).await {
+            Ok(rating) => rating,
+            Err(error) => {
+                self.repository
+                    .record_source_failure(
+                        &health_source,
+                        &error.to_string(),
+                        SOURCE_ALERT_FAILURE_THRESHOLD,
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
+        self.repository
+            .update_anime_archive_bangumi_rating(anime_id, rating.score, rating.total, rating.rank)
+            .await?;
+        self.repository
+            .record_source_success(&health_source)
+            .await?;
+        info!(
+            anime_id,
+            bangumi_subject_id = subject_id,
+            score = ?rating.score,
+            rating_total = rating.total,
+            rank = ?rating.rank,
+            "archived anime Bangumi rating refreshed"
+        );
+        Ok(())
     }
 
     async fn load_catalog_with_health(&self) -> Result<ScheduleCatalog> {
@@ -2066,6 +2142,7 @@ mod tests {
             date: Some(subject_date.to_string()),
             platform: Some("WEB".into()),
             total_episodes: Some(10),
+            rating: None,
         };
         let media = AnimeScheduleAnime {
             title: "Cyberpunk: Edgerunners 2".into(),
@@ -2126,6 +2203,7 @@ mod tests {
             date: None,
             platform: Some("TV".into()),
             total_episodes: None,
+            rating: None,
         };
         let media = AnimeScheduleAnime {
             title: "Yasei no Last Boss ga Arawareta! 2nd Season".into(),
@@ -2465,6 +2543,83 @@ mod tests {
             Some(previous)
         );
         assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn archived_sync_refreshes_rating_without_loading_schedule_catalog() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("archive-rating.db");
+        let repository = Repository::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "攻壳机动队".into(),
+                aliases: vec![],
+                next_episode: 1,
+                expected_at: None,
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 1_800,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 496_276,
+                    anilist_media_id: None,
+                    anime_schedule_route: None,
+                    total_episodes: Some(10),
+                    broadcast_pattern: "R/2026-07-01T15:00:00Z/P7D".into(),
+                    schedule_source: "danime".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        repository
+            .mark_anime_released_complete(anime_id, Some(10))
+            .await
+            .unwrap();
+        repository
+            .archive_anime(anime_id, Some(10), "")
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let headers = String::from_utf8_lossy(request_headers(&request));
+            assert!(headers.contains("/v0/subjects/496276"));
+            let body = r#"{"id":496276,"name":"攻殻機動隊","rating":{"rank":88,"total":4321,"score":8.1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = ScheduleConfig {
+            bangumi_data_url: "http://127.0.0.1:1/catalog-must-not-be-requested".into(),
+            bangumi_api_base_url: format!("http://{address}"),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        };
+
+        ScheduleSynchronizer::new(repository.clone(), config)
+            .unwrap()
+            .sync_now(anime_id)
+            .await
+            .unwrap();
+
+        let memory = repository.get_anime_archive_memory(anime_id).await.unwrap();
+        assert_eq!(memory.bangumi_score, Some(8.1));
+        assert_eq!(memory.bangumi_rating_total, Some(4_321));
+        assert_eq!(memory.bangumi_rank, Some(88));
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -2826,6 +2981,39 @@ mod tests {
             ..ScheduleConfig::default()
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reads_public_bangumi_rating_from_subject_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let headers = String::from_utf8_lossy(request_headers(&request));
+            assert!(headers.contains("/v0/subjects/496276"));
+            let body = r#"{"id":496276,"name":"攻殻機動隊","name_cn":"攻壳机动队","rating":{"rank":321,"total":9876,"score":8.4}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let rating = provider(&format!("http://{address}"))
+            .bangumi_public_rating(496_276)
+            .await
+            .unwrap();
+        assert_eq!(
+            rating,
+            BangumiPublicRating {
+                score: Some(8.4),
+                total: 9_876,
+                rank: Some(321),
+            }
+        );
+        task.await.unwrap();
     }
 
     async fn mock_server(ambiguous: bool) -> (String, tokio::task::JoinHandle<usize>) {

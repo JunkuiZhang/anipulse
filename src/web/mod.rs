@@ -679,6 +679,12 @@ struct AnimeListItem {
     archived: bool,
     archive_memory: String,
     has_archive_memory: bool,
+    archive_start_label: String,
+    archive_start_date: String,
+    archive_completion_label: String,
+    archive_completion_date: String,
+    archive_span_label: String,
+    archive_span: String,
 }
 
 #[derive(Template)]
@@ -722,18 +728,54 @@ async fn anime_list(
         };
         let cover_url = anime.bangumi_subject_id.and_then(bangumi_cover_url);
         let cover_initial = title_initial(&anime.title);
-        let archive_memory = if anime.lifecycle == "archived" {
+        let (
+            archive_memory,
+            archive_start_label,
+            archive_start_date,
+            archive_completion_label,
+            archive_completion_date,
+            archive_span_label,
+            archive_span,
+        ) = if anime.lifecycle == "archived" {
             let memory = state.repository.get_anime_archive_memory(anime.id).await?;
             let mut pieces = Vec::new();
             if let Some(rating) = memory.rating {
-                pieces.push(format!("★ {rating}/10"));
+                pieces.push(format!("我的评分 {rating}/10"));
             }
-            if let Some(seconds) = memory.approximate_watch_seconds {
-                pieces.push(format_archive_duration(seconds));
+            if let Some(score) = memory.bangumi_score {
+                pieces.push(format!("Bangumi {score:.1}"));
+            } else if anime.bangumi_subject_id.is_some() {
+                pieces.push(if memory.bangumi_rating_updated_at.is_some() {
+                    "Bangumi 暂无评分".into()
+                } else {
+                    "Bangumi 评分待同步".into()
+                });
             }
-            pieces.join(" · ")
+            let (start_label, span_label, start_at) = archive_start(&memory);
+            let completion_label = if memory.history_available {
+                "看完"
+            } else {
+                "归档"
+            };
+            (
+                pieces.join(" · "),
+                start_label.into(),
+                format_date(start_at, state.display_timezone),
+                completion_label.into(),
+                format_date(memory.completed_at, state.display_timezone),
+                span_label.into(),
+                format_tracking_span(start_at, memory.completed_at),
+            )
         } else {
-            String::new()
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
         };
         items.push(AnimeListItem {
             id: anime.id,
@@ -813,6 +855,12 @@ async fn anime_list(
             archived: anime.lifecycle == "archived",
             has_archive_memory: !archive_memory.is_empty(),
             archive_memory,
+            archive_start_label,
+            archive_start_date,
+            archive_completion_label,
+            archive_completion_date,
+            archive_span_label,
+            archive_span,
         });
     }
     let notice = match query.result.as_deref() {
@@ -1244,12 +1292,20 @@ struct AnimeArchiveDetailTemplate {
     notice: String,
     episode_stat: String,
     watch_duration: String,
+    span_label: String,
     tracking_span: String,
+    start_label: String,
+    start_date: String,
     completion_label: String,
     completion_date: String,
     rating_value: String,
     rating_label: String,
     has_rating: bool,
+    bangumi_rating_label: String,
+    has_bangumi_rating: bool,
+    has_bangumi: bool,
+    bangumi_rating_updated_at: String,
+    has_bangumi_rating_updated_at: bool,
     short_review: String,
     has_short_review: bool,
     tags: Vec<String>,
@@ -1259,6 +1315,8 @@ struct AnimeArchiveDetailTemplate {
     tracking_started_at: String,
     first_confirmed_at: String,
     has_first_confirmed_at: bool,
+    first_watched_at: String,
+    has_first_watched_at: bool,
     completed_at: String,
     history_available: bool,
 }
@@ -1322,8 +1380,11 @@ async fn anime_detail(
             (Some(watched), None) => format!("已记录 {watched} 集"),
             (None, None) => "未知".into(),
         };
+        let (start_label, span_label, start_at) = archive_start(&memory);
+        let (bangumi_rating_label, has_bangumi_rating) = format_bangumi_rating(&memory);
         let notice = match query.result.as_deref() {
             Some("archive-memory-saved") => "观看记录已经保存。",
+            Some("archive-rating-enqueued") => "Bangumi 评分刷新已加入后台队列。",
             _ => "",
         }
         .to_string();
@@ -1350,18 +1411,29 @@ async fn anime_detail(
                 .approximate_watch_seconds
                 .map(format_archive_duration)
                 .unwrap_or_else(|| "暂无记录".into()),
-            tracking_span: format_tracking_span(memory.tracking_started_at, memory.completed_at),
+            span_label: span_label.into(),
+            tracking_span: format_tracking_span(start_at, memory.completed_at),
+            start_label: start_label.into(),
+            start_date: format_date(start_at, state.display_timezone),
             completion_label: if completion_is_exact {
-                "完成日期".into()
+                "看完日期".into()
             } else {
                 "归档日期".into()
             },
             completion_date: format_date(memory.completed_at, state.display_timezone),
             rating_label: memory
                 .rating
-                .map(|value| format!("★ {value} / 10"))
-                .unwrap_or_else(|| "尚未评分".into()),
+                .map(|value| format!("我的评分 {value} / 10"))
+                .unwrap_or_else(|| "尚未填写我的评分".into()),
             has_rating,
+            bangumi_rating_label,
+            has_bangumi_rating,
+            has_bangumi: anime.anime.bangumi_subject_id.is_some(),
+            has_bangumi_rating_updated_at: memory.bangumi_rating_updated_at.is_some(),
+            bangumi_rating_updated_at: memory
+                .bangumi_rating_updated_at
+                .map(|value| format_time(Some(value), state.display_timezone))
+                .unwrap_or_default(),
             rating_value,
             has_short_review,
             short_review: memory.short_review,
@@ -1376,6 +1448,11 @@ async fn anime_detail(
             has_first_confirmed_at: memory.first_confirmed_at.is_some(),
             first_confirmed_at: memory
                 .first_confirmed_at
+                .map(|value| format_time(Some(value), state.display_timezone))
+                .unwrap_or_else(|| "旧归档未保留".into()),
+            has_first_watched_at: memory.first_watched_at.is_some(),
+            first_watched_at: memory
+                .first_watched_at
                 .map(|value| format_time(Some(value), state.display_timezone))
                 .unwrap_or_else(|| "旧归档未保留".into()),
             completed_at: format_time(Some(memory.completed_at), state.display_timezone),
@@ -1906,7 +1983,13 @@ async fn anime_sync(
     Form(form): Form<CsrfForm>,
 ) -> WebResponse {
     validate_write(&state, &identity, &headers, &form.csrf_token)?;
+    let archived = state.repository.get_anime(id).await?.anime.lifecycle == "archived";
     let target = id.to_string();
+    let dedupe_key = if archived {
+        format!("archive_rating:{id}")
+    } else {
+        format!("sync_schedule:{id}")
+    };
     let job_id = state
         .application
         .enqueue_job(
@@ -1915,7 +1998,7 @@ async fn anime_sync(
             Some(&target),
             "{}",
             Some(identity.admin_id),
-            Some(&format!("sync_schedule:{id}")),
+            Some(&dedupe_key),
         )
         .await?;
     audit_success(
@@ -1927,7 +2010,12 @@ async fn anime_sync(
         serde_json::json!({"anime_id": id}),
     )
     .await?;
-    Ok(Redirect::to(&format!("/anime/{id}")).into_response())
+    let destination = if archived {
+        format!("/anime/{id}?result=archive-rating-enqueued")
+    } else {
+        format!("/anime/{id}")
+    };
+    Ok(Redirect::to(&destination).into_response())
 }
 
 #[derive(Deserialize)]
@@ -3616,6 +3704,36 @@ fn format_tracking_span(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
             }
         }
     }
+}
+
+fn archive_start(
+    memory: &crate::repository::AnimeArchiveMemory,
+) -> (&'static str, &'static str, DateTime<Utc>) {
+    match memory.first_watched_at {
+        Some(started_at) => ("开始观看", "观看历时", started_at),
+        None => ("开始追踪", "追踪历时", memory.tracking_started_at),
+    }
+}
+
+fn format_bangumi_rating(memory: &crate::repository::AnimeArchiveMemory) -> (String, bool) {
+    let Some(score) = memory.bangumi_score else {
+        return (
+            if memory.bangumi_rating_updated_at.is_some() {
+                "Bangumi 暂无公开评分".into()
+            } else {
+                "Bangumi 评分待同步".into()
+            },
+            false,
+        );
+    };
+    let mut label = format!("Bangumi {score:.1} / 10");
+    if let Some(total) = memory.bangumi_rating_total.filter(|value| *value > 0) {
+        label.push_str(&format!(" · {total} 人评分"));
+    }
+    if let Some(rank) = memory.bangumi_rank {
+        label.push_str(&format!(" · 排名 #{rank}"));
+    }
+    (label, true)
 }
 
 fn parse_archive_rating(value: &str) -> Result<Option<i64>> {
