@@ -50,7 +50,7 @@ anipulse anime add \
 
 如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，并用 Bangumi 章节日期校准当前集；也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
 
-未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule，并保存其 route。已有 AniList Media ID 时可用 `--anilist-id ID` 作为 AnimeSchedule 的精确检索键，但程序不会请求 AniList API；匹配仍不唯一时，核对 AnimeSchedule 页面地址后加 `--anime-schedule-route ROUTE`。AnimeSchedule 尚未公布精确时刻、但 Bangumi 已有开播日期时，系统会保存“仅日期”排期并从当天开始检查；日期也没有时才需要暂用手工排期。
+未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule，并保存其 route。为兼容网络平台先行上线与电视首播日期不同，标题、季度和类型吻合时允许两边日期在 `max_stream_offset_days`（默认 14 天）内偏移，并把该偏移应用到后续单集日期；跨年等超过阈值的冲突仍会拒绝。已有 AniList Media ID 时可用 `--anilist-id ID` 作为 AnimeSchedule 的精确检索键，但程序不会请求 AniList API；匹配仍不唯一时，核对 AnimeSchedule 页面地址后加 `--anime-schedule-route ROUTE`。AnimeSchedule 尚未公布精确时刻、但 Bangumi 已有开播日期时，系统会保存“仅日期”排期并从当天开始检查；日期也没有时才需要暂用手工排期。
 
 如果站内使用的集数与 Bangumi 条目编号不同，可以提供一组起点映射。例如站内 EP12 对应 Bangumi EP78：
 

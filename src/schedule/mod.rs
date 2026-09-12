@@ -772,7 +772,13 @@ impl ScheduleProvider {
         if let Some(route) = persisted_route {
             validate_anime_schedule_route(route)?;
             let media = self.anime_schedule_media(route).await?;
-            validate_anime_schedule_mapping(subject, subject_date, &media, anilist_media_id)?;
+            validate_anime_schedule_mapping(
+                subject,
+                subject_date,
+                &media,
+                anilist_media_id,
+                self.config.max_stream_offset_days,
+            )?;
             return Ok(media);
         }
 
@@ -782,7 +788,13 @@ impl ScheduleProvider {
             self.anime_schedule_search(Some(&subject.name), None)
                 .await?
         };
-        select_anime_schedule_candidate(subject, subject_date, anilist_media_id, candidates)
+        select_anime_schedule_candidate(
+            subject,
+            subject_date,
+            anilist_media_id,
+            self.config.max_stream_offset_days,
+            candidates,
+        )
     }
 
     async fn anime_schedule_search(
@@ -947,12 +959,19 @@ fn anime_schedule_estimate(
         let mut expected_at = if anime_schedule_is_ona(media) {
             premier
         } else if let Some(airdate) = episode_airdate {
-            let time = premier.with_timezone(&Tokyo).time();
+            let tokyo_premier = premier.with_timezone(&Tokyo);
+            let source_day_offset = subject_date
+                .map(|date| (tokyo_premier.date_naive() - date).num_days())
+                .unwrap_or(0);
+            let expected_date = airdate
+                .checked_add_signed(Duration::days(source_day_offset))
+                .ok_or_else(|| AppError::Schedule("episode date calculation overflowed".into()))?;
+            let time = tokyo_premier.time();
             Tokyo
                 .with_ymd_and_hms(
-                    airdate.year(),
-                    airdate.month(),
-                    airdate.day(),
+                    expected_date.year(),
+                    expected_date.month(),
+                    expected_date.day(),
                     time.hour(),
                     time.minute(),
                     time.second(),
@@ -1242,18 +1261,34 @@ fn anime_schedule_release_label(media: &AnimeScheduleAnime) -> String {
 fn anime_schedule_release_conflicts(
     subject_date: Option<NaiveDate>,
     media: &AnimeScheduleAnime,
+    maximum_offset_days: i64,
 ) -> bool {
     let Some(subject_date) = subject_date else {
         return false;
     };
     if let Some(media_date) = anime_schedule_premier_date(media) {
-        return subject_date != media_date;
+        return (subject_date - media_date).num_days().abs() > maximum_offset_days;
     }
     anime_schedule_month_start(media)
         .ok()
         .flatten()
-        .is_some_and(|month| {
-            subject_date.year() != month.year() || subject_date.month() != month.month()
+        .is_some_and(|month_start| {
+            let next_month = if month_start.month() == 12 {
+                NaiveDate::from_ymd_opt(month_start.year() + 1, 1, 1)
+            } else {
+                NaiveDate::from_ymd_opt(month_start.year(), month_start.month() + 1, 1)
+            };
+            let month_end = next_month
+                .and_then(|date| date.pred_opt())
+                .unwrap_or(month_start);
+            let distance = if subject_date < month_start {
+                (month_start - subject_date).num_days()
+            } else if subject_date > month_end {
+                (subject_date - month_end).num_days()
+            } else {
+                0
+            };
+            distance > maximum_offset_days
         })
 }
 
@@ -1262,6 +1297,7 @@ fn anime_schedule_matches_subject(
     subject_date: Option<NaiveDate>,
     media: &AnimeScheduleAnime,
     expected_anilist_id: Option<i64>,
+    maximum_release_offset_days: i64,
 ) -> bool {
     let actual_anilist_id = anime_schedule_anilist_id(media);
     if let (Some(expected), Some(actual)) = (expected_anilist_id, actual_anilist_id)
@@ -1289,7 +1325,7 @@ fn anime_schedule_matches_subject(
     if subject_titles.is_empty() || media_titles.is_empty() {
         return false;
     }
-    if anime_schedule_release_conflicts(subject_date, media) {
+    if anime_schedule_release_conflicts(subject_date, media, maximum_release_offset_days) {
         return false;
     }
     let platform = subject.platform.as_deref().unwrap_or_default();
@@ -1386,8 +1422,15 @@ fn validate_anime_schedule_mapping(
     subject_date: Option<NaiveDate>,
     media: &AnimeScheduleAnime,
     expected_anilist_id: Option<i64>,
+    maximum_release_offset_days: i64,
 ) -> Result<()> {
-    if anime_schedule_matches_subject(subject, subject_date, media, expected_anilist_id) {
+    if anime_schedule_matches_subject(
+        subject,
+        subject_date,
+        media,
+        expected_anilist_id,
+        maximum_release_offset_days,
+    ) {
         return Ok(());
     }
     Err(AppError::Schedule(format!(
@@ -1407,12 +1450,19 @@ fn select_anime_schedule_candidate(
     subject: &BangumiSubject,
     subject_date: Option<NaiveDate>,
     expected_anilist_id: Option<i64>,
+    maximum_release_offset_days: i64,
     candidates: Vec<AnimeScheduleAnime>,
 ) -> Result<AnimeScheduleAnime> {
     let mut matches = candidates
         .iter()
         .filter(|media| {
-            anime_schedule_matches_subject(subject, subject_date, media, expected_anilist_id)
+            anime_schedule_matches_subject(
+                subject,
+                subject_date,
+                media,
+                expected_anilist_id,
+                maximum_release_offset_days,
+            )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2133,7 +2183,7 @@ mod tests {
     use crate::domain::{AutoScheduleMetadata, NewAnime};
 
     #[test]
-    fn anime_schedule_mapping_compares_all_titles_without_weakening_date_checks() {
+    fn anime_schedule_mapping_compares_all_titles_and_allows_small_release_offsets() {
         let subject_date = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let subject = BangumiSubject {
             id: 513_878,
@@ -2178,19 +2228,35 @@ mod tests {
             Some(subject_date),
             &media,
             Some(195_539),
+            14,
         ));
 
-        let mut wrong_date = media.clone();
-        wrong_date.premier = Some(
+        let mut nearby_date = media.clone();
+        nearby_date.premier = Some(
             DateTime::parse_from_rfc3339("2026-10-21T07:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(anime_schedule_matches_subject(
+            &subject,
+            Some(subject_date),
+            &nearby_date,
+            Some(195_539),
+            14,
+        ));
+
+        let mut wrong_year = media.clone();
+        wrong_year.premier = Some(
+            DateTime::parse_from_rfc3339("2027-10-20T07:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
         );
         assert!(!anime_schedule_matches_subject(
             &subject,
             Some(subject_date),
-            &wrong_date,
+            &wrong_year,
             Some(195_539),
+            14,
         ));
     }
 
@@ -2200,7 +2266,7 @@ mod tests {
             id: 616_808,
             name: "野生のラスボスが現れた！第2期".into(),
             name_cn: "野生的大魔王出现了 第二季".into(),
-            date: None,
+            date: Some("2026-10-03".into()),
             platform: Some("TV".into()),
             total_episodes: None,
             rating: None,
@@ -2208,9 +2274,13 @@ mod tests {
         let media = AnimeScheduleAnime {
             title: "Yasei no Last Boss ga Arawareta! 2nd Season".into(),
             route: "yasei-no-last-boss-ga-arawareta-2nd-season".into(),
-            premier: None,
-            month: Some("October".into()),
-            year: Some(2027),
+            premier: Some(
+                DateTime::parse_from_rfc3339("2026-09-26T13:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            month: Some("September".into()),
+            year: Some(2026),
             episode_override: None,
             delayed_from: None,
             delayed_until: None,
@@ -2234,26 +2304,35 @@ mod tests {
             None,
             &media,
             Some(200_001),
+            14,
         ));
         assert!(anime_schedule_matches_subject(
             &subject,
-            NaiveDate::from_ymd_opt(2027, 10, 18),
+            NaiveDate::from_ymd_opt(2026, 10, 3),
             &media,
             Some(200_001),
+            14,
         ));
         assert!(!anime_schedule_matches_subject(
             &subject,
-            NaiveDate::from_ymd_opt(2027, 11, 1),
+            NaiveDate::from_ymd_opt(2027, 10, 3),
             &media,
             Some(200_001),
+            14,
         ));
         let timezone = "Asia/Shanghai".parse::<Tz>().unwrap();
-        let (expected_at, confidence, warning, precise) =
-            anime_schedule_estimate(None, None, &media, 1, timezone).unwrap();
-        assert_eq!(expected_at.to_rfc3339(), "2027-09-30T16:00:00+00:00");
-        assert_eq!(confidence, "date_only");
-        assert!(!precise);
-        assert!(warning.unwrap().contains("2027年10月"));
+        let (expected_at, confidence, warning, precise) = anime_schedule_estimate(
+            NaiveDate::from_ymd_opt(2026, 10, 3),
+            NaiveDate::from_ymd_opt(2026, 10, 3),
+            &media,
+            1,
+            timezone,
+        )
+        .unwrap();
+        assert_eq!(expected_at.to_rfc3339(), "2026-09-26T13:30:00+00:00");
+        assert_eq!(confidence, "calibrated");
+        assert!(precise);
+        assert!(warning.is_none());
 
         let mut wrong_season = media.clone();
         wrong_season.title = "Yasei no Last Boss ga Arawareta! 3rd Season".into();
@@ -2265,24 +2344,32 @@ mod tests {
         wrong_season.names.as_mut().unwrap().synonyms = None;
         assert!(!anime_schedule_matches_subject(
             &subject,
-            None,
+            NaiveDate::from_ymd_opt(2026, 10, 3),
             &wrong_season,
             Some(200_001),
+            14,
         ));
 
         let mut contradictory_season = wrong_season.clone();
         contradictory_season.names.as_mut().unwrap().native = Some(subject.name.clone());
         assert!(!anime_schedule_matches_subject(
             &subject,
-            None,
+            NaiveDate::from_ymd_opt(2026, 10, 3),
             &contradictory_season,
             Some(200_001),
+            14,
         ));
 
-        let error = validate_anime_schedule_mapping(&subject, None, &wrong_season, Some(200_001))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("2027-10"));
+        let error = validate_anime_schedule_mapping(
+            &subject,
+            NaiveDate::from_ymd_opt(2026, 10, 3),
+            &wrong_season,
+            Some(200_001),
+            14,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("2026-09-26"));
         assert!(error.contains("3rd Season"));
     }
 

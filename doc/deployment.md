@@ -195,7 +195,7 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 
 Bangumi API 要求非浏览器客户端使用包含开发者个人标识和应用名的 User-Agent。把示例中的“你的-Bangumi-用户名”改成自己的用户名或稳定个人标识；自动排期不需要 Access Token。
 
-尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的正式标题、中文名、首播日期和类型，再与 AnimeSchedule 的日文、罗马字、英文标题及别名进行高置信匹配；成功后把 AnimeSchedule route 持久化，后续直接按 route 同步。若已有 AniList Media ID，可在网页高级选项或 CLI 的 `--anilist-id` 中填写，作为 AnimeSchedule 的精确检索键；AniPulse 不再请求 AniList API。若仍没有唯一结果，核对 AnimeSchedule 条目 URL 末尾的 route，再填写 `--anime-schedule-route`。这两个辅助字段都不能脱离 Bangumi ID 单独填写。AnimeSchedule 没有精确时刻、但 Bangumi 已有开播日期时可以正常添加：页面显示“仅开播日期，时间待公布”，系统从该日期开始检查并每日同步；精确周排期发布后会自动校准。若连开播日期都没有，才需要暂用手工排期。
+尚未进入 `bangumi-data` 的未上映作品必须填写 Bangumi ID。AniPulse 会读取 Bangumi 条目的正式标题、中文名、首播日期和类型，再与 AnimeSchedule 的日文、罗马字、英文标题及别名进行高置信匹配；成功后把 AnimeSchedule route 持久化，后续直接按 route 同步。为兼容网络先行与电视首播日期不同，标题、季度和类型吻合时允许两边日期在 `max_stream_offset_days`（默认 14 天）内偏移，并把该偏移应用到后续单集日期；超过阈值的跨年或错误季度仍会拒绝。若已有 AniList Media ID，可在网页高级选项或 CLI 的 `--anilist-id` 中填写，作为 AnimeSchedule 的精确检索键；AniPulse 不再请求 AniList API。若仍没有唯一结果，核对 AnimeSchedule 条目 URL 末尾的 route，再填写 `--anime-schedule-route`。这两个辅助字段都不能脱离 Bangumi ID 单独填写。AnimeSchedule 没有精确时刻、但 Bangumi 已有开播日期时可以正常添加：页面显示“仅开播日期，时间待公布”，系统从该日期开始检查并每日同步；精确周排期发布后会自动校准。若连开播日期都没有，才需要暂用手工排期。
 
 直连 AnimeSchedule API 需要先在 AnimeSchedule 网站注册并在账户设置的 **API / Applications** 中创建应用，然后把 application token 写入 `/etc/anipulse/anipulse.env`：
 
