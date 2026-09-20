@@ -36,6 +36,16 @@ static LATIN_SEASON: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:season[\s.\-]*(\d{1,2})|(\d{1,2})(?:st|nd|rd|th)?[\s.\-]*season)")
         .expect("valid Latin season regex")
 });
+static EAST_ASIAN_PART: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:第\s*)?([0-9一二两三四五六七八九十]+)\s*(?:クール|部分|部)")
+        .expect("valid East Asian part regex")
+});
+static LATIN_PART: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:(?:part|cour)[\s.\-]*(\d{1,2})|(\d{1,2})(?:st|nd|rd|th)[\s.\-]*(?:part|cour))",
+    )
+    .expect("valid Latin part regex")
+});
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
@@ -1211,40 +1221,54 @@ fn parse_chinese_number(value: &str) -> Option<i64> {
     }
 }
 
-fn season_numbers(values: impl IntoIterator<Item = impl AsRef<str>>) -> HashSet<i64> {
+fn marker_numbers(
+    values: impl IntoIterator<Item = impl AsRef<str>>,
+    patterns: &[&Regex],
+) -> HashSet<i64> {
     let mut numbers = HashSet::new();
     for value in values {
         let normalized = normalize_title(value.as_ref());
-        for captures in EAST_ASIAN_SEASON.captures_iter(&normalized) {
-            let value = &captures[1];
-            if let Some(number) = value
-                .parse::<i64>()
-                .ok()
-                .or_else(|| parse_chinese_number(value))
-                .filter(|number| (1..=99).contains(number))
-            {
-                numbers.insert(number);
-            }
-        }
-        for captures in LATIN_SEASON.captures_iter(&normalized) {
-            if let Some(number) = captures
-                .get(1)
-                .or_else(|| captures.get(2))
-                .and_then(|value| value.as_str().parse::<i64>().ok())
-                .filter(|number| (1..=99).contains(number))
-            {
-                numbers.insert(number);
+        for pattern in patterns {
+            for captures in pattern.captures_iter(&normalized) {
+                let number = (1..captures.len()).find_map(|index| {
+                    let value = captures.get(index)?.as_str();
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .or_else(|| parse_chinese_number(value))
+                });
+                if let Some(number) = number.filter(|number| (1..=99).contains(number)) {
+                    numbers.insert(number);
+                }
             }
         }
     }
     numbers
 }
 
-fn title_without_season(value: &str) -> String {
+fn season_numbers(values: impl IntoIterator<Item = impl AsRef<str>>) -> HashSet<i64> {
+    marker_numbers(values, &[&EAST_ASIAN_SEASON, &LATIN_SEASON])
+}
+
+fn part_numbers(values: impl IntoIterator<Item = impl AsRef<str>>) -> HashSet<i64> {
+    marker_numbers(values, &[&EAST_ASIAN_PART, &LATIN_PART])
+}
+
+fn title_without_installment(value: &str) -> String {
     let normalized = normalize_title(value);
     let without_east_asian = EAST_ASIAN_SEASON.replace_all(&normalized, " ");
     let without_latin = LATIN_SEASON.replace_all(&without_east_asian, " ");
-    normalize_title(&without_latin)
+    let without_east_asian_part = EAST_ASIAN_PART.replace_all(&without_latin, " ");
+    let without_latin_part = LATIN_PART.replace_all(&without_east_asian_part, " ");
+    normalize_title(&without_latin_part)
+}
+
+fn ordinal_sets_conflict(left: &HashSet<i64>, right: &HashSet<i64>) -> bool {
+    left.len() > 1 || right.len() > 1 || (!left.is_empty() && !right.is_empty() && left != right)
+}
+
+fn matching_single_ordinal(left: &HashSet<i64>, right: &HashSet<i64>) -> bool {
+    left.len() == 1 && right.len() == 1 && left == right
 }
 
 fn anime_schedule_release_label(media: &AnimeScheduleAnime) -> String {
@@ -1344,11 +1368,14 @@ fn anime_schedule_matches_subject(
             .into_iter()
             .chain(std::iter::once(media.route.as_str())),
     );
-    if subject_seasons.len() > 1
-        || media_seasons.len() > 1
-        || (!subject_seasons.is_empty()
-            && !media_seasons.is_empty()
-            && subject_seasons != media_seasons)
+    let subject_parts = part_numbers([subject.name.as_str(), subject.name_cn.as_str()]);
+    let media_parts = part_numbers(
+        anime_schedule_titles(media)
+            .into_iter()
+            .chain(std::iter::once(media.route.as_str())),
+    );
+    if ordinal_sets_conflict(&subject_seasons, &media_seasons)
+        || ordinal_sets_conflict(&subject_parts, &media_parts)
     {
         return false;
     }
@@ -1368,9 +1395,10 @@ fn anime_schedule_matches_subject(
     let exact_date_matches = subject_date
         .zip(media_date)
         .is_some_and(|(left, right)| left == right);
-    let only_one_side_declares_season = subject_seasons.is_empty() != media_seasons.is_empty();
+    let only_one_side_declares_installment = subject_seasons.is_empty() != media_seasons.is_empty()
+        || subject_parts.is_empty() != media_parts.is_empty();
     if exact_primary_title
-        && (!only_one_side_declares_season || exact_date_matches || anilist_id_matches)
+        && (!only_one_side_declares_installment || exact_date_matches || anilist_id_matches)
     {
         return true;
     }
@@ -1378,20 +1406,20 @@ fn anime_schedule_matches_subject(
         return true;
     }
 
-    let matching_season =
-        subject_seasons.len() == 1 && media_seasons.len() == 1 && subject_seasons == media_seasons;
-    if !matching_season {
+    let matching_installment = matching_single_ordinal(&subject_seasons, &media_seasons)
+        || matching_single_ordinal(&subject_parts, &media_parts);
+    if !matching_installment {
         return false;
     }
 
     let subject_cores = [&subject.name, &subject.name_cn]
         .into_iter()
-        .map(|value| title_without_season(value))
+        .map(|value| title_without_installment(value))
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let media_cores = anime_schedule_titles(media)
         .into_iter()
-        .map(title_without_season)
+        .map(title_without_installment)
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     subject_cores.iter().any(|subject| {
@@ -1405,6 +1433,12 @@ fn equivalent_title_spelling(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
+    if (contains_east_asian_text(left) || contains_east_asian_text(right))
+        && left.split_whitespace().collect::<String>()
+            == right.split_whitespace().collect::<String>()
+    {
+        return true;
+    }
     let left = left.chars().collect::<Vec<_>>();
     let right = right.chars().collect::<Vec<_>>();
     left.len() >= 5
@@ -1415,6 +1449,14 @@ fn equivalent_title_spelling(left: &str, right: &str) -> bool {
             .filter(|(left, right)| left != right)
             .count()
             == 1
+}
+
+fn contains_east_asian_text(value: &str) -> bool {
+    value.chars().any(|character| {
+        ('\u{3040}'..='\u{30ff}').contains(&character)
+            || ('\u{3400}'..='\u{9fff}').contains(&character)
+            || ('\u{ac00}'..='\u{d7af}').contains(&character)
+    })
 }
 
 fn validate_anime_schedule_mapping(
@@ -2371,6 +2413,111 @@ mod tests {
         .to_string();
         assert!(error.contains("2026-09-26"));
         assert!(error.contains("3rd Season"));
+    }
+
+    #[test]
+    fn anime_schedule_mapping_matches_cour_and_part_without_confusing_installments() {
+        let subject = BangumiSubject {
+            id: 705_345,
+            name: "ふつつかな悪女ではございますが ～雛宮蝶鼠とりかえ伝～ 第2クール".into(),
+            name_cn: "恶女不才，请多关照 ～雏宫蝶鼠换身传～ 第2部分".into(),
+            date: None,
+            platform: Some("TV".into()),
+            total_episodes: None,
+            rating: None,
+        };
+        let media = AnimeScheduleAnime {
+            title: "Futsutsuka na Akujo dewa Gozaimasu ga: Suuguu Chouso Torikae Den Part 2".into(),
+            route: "futsutsuka-na-akujo-dewa-gozaimasu-ga-suuguu-chouso-torikae-den-part-2".into(),
+            premier: None,
+            month: Some("January".into()),
+            year: Some(2027),
+            episode_override: None,
+            delayed_from: None,
+            delayed_until: None,
+            episodes: None,
+            status: Some("Upcoming".into()),
+            names: Some(AnimeScheduleNames {
+                romaji: Some(
+                    "Futsutsuka na Akujo dewa Gozaimasu ga: Suuguu Chouso Torikae Den Part 2"
+                        .into(),
+                ),
+                english: Some("Though I Am an Inept Villainess Part 2".into()),
+                native: Some(
+                    "ふつつかな悪女ではございますが ～雛宮蝶鼠とりかえ伝～第2クール".into(),
+                ),
+                ..AnimeScheduleNames::default()
+            }),
+            websites: None,
+            media_types: vec![AnimeScheduleCategory { route: "tv".into() }],
+        };
+
+        assert!(anime_schedule_matches_subject(
+            &subject, None, &media, None, 14,
+        ));
+        assert!(equivalent_title_spelling(
+            &normalize_title(&subject.name),
+            &normalize_title(media.names.as_ref().unwrap().native.as_ref().unwrap()),
+        ));
+        assert_eq!(
+            season_numbers(["Example Season 2 Part 1"]),
+            HashSet::from([2])
+        );
+        assert_eq!(
+            part_numbers(["Example Season 2 Part 1"]),
+            HashSet::from([1])
+        );
+
+        let mut wrong_part = media.clone();
+        wrong_part.title = wrong_part.title.replace("Part 2", "Part 1");
+        wrong_part.route = wrong_part.route.replace("part-2", "part-1");
+        let names = wrong_part.names.as_mut().unwrap();
+        names.romaji = names
+            .romaji
+            .as_ref()
+            .map(|value| value.replace("Part 2", "Part 1"));
+        names.english = names
+            .english
+            .as_ref()
+            .map(|value| value.replace("Part 2", "Part 1"));
+        names.native = names
+            .native
+            .as_ref()
+            .map(|value| value.replace("第2クール", "第1クール"));
+        assert!(!anime_schedule_matches_subject(
+            &subject,
+            None,
+            &wrong_part,
+            None,
+            14,
+        ));
+
+        let mut first_part_without_marker = media.clone();
+        first_part_without_marker.title = first_part_without_marker.title.replace(" Part 2", "");
+        first_part_without_marker.route = first_part_without_marker
+            .route
+            .trim_end_matches("-part-2")
+            .into();
+        let names = first_part_without_marker.names.as_mut().unwrap();
+        names.romaji = names
+            .romaji
+            .as_ref()
+            .map(|value| value.replace(" Part 2", ""));
+        names.english = names
+            .english
+            .as_ref()
+            .map(|value| value.replace(" Part 2", ""));
+        names.native = names
+            .native
+            .as_ref()
+            .map(|value| value.replace("第2クール", ""));
+        assert!(!anime_schedule_matches_subject(
+            &subject,
+            None,
+            &first_part_without_marker,
+            None,
+            14,
+        ));
     }
 
     #[tokio::test]
