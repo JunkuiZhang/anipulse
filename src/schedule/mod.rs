@@ -275,6 +275,12 @@ enum BroadcastSourceKind {
     Catalog,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AnimeScheduleFallbackReason {
+    MissingCatalogEntry,
+    CatalogDefaultOnly,
+}
+
 struct ExpectedSchedule {
     expected_at: Option<DateTime<Utc>>,
     confidence: &'static str,
@@ -389,9 +395,11 @@ impl ScheduleProvider {
         .await
     }
 
-    /// Resolves from bangumi-data when possible. An explicit Bangumi subject that
-    /// is not in the catalog falls back to Bangumi metadata plus AnimeSchedule.
-    /// AniList IDs are lookup keys only; AniList itself is never contacted.
+    /// Resolves from a trusted bangumi-data streaming source when possible. An
+    /// explicit Bangumi subject that is absent from the catalog, or whose catalog
+    /// entry only has the default broadcast time, can keep using a previously
+    /// bound AnimeSchedule route. AniList IDs are lookup keys only; AniList itself
+    /// is never contacted.
     pub async fn resolve_auto(
         &self,
         catalog: &ScheduleCatalog,
@@ -414,18 +422,56 @@ impl ScheduleProvider {
                     request.anilist_media_id,
                     request.anime_schedule_route,
                     request.timezone,
+                    AnimeScheduleFallbackReason::MissingCatalogEntry,
                 )
                 .await;
         }
-        self.resolve_mapped_at(
-            catalog,
-            request.title,
-            request.subject_id,
-            target,
-            request.timezone,
-            Utc::now(),
-        )
-        .await
+        let mut catalog_schedule = self
+            .resolve_mapped_at(
+                catalog,
+                request.title,
+                request.subject_id,
+                target,
+                request.timezone,
+                Utc::now(),
+            )
+            .await?;
+        let has_bound_anime_schedule =
+            request.anime_schedule_route.is_some() || request.anilist_media_id.is_some();
+        if catalog_schedule.schedule_source != CATALOG_SOURCE || !has_bound_anime_schedule {
+            return Ok(catalog_schedule);
+        }
+
+        let Some(subject_id) = request.subject_id else {
+            return Ok(catalog_schedule);
+        };
+        match self
+            .resolve_anime_schedule_fallback(
+                subject_id,
+                target,
+                request.anilist_media_id,
+                request.anime_schedule_route,
+                request.timezone,
+                AnimeScheduleFallbackReason::CatalogDefaultOnly,
+            )
+            .await
+        {
+            Ok(anime_schedule) => Ok(anime_schedule),
+            Err(error) => {
+                warn!(
+                    subject_id,
+                    %error,
+                    "bound AnimeSchedule route unavailable; retaining bangumi-data default schedule"
+                );
+                catalog_schedule.schedule_warning = merge_warnings(
+                    catalog_schedule.schedule_warning,
+                    Some(format!(
+                        "已绑定的 AnimeSchedule 排期暂时不可用，继续采用 bangumi-data 默认时段：{error}"
+                    )),
+                );
+                Ok(catalog_schedule)
+            }
+        }
     }
 
     async fn resolve_at(
@@ -647,6 +693,7 @@ impl ScheduleProvider {
         anilist_media_id: Option<i64>,
         anime_schedule_route: Option<&str>,
         timezone: &str,
+        reason: AnimeScheduleFallbackReason,
     ) -> Result<ResolvedSchedule> {
         if episode_target.local_episode <= 0 {
             return Err(AppError::Schedule(
@@ -727,10 +774,16 @@ impl ScheduleProvider {
         }
         let aliases = anime_schedule_aliases(&subject, &media);
         let resolved_anilist_id = anilist_media_id.or_else(|| anime_schedule_anilist_id(&media));
-        let fallback_warning = format!(
-            "bangumi-data 尚未收录 Bangumi #{}；已绑定 AnimeSchedule '{}'，系统会每日复查并在正式目录收录后自动切回平台排期。",
-            subject.id, media.route
-        );
+        let fallback_warning = match reason {
+            AnimeScheduleFallbackReason::MissingCatalogEntry => format!(
+                "bangumi-data 尚未收录 Bangumi #{}；已绑定 AnimeSchedule '{}'，系统会每日复查并在正式目录收录后自动切回平台排期。",
+                subject.id, media.route
+            ),
+            AnimeScheduleFallbackReason::CatalogDefaultOnly => format!(
+                "bangumi-data 已收录 Bangumi #{}，但没有可用的受信网络平台时段；继续使用 AnimeSchedule '{}'，系统仍会每日复查目录平台排期。",
+                subject.id, media.route
+            ),
+        };
         Ok(ResolvedSchedule {
             bangumi_subject_id: subject.id,
             anilist_media_id: resolved_anilist_id,
@@ -2613,6 +2666,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_default_keeps_bound_anime_schedule_network_premiere() {
+        let (base_url, requests) = catalog_default_mock_server(false).await;
+        let provider = ScheduleProvider::new(ScheduleConfig {
+            bangumi_data_url: format!("{base_url}/data.json"),
+            bangumi_api_base_url: base_url.clone(),
+            anime_schedule_api_url: format!("{base_url}/anime-schedule"),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        })
+        .unwrap();
+        let catalog = provider.load_catalog().await.unwrap();
+
+        let resolved = provider
+            .resolve_auto(
+                &catalog,
+                AutoScheduleRequest {
+                    title: "野生的大魔王出现了！ 第二季",
+                    subject_id: Some(616_808),
+                    next_episode: 1,
+                    episode_mapping: None,
+                    anilist_media_id: None,
+                    anime_schedule_route: Some("yasei-no-last-boss-ga-arawareta-2nd-season"),
+                    timezone: "Asia/Shanghai",
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.schedule_source, "anime_schedule");
+        assert_eq!(resolved.schedule_confidence, "calibrated");
+        assert_eq!(resolved.expected_time.as_deref(), Some("21:30"));
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-09-26T13:30:00+00:00"
+        );
+        assert!(
+            resolved
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("没有可用的受信网络平台时段"))
+        );
+        assert_eq!(requests.await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn catalog_default_survives_bound_anime_schedule_outage() {
+        let (base_url, requests) = catalog_default_mock_server(true).await;
+        let provider = ScheduleProvider::new(ScheduleConfig {
+            bangumi_data_url: format!("{base_url}/data.json"),
+            bangumi_api_base_url: base_url.clone(),
+            anime_schedule_api_url: format!("{base_url}/anime-schedule"),
+            request_timeout_secs: 5,
+            ..ScheduleConfig::default()
+        })
+        .unwrap();
+        let catalog = provider.load_catalog().await.unwrap();
+
+        let resolved = provider
+            .resolve_auto(
+                &catalog,
+                AutoScheduleRequest {
+                    title: "野生的大魔王出现了！ 第二季",
+                    subject_id: Some(616_808),
+                    next_episode: 1,
+                    episode_mapping: None,
+                    anilist_media_id: None,
+                    anime_schedule_route: Some("yasei-no-last-boss-ga-arawareta-2nd-season"),
+                    timezone: "Asia/Shanghai",
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.schedule_source, CATALOG_SOURCE);
+        assert_eq!(resolved.schedule_confidence, "estimated");
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-10-03T13:30:00+00:00"
+        );
+        assert!(
+            resolved
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("AnimeSchedule 排期暂时不可用"))
+        );
+        assert_eq!(requests.await.unwrap(), 5);
+    }
+
+    #[tokio::test]
     async fn unreleased_ona_without_airing_timestamp_uses_date_only_schedule() {
         let (base_url, requests) = date_only_anime_schedule_mock_server().await;
         let provider = ScheduleProvider::new(ScheduleConfig {
@@ -3403,6 +3545,83 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             5
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn catalog_default_mock_server(
+        anime_schedule_outage: bool,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_requests = if anime_schedule_outage { 5 } else { 6 };
+        let task = tokio::spawn(async move {
+            for index in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let (status, response_body) = match index {
+                    0 => (
+                        "200 OK",
+                        r#"{"items":[{
+                            "title":"野生のラスボスが現れた！(第2期)",
+                            "titleTranslate":{"zh-Hans":["野生的大魔王出现了！ 第二季"],"en":["A Wild Last Boss Appeared! Season 2"]},
+                            "type":"tv",
+                            "begin":"2026-10-03T13:30:00.000Z",
+                            "broadcast":"R/2026-10-03T13:30:00.000Z/P7D",
+                            "sites":[
+                                {"site":"bangumi","id":"616808"},
+                                {"site":"unext","id":"SID0316400","begin":"","broadcast":""}
+                            ]
+                        }]}"#,
+                    ),
+                    1 | 3 => {
+                        assert!(headers.contains("/v0/episodes?"));
+                        assert!(headers.contains("subject_id=616808"));
+                        assert!(headers.contains("offset=0"));
+                        (
+                            "200 OK",
+                            r#"{"total":12,"data":[{"airdate":"2026-10-03","sort":1,"ep":1}]}"#,
+                        )
+                    }
+                    2 => {
+                        assert!(headers.contains("/v0/subjects/616808"));
+                        (
+                            "200 OK",
+                            r#"{"id":616808,"name":"野生のラスボスが現れた！第2期","name_cn":"野生的大魔王出现了！ 第二季","date":"2026-10-03","platform":"TV","total_episodes":12}"#,
+                        )
+                    }
+                    4 if anime_schedule_outage => {
+                        assert!(headers.contains(
+                            "/anime-schedule/anime/yasei-no-last-boss-ga-arawareta-2nd-season"
+                        ));
+                        ("503 Service Unavailable", r#"{"error":"maintenance"}"#)
+                    }
+                    4 => {
+                        assert!(headers.contains(
+                            "/anime-schedule/anime/yasei-no-last-boss-ga-arawareta-2nd-season"
+                        ));
+                        (
+                            "200 OK",
+                            r#"{"id":"as-last-boss-2","title":"Yasei no Last Boss ga Arawareta! 2nd Season","route":"yasei-no-last-boss-ga-arawareta-2nd-season","premier":"2026-09-26T13:30:00Z","episodes":12,"status":"Upcoming","names":{"romaji":"Yasei no Last Boss ga Arawareta! 2nd Season","english":"A Wild Last Boss Appeared! Season 2","native":"野生のラスボスが現れた！第2期"},"mediaTypes":[{"route":"tv"}]}"#,
+                        )
+                    }
+                    _ => {
+                        assert!(headers.starts_with("GET /anime-schedule/timetables/raw?"));
+                        (
+                            "200 OK",
+                            r#"[{"route":"yasei-no-last-boss-ga-arawareta-2nd-season","episodeDate":"2026-09-26T13:30:00Z","episodeNumber":1}]"#,
+                        )
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            expected_requests
         });
         (format!("http://{address}"), task)
     }

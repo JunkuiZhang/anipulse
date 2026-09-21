@@ -260,7 +260,7 @@ max_catalog_offset_days = 1
 
 `bangumi_api_base_url` 不要写 `/v0`；AniPulse 会自己追加章节、条目和封面路径。`anime_schedule_api_url` 必须写到 `/anime-schedule`，不要再追加 `/api/v3`。旧的 `anilist_api_url` 已不再使用，可以从配置中删除。
 
-`stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。`excluded_stream_sites` 会先排除不可信来源，默认禁用 U-NEXT；即使旧配置的优先列表里还保留 `unext`，缺省排除规则仍会生效。AniPulse 会在本地比较 `/data.json` 中的其余候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。
+`stream_site_priority` 是可信来源集合兼决胜顺序，不再表示“找到第一个就停止”。`excluded_stream_sites` 会先排除不可信来源，默认禁用 U-NEXT；即使旧配置的优先列表里还保留 `unext`，缺省排除规则仍会生效。AniPulse 会在本地比较 `/data.json` 中的其余候选并选择最早的独立平台共识；Worker 不需要新增任何上游网站或路由。若目录条目只有默认电视时段、而该追番已经绑定 AnimeSchedule route，AniPulse 会继续经 Worker 的 `/anime-schedule` 路由读取网络排期，直到目录补齐受信平台时段。
 
 调度器和网页封面服务都会读取该配置，因此两个服务都要重启：
 
