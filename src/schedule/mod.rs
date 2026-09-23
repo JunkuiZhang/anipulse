@@ -272,6 +272,7 @@ struct Recurrence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BroadcastSourceKind {
     Stream,
+    RebasedStream,
     Catalog,
 }
 
@@ -584,7 +585,9 @@ impl ScheduleProvider {
             origin_airdate,
             selected.kind,
             match selected.kind {
-                BroadcastSourceKind::Stream => self.config.max_stream_offset_days,
+                BroadcastSourceKind::Stream | BroadcastSourceKind::RebasedStream => {
+                    self.config.max_stream_offset_days
+                }
                 BroadcastSourceKind::Catalog => self.config.max_catalog_offset_days,
             },
             now,
@@ -665,12 +668,14 @@ impl ScheduleProvider {
                 total_episodes,
             });
         };
-        let returned_number = if episode.ep > 0.0 {
-            episode.ep
+        // Bangumi's `ep` is local to this subject (1..8 here), whereas `sort`
+        // can carry the series-wide number (78..85). The UI displays `sort`.
+        let matches_number = if episode.sort > 0.0 {
+            (episode.sort - bangumi_episode_no as f64).abs() <= 0.01
         } else {
-            episode.sort
+            (episode.ep - subject_episode_index as f64).abs() <= 0.01
         };
-        if (returned_number - bangumi_episode_no as f64).abs() > 0.01 {
+        if !matches_number {
             return Ok(EpisodeLookup {
                 airdate: None,
                 total_episodes,
@@ -2000,59 +2005,40 @@ fn select_broadcast(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| fallback_weekly_pattern(&item.begin));
-
-    if !excluded_sources.contains(config.preferred_site.as_str())
-        && let Some(site) = item
-            .sites
-            .iter()
-            .find(|site| site.site == config.preferred_site)
-        && let Some(pattern) = site_pattern(site, item_pattern.as_deref())
-    {
-        return Ok(SelectedBroadcast {
-            pattern,
-            source: site.site.clone(),
-            kind: BroadcastSourceKind::Stream,
-            warning: None,
-        });
-    }
+    let catalog_origin = item_pattern
+        .as_deref()
+        .and_then(|pattern| parse_recurrence(pattern).ok())
+        .map(|recurrence| recurrence.anchor.with_timezone(&Tokyo).date_naive());
+    let reference_origin = origin_airdate.or(catalog_origin);
 
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     let mut rejected_by_date = Vec::new();
-    for (priority, source) in config.stream_site_priority.iter().enumerate() {
-        if source == &config.preferred_site
-            || excluded_sources.contains(source.as_str())
-            || !seen.insert(source.clone())
-        {
+    for (priority, source) in std::iter::once(&config.preferred_site)
+        .chain(config.stream_site_priority.iter())
+        .enumerate()
+    {
+        if excluded_sources.contains(source.as_str()) || !seen.insert(source.clone()) {
             continue;
         }
         let Some(site) = item.sites.iter().find(|site| site.site == *source) else {
             continue;
         };
-        let Some(pattern) = site_pattern(site, item_pattern.as_deref()) else {
-            continue;
-        };
-        let Ok(recurrence) = parse_recurrence(&pattern) else {
-            continue;
-        };
-        if let Some(origin_airdate) = origin_airdate {
-            let source_day_offset =
-                (recurrence.anchor.with_timezone(&Tokyo).date_naive() - origin_airdate).num_days();
-            if source_day_offset.abs() > config.max_stream_offset_days {
-                rejected_by_date.push(site.site.clone());
-                continue;
-            }
-        }
-        candidates.push(StreamBroadcastCandidate {
-            selected: SelectedBroadcast {
-                pattern,
-                source: site.site.clone(),
-                kind: BroadcastSourceKind::Stream,
-                warning: None,
-            },
-            anchor: recurrence.anchor,
+        let Some(candidate) = stream_candidate(
+            site,
+            item_pattern.as_deref(),
+            reference_origin,
+            catalog_origin,
+            config,
             priority,
-        });
+            &mut rejected_by_date,
+        ) else {
+            continue;
+        };
+        if priority == 0 {
+            return Ok(candidate.selected);
+        }
+        candidates.push(candidate);
     }
 
     let corroborated = candidates
@@ -2076,10 +2062,13 @@ fn select_broadcast(
 
     if let Some(candidate) = candidates.iter().min_by_key(|candidate| candidate.priority) {
         let mut selected = candidate.selected.clone();
-        selected.warning = Some(format!(
-            "没有两个独立网络来源能相互印证，暂按优先级使用 {} 的排期。",
-            candidate.selected.source
-        ));
+        selected.warning = merge_warnings(
+            selected.warning,
+            Some(format!(
+                "没有两个独立网络来源能相互印证，暂按优先级使用 {} 的排期。",
+                candidate.selected.source
+            )),
+        );
         return Ok(selected);
     }
 
@@ -2096,6 +2085,56 @@ fn select_broadcast(
             }),
         })
         .ok_or_else(|| AppError::Schedule(format!("'{}' has no broadcast time", item.title)))
+}
+
+fn stream_candidate(
+    site: &BangumiDataSite,
+    item_pattern: Option<&str>,
+    reference_origin: Option<NaiveDate>,
+    catalog_origin: Option<NaiveDate>,
+    config: &ScheduleConfig,
+    priority: usize,
+    rejected_by_date: &mut Vec<String>,
+) -> Option<StreamBroadcastCandidate> {
+    let mut pattern = site_pattern(site, item_pattern)?;
+    let mut recurrence = parse_recurrence(&pattern).ok()?;
+    let mut kind = BroadcastSourceKind::Stream;
+    let mut warning = None;
+    if let Some(origin) = reference_origin {
+        let day_offset = (recurrence.anchor.with_timezone(&Tokyo).date_naive() - origin).num_days();
+        if day_offset.abs() > config.max_stream_offset_days {
+            // A split cour can retain the platform's first-cour weekly anchor.
+            // Reuse its clock only when the catalog and Bangumi agree on this
+            // cour's first day and that day is on the same weekly cadence.
+            let elapsed_days = -day_offset;
+            if catalog_origin == Some(origin)
+                && recurrence.period == Duration::days(7)
+                && (28..=182).contains(&elapsed_days)
+                && elapsed_days % 7 == 0
+            {
+                recurrence.anchor += Duration::days(elapsed_days);
+                pattern = format!("R/{}/P7D", recurrence.anchor.to_rfc3339());
+                kind = BroadcastSourceKind::RebasedStream;
+                warning = Some(format!(
+                    "{} 的平台起点仍在上一播出阶段；已按本篇首集日期对齐每周时段，当前为估算时间。",
+                    site.site
+                ));
+            } else {
+                rejected_by_date.push(site.site.clone());
+                return None;
+            }
+        }
+    }
+    Some(StreamBroadcastCandidate {
+        selected: SelectedBroadcast {
+            pattern,
+            source: site.site.clone(),
+            kind,
+            warning,
+        },
+        anchor: recurrence.anchor,
+        priority,
+    })
 }
 
 fn site_pattern(site: &BangumiDataSite, item_pattern: Option<&str>) -> Option<String> {
@@ -2167,7 +2206,7 @@ fn expected_at(
     origin_airdate: Option<NaiveDate>,
     source_kind: BroadcastSourceKind,
     maximum_offset_days: i64,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> Result<ExpectedSchedule> {
     let steps = episode_no - 1;
     let period_seconds = recurrence.period.num_seconds();
@@ -2205,6 +2244,7 @@ fn expected_at(
         };
         let (confidence, warning) = match source_kind {
             BroadcastSourceKind::Stream => ("calibrated", None),
+            BroadcastSourceKind::RebasedStream => ("estimated", None),
             BroadcastSourceKind::Catalog => (
                 "estimated",
                 Some(
@@ -2221,25 +2261,11 @@ fn expected_at(
         });
     }
 
-    let mut expected = projected;
-    if expected < now - Duration::days(14) {
-        let threshold = now - Duration::hours(6);
-        if recurrence.anchor < threshold {
-            let elapsed = (threshold - recurrence.anchor).num_seconds();
-            let periods = elapsed.div_euclid(period_seconds);
-            expected = recurrence.anchor + Duration::seconds(period_seconds * periods);
-            if expected < threshold {
-                expected += recurrence.period;
-            }
-        } else {
-            expected = recurrence.anchor;
-        }
-    }
     Ok(ExpectedSchedule {
-        expected_at: Some(expected),
+        expected_at: Some(projected),
         confidence: "estimated",
         warning: Some(
-            "Bangumi 缺少目标集或本季首集日期，当前时间仅按周播周期递推；连播、停播或先行配信可能导致偏差。"
+            "Bangumi 缺少目标集或本季首集日期，当前时间按本篇起点和集序推算；连播、停播或先行配信可能导致偏差。"
                 .into(),
         ),
         health_error: None,
@@ -3054,6 +3080,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_cour_finale_uses_its_own_date_and_rebases_old_stream_clock() {
+        let (base_url, requests) = split_cour_mock_server(false).await;
+        let provider = provider(&base_url);
+        let catalog = provider.load_catalog().await.unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-09-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let resolved = provider
+            .resolve_mapped_at(
+                &catalog,
+                "从零开始的异世界生活 第四季 夺还篇",
+                Some(633_836),
+                EpisodeScheduleTarget {
+                    local_episode: 19,
+                    mapping: Some(EpisodeNumberMapping {
+                        local_origin: 12,
+                        bangumi_origin: 78,
+                    }),
+                },
+                "Asia/Shanghai",
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.schedule_source, "danime");
+        assert_eq!(resolved.schedule_confidence, "estimated");
+        assert_eq!(resolved.expected_time.as_deref(), Some("21:30"));
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-09-30T13:30:00+00:00"
+        );
+        assert!(
+            resolved
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("上一播出阶段"))
+        );
+        assert_eq!(resolved.total_episodes, Some(8));
+        assert_eq!(requests.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn split_cour_api_outage_does_not_reuse_previous_episode_week() {
+        let (base_url, requests) = split_cour_mock_server(true).await;
+        let provider = provider(&base_url);
+        let catalog = provider.load_catalog().await.unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let resolved = provider
+            .resolve_mapped_at(
+                &catalog,
+                "从零开始的异世界生活 第四季 夺还篇",
+                Some(633_836),
+                EpisodeScheduleTarget {
+                    local_episode: 19,
+                    mapping: Some(EpisodeNumberMapping {
+                        local_origin: 12,
+                        bangumi_origin: 78,
+                    }),
+                },
+                "Asia/Shanghai",
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.schedule_confidence, "estimated");
+        assert_eq!(
+            resolved.expected_at.unwrap().to_rfc3339(),
+            "2026-09-30T13:30:00+00:00"
+        );
+        assert!(
+            resolved
+                .schedule_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("Bangumi 章节日期请求失败"))
+        );
+        assert_eq!(requests.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn episode_count_survives_an_offset_past_the_final_episode() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3451,12 +3560,12 @@ mod tests {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=633836"));
                     assert!(headers.contains("offset=2"));
-                    r#"{"total":8,"data":[{"airdate":"2026-08-26","sort":80,"ep":80}]}"#.into()
+                    r#"{"total":8,"data":[{"airdate":"2026-08-26","sort":80,"ep":3}]}"#.into()
                 } else {
                     assert!(headers.contains("/v0/episodes?"));
                     assert!(headers.contains("subject_id=633836"));
                     assert!(headers.contains("offset=0"));
-                    r#"{"total":8,"data":[{"airdate":"2026-08-12","sort":78,"ep":78}]}"#.into()
+                    r#"{"total":8,"data":[{"airdate":"2026-08-12","sort":78,"ep":1}]}"#.into()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3466,6 +3575,66 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             3
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn split_cour_mock_server(
+        episode_api_outage: bool,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_requests = if episode_api_outage { 2 } else { 3 };
+        let task = tokio::spawn(async move {
+            for index in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let headers = String::from_utf8_lossy(request_headers(&request));
+                let (status, body) = match index {
+                    0 => (
+                        "200 OK",
+                        r#"{"items":[{
+                            "title":"Re:ゼロから始める異世界生活 4th season 奪還編",
+                            "titleTranslate":{"zh-Hans":["从零开始的异世界生活 第四季 夺还篇"]},
+                            "type":"tv",
+                            "begin":"2026-08-12T14:00:00Z",
+                            "broadcast":"R/2026-08-12T14:00:00.000Z/P7D",
+                            "sites":[
+                                {"site":"bangumi","id":"633836"},
+                                {"site":"danime","id":"28801","begin":"2026-04-08T13:30:00Z","broadcast":"R/2026-04-08T13:30:00.000Z/P7D"}
+                            ]
+                        }]}"#,
+                    ),
+                    1 if episode_api_outage => {
+                        assert!(headers.contains("subject_id=633836"));
+                        assert!(headers.contains("offset=7"));
+                        ("503 Service Unavailable", r#"{"error":"unavailable"}"#)
+                    }
+                    1 => {
+                        assert!(headers.contains("subject_id=633836"));
+                        assert!(headers.contains("offset=7"));
+                        (
+                            "200 OK",
+                            r#"{"total":8,"data":[{"airdate":"2026-09-30","sort":85,"ep":8}]}"#,
+                        )
+                    }
+                    _ => {
+                        assert!(headers.contains("subject_id=633836"));
+                        assert!(headers.contains("offset=0"));
+                        (
+                            "200 OK",
+                            r#"{"total":8,"data":[{"airdate":"2026-08-12","sort":78,"ep":1}]}"#,
+                        )
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            expected_requests
         });
         (format!("http://{address}"), task)
     }
