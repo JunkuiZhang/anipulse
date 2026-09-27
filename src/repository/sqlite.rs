@@ -477,11 +477,8 @@ impl Repository {
         .await?)
     }
 
-    pub async fn upcoming_releases(
-        &self,
-        from: DateTime<Utc>,
-        until: DateTime<Utc>,
-    ) -> Result<Vec<UpcomingReleaseRow>> {
+    /// Include overdue episodes until they are confirmed, not just future dates.
+    pub async fn upcoming_releases(&self, until: DateTime<Utc>) -> Result<Vec<UpcomingReleaseRow>> {
         Ok(sqlx::query_as::<_, UpcomingReleaseRow>(
             r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id,
                       a.total_episodes, a.schedule_confidence, a.enabled,
@@ -490,11 +487,9 @@ impl Repository {
                JOIN episode e ON e.anime_id = a.id
                WHERE a.lifecycle = 'tracking'
                  AND e.state NOT IN ('notified', 'confirmed')
-                 AND e.expected_at >= ?
                  AND e.expected_at < ?
                ORDER BY e.expected_at, a.id"#,
         )
-        .bind(from)
         .bind(until)
         .fetch_all(&self.pool)
         .await?)
@@ -4254,11 +4249,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upcoming_releases_are_ordered_windowed_and_keep_paused_schedules() {
+    async fn upcoming_releases_keep_overdue_episodes_until_confirmed() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("upcoming.db");
         let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
-        let now = Utc::now();
+        let now = DateTime::parse_from_rfc3339("2026-09-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let add = |title: &str, expected_at| NewAnime {
             title: title.into(),
             aliases: Vec::new(),
@@ -4286,10 +4283,65 @@ mod tests {
             .await
             .unwrap();
         repository.set_anime_enabled(paused, false).await.unwrap();
+        let mut finale = add("无职转生 第三季", now - chrono::Duration::hours(1));
+        finale.next_episode = 14;
+        let overdue = repository.add_anime(finale).await.unwrap();
+        sqlx::query("UPDATE anime SET total_episodes = 14 WHERE id = ?")
+            .bind(overdue)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let awaiting_review = repository
+            .add_anime(add("更早的待审核", now - chrono::Duration::days(30)))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE episode SET state = 'needs_manual_review' WHERE anime_id = ?")
+            .bind(awaiting_review)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let due_now = repository.add_anime(add("刚到时间", now)).await.unwrap();
+        let before_until = repository
+            .add_anime(add(
+                "窗口末尾",
+                now + chrono::Duration::days(7) - chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        repository
+            .add_anime(add("窗口边界", now + chrono::Duration::days(7)))
+            .await
+            .unwrap();
         repository
             .add_anime(add("窗口外", now + chrono::Duration::days(8)))
             .await
             .unwrap();
+        let mut unknown = add("暂无时间", now);
+        unknown.expected_at = None;
+        repository.add_anime(unknown).await.unwrap();
+        for state in ["confirmed", "notified"] {
+            for offset in [-1, 1] {
+                let released = repository
+                    .add_anime(add(state, now + chrono::Duration::days(offset)))
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE episode SET state = ? WHERE anime_id = ?")
+                    .bind(state)
+                    .bind(released)
+                    .execute(&repository.pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        let archived = repository
+            .add_anime(add("已归档", now - chrono::Duration::days(1)))
+            .await
+            .unwrap();
+        repository
+            .mark_anime_released_complete(archived, Some(1))
+            .await
+            .unwrap();
+        repository.archive_anime(archived, None, "").await.unwrap();
         let completed = repository
             .add_anime(add("已经播完", now + chrono::Duration::days(3)))
             .await
@@ -4300,14 +4352,33 @@ mod tests {
             .unwrap();
 
         let releases = repository
-            .upcoming_releases(now, now + chrono::Duration::days(7))
+            .upcoming_releases(now + chrono::Duration::days(7))
             .await
             .unwrap();
-        assert_eq!(releases.len(), 2);
-        assert_eq!(releases[0].anime_id, paused);
-        assert!(!releases[0].enabled);
-        assert_eq!(releases[1].anime_id, later);
-        assert_eq!(releases[1].total_episodes, Some(12));
+        assert_eq!(
+            releases.iter().map(|row| row.anime_id).collect::<Vec<_>>(),
+            vec![
+                awaiting_review,
+                overdue,
+                due_now,
+                paused,
+                later,
+                before_until
+            ]
+        );
+        assert_eq!(releases[1].episode_no, 14);
+        assert_eq!(releases[1].total_episodes, Some(14));
+        assert_eq!(releases[1].expected_at, now - chrono::Duration::hours(1));
+        assert!(!releases[3].enabled);
+        assert_eq!(releases[4].total_episodes, Some(12));
+
+        // Unconfirmed episodes remain visible after midnight and after a week.
+        let next_week = repository
+            .upcoming_releases(now + chrono::Duration::days(14))
+            .await
+            .unwrap();
+        assert!(next_week.iter().any(|row| row.anime_id == overdue));
+        assert!(next_week.iter().any(|row| row.anime_id == awaiting_review));
     }
 
     fn candidate() -> (VideoCandidate, Evaluation) {
@@ -4392,6 +4463,8 @@ mod tests {
     #[tokio::test]
     async fn confirmed_episode_stays_in_watch_queue_until_marked_watched() {
         let (_directory, repository, anime_id, episode) = fixture().await;
+        let until = Utc::now() + chrono::Duration::days(7);
+        assert_eq!(repository.upcoming_releases(until).await.unwrap().len(), 1);
         let (mut candidate, evaluation) = candidate();
         candidate.published_at = Utc::now() - chrono::Duration::minutes(35);
         repository
@@ -4402,6 +4475,14 @@ mod tests {
             .confirm_candidate(episode.id, &candidate.bvid, "manual", "default", true)
             .await
             .unwrap();
+
+        assert!(
+            repository
+                .upcoming_releases(until)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let queued = repository.watch_queue(50).await.unwrap();
         assert_eq!(queued.len(), 1);

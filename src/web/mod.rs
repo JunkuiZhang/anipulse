@@ -518,6 +518,7 @@ struct UpcomingReleaseView {
     has_episode_total: bool,
     day: String,
     time: String,
+    awaiting_update: bool,
     enabled: bool,
 }
 
@@ -548,7 +549,7 @@ async fn dashboard(
     let now = Utc::now();
     let upcoming = state
         .repository
-        .upcoming_releases(now, now + chrono::Duration::days(7))
+        .upcoming_releases(now + chrono::Duration::days(7))
         .await?
         .into_iter()
         .map(|release| {
@@ -576,6 +577,7 @@ async fn dashboard(
                 } else {
                     local.format("%H:%M").to_string()
                 },
+                awaiting_update: release.expected_at <= now,
                 enabled: release.enabled,
             }
         })
@@ -4210,6 +4212,76 @@ mod tests {
         );
 
         drop((repository, config, auth));
+    }
+
+    #[tokio::test]
+    async fn dashboard_shows_overdue_unconfirmed_episodes_before_future_releases() {
+        let (_directory, repository, config, auth, app) = test_app().await;
+        let now = Utc::now();
+        let expected_at = now - chrono::Duration::hours(1);
+        let new_anime = |title: &str, episode, expected_at| NewAnime {
+            title: title.into(),
+            aliases: Vec::new(),
+            next_episode: episode,
+            expected_at: Some(expected_at),
+            expected_weekday: None,
+            expected_time: None,
+            timezone: "Asia/Shanghai".into(),
+            duration_min_sec: 1_200,
+            duration_max_sec: 2_400,
+            auto_schedule: None,
+        };
+        let future = repository
+            .add_anime(new_anime("明天更新", 1, now + chrono::Duration::days(1)))
+            .await
+            .unwrap();
+        let overdue = repository
+            .add_anime(new_anime("无职转生 第三季", 14, expected_at))
+            .await
+            .unwrap();
+        repository.set_anime_enabled(future, false).await.unwrap();
+
+        create_admin(&repository, "admin", "correct-password-1234".to_string())
+            .await
+            .unwrap();
+        let token = match auth
+            .login(
+                "admin",
+                "correct-password-1234".to_string(),
+                "127.0.0.1",
+                Some("test"),
+            )
+            .await
+            .unwrap()
+        {
+            LoginOutcome::Success(session) => session.token,
+            _ => panic!("test login should succeed"),
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let overdue_card =
+            format!("<a class=\"upcoming-card awaiting-update\" href=\"/anime/{overdue}\">");
+        let future_card = format!("<a class=\"upcoming-card\" href=\"/anime/{future}\">");
+        assert!(html.find(&overdue_card).unwrap() < html.find(&future_card).unwrap());
+        assert!(html.contains("EP14"));
+        assert!(html.contains("class=\"awaiting-update-label\" title=\"已到预计时间，尚未确认视频更新\">等待更新</span>"));
+        assert!(html.contains("class=\"upcoming-kind\">预计更新</span>"));
+        assert!(html.contains("监控已暂停"));
+        let local = expected_at.with_timezone(&config.web.timezone.parse::<Tz>().unwrap());
+        assert!(html.contains(&local.format("%m月%d日").to_string()));
+        assert!(html.contains(&format!("<span>{}</span>", local.format("%H:%M"))));
+        assert!(html.contains("暂时没有待看的新集数。"));
     }
 
     #[tokio::test]

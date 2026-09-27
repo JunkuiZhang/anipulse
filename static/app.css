@@ -267,6 +267,18 @@ a { color: inherit; }
   content: "·";
 }
 
+.upcoming-card.awaiting-update {
+  border-color: rgba(216, 138, 104, 0.3);
+}
+
+.awaiting-update-label {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: #a4593b;
+  font-weight: 750;
+}
+
 .paused-label {
   padding: 2px 7px;
   border-radius: 999px;
