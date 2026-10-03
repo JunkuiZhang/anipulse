@@ -19,10 +19,10 @@
 {% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 <section class="history-section">
   <div class="section-heading">
-    <div><p class="eyebrow">EPISODE LIBRARY</p><h2>往集视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
+    <div><p class="eyebrow">EPISODE LIBRARY</p><h2>集数视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
   </div>
   <section class="panel history-add-panel">
-    <div><h3>添加以前集数的视频</h3><p class="muted">适合补录开始监控前的集数，或为同一集增加备用来源。</p></div>
+    <div><h3>添加集数视频</h3><p class="muted">支持当前集和以前集数，也可增加备用来源。添加当前集表示手动确认该集视频；读取成功后会进入首页“等待观看”，看完后请点击“已观看”。</p></div>
     <form method="post" action="/anime/{{ id }}/history/videos" class="history-add-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <label>集数<input type="number" name="episode_no" min="1" max="10000" placeholder="例如 8" required></label>
@@ -32,13 +32,13 @@
     {% if video_job_enqueued %}
     <div class="job-progress" role="status" aria-live="polite">
       <span class="job-progress-indicator" aria-hidden="true"></span>
-      <div><strong>正在后台读取视频信息</strong><p>这项任务可能需要几分钟；完成后刷新本页即可看到新的视频来源。</p></div>
+      <div><strong>正在后台读取视频信息</strong><p>这项任务可能需要几分钟；完成后刷新即可看到视频。补录当前集成功后，也可到首页标记“已观看”。</p></div>
       <a class="button" href="/jobs">查看任务</a>
     </div>
     {% endif %}
   </section>
   {% if history.is_empty() %}
-  <section class="panel empty-state"><h3>还没有往集视频</h3><p class="muted">当前集确认并完成推送后会自动收录，也可以在上方手动补录。</p></section>
+  <section class="panel empty-state"><h3>还没有集数视频</h3><p class="muted">当前集确认后会自动收录，也可以在上方手动补录当前集或以前集数。</p></section>
   {% else %}
   <div class="episode-history-list">
     {% for item in history %}

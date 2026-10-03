@@ -1294,11 +1294,7 @@ impl Repository {
         .ok_or_else(|| AppError::NotFound(format!("active episode for anime {anime_id}")))
     }
 
-    pub async fn ensure_historical_episode(
-        &self,
-        anime_id: i64,
-        episode_no: i64,
-    ) -> Result<Episode> {
+    pub async fn ensure_video_episode(&self, anime_id: i64, episode_no: i64) -> Result<Episode> {
         if episode_no <= 0 || episode_no > 10_000 {
             return Err(AppError::InvalidInput(
                 "episode must be between 1 and 10000".into(),
@@ -1316,26 +1312,39 @@ impl Repository {
                 "archived anime no longer accepts episode videos".into(),
             ));
         }
-        let exclusive_limit = if anime.lifecycle == "released_complete" {
+        let latest_allowed = if anime.lifecycle == "released_complete" {
             anime
                 .final_episode_no()?
                 .ok_or_else(|| AppError::InvalidInput("anime total episodes is unknown".into()))?
-                + 1
         } else {
-            sqlx::query_scalar::<_, i64>(
-                r#"SELECT episode_no FROM episode
-                   WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
-                   ORDER BY episode_no LIMIT 1"#,
+            sqlx::query_scalar::<_, Option<i64>>(
+                r#"SELECT COALESCE(
+                       MIN(CASE WHEN state NOT IN ('notified', 'confirmed') THEN episode_no END),
+                       MAX(episode_no)
+                   ) FROM episode WHERE anime_id = ?"#,
             )
             .bind(anime_id)
-            .fetch_optional(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?
             .ok_or_else(|| AppError::InvalidInput("anime has no active episode".into()))?
         };
-        if episode_no >= exclusive_limit {
+        if episode_no > latest_allowed {
             return Err(AppError::InvalidInput(format!(
-                "historical episode must be earlier than EP{exclusive_limit}"
+                "只能补录 EP{latest_allowed} 及以前集数的视频"
             )));
+        }
+        // The current episode is returned unchanged. Only a successful metadata
+        // import and manual confirmation may mark it released.
+        if anime.lifecycle == "tracking" && episode_no == latest_allowed {
+            let episode = sqlx::query_as::<_, Episode>(
+                "SELECT * FROM episode WHERE anime_id = ? AND episode_no = ?",
+            )
+            .bind(anime_id)
+            .bind(episode_no)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(episode);
         }
         sqlx::query(
             r#"INSERT OR IGNORE INTO episode(
@@ -4511,16 +4520,22 @@ mod tests {
     #[tokio::test]
     async fn historical_video_library_supports_ranking_preference_replacement_and_blocking() {
         let (_directory, repository, anime_id, current_episode) = fixture().await;
+        let current = repository
+            .ensure_video_episode(anime_id, current_episode.episode_no)
+            .await
+            .unwrap();
+        assert_eq!(current.id, current_episode.id);
+        assert_eq!(current.state, current_episode.state);
+        assert!(current.confirmed_at.is_none());
+        assert!(current.watched_at.is_none());
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
         assert!(
             repository
-                .ensure_historical_episode(anime_id, current_episode.episode_no)
+                .ensure_video_episode(anime_id, current_episode.episode_no + 1)
                 .await
                 .is_err()
         );
-        let historical = repository
-            .ensure_historical_episode(anime_id, 7)
-            .await
-            .unwrap();
+        let historical = repository.ensure_video_episode(anime_id, 7).await.unwrap();
         assert_eq!(historical.state, "notified");
         assert!(historical.watched_at.is_some());
 

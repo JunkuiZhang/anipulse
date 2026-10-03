@@ -1737,7 +1737,7 @@ async fn history_video_add(
     let bvid = parse_bilibili_bvid(&form.url)?;
     let episode = state
         .repository
-        .ensure_historical_episode(anime_id, form.episode_no)
+        .ensure_video_episode(anime_id, form.episode_no)
         .await?;
     let payload = serde_json::to_string(&serde_json::json!({
         "purpose": "episode_video",
@@ -4282,6 +4282,76 @@ mod tests {
         assert!(html.contains(&local.format("%m月%d日").to_string()));
         assert!(html.contains(&format!("<span>{}</span>", local.format("%H:%M"))));
         assert!(html.contains("暂时没有待看的新集数。"));
+    }
+
+    #[tokio::test]
+    async fn video_add_form_queues_the_current_episode_without_marking_it_watched() {
+        let (_directory, repository, _config, auth, app) = test_app().await;
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "克雷瓦提斯 第二季".into(),
+                aliases: Vec::new(),
+                next_episode: 13,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 2_400,
+                auto_schedule: None,
+            })
+            .await
+            .unwrap();
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        create_admin(&repository, "admin", "correct-password-1234".to_string())
+            .await
+            .unwrap();
+        let token = match auth
+            .login(
+                "admin",
+                "correct-password-1234".to_string(),
+                "127.0.0.1",
+                Some("test"),
+            )
+            .await
+            .unwrap()
+        {
+            LoginOutcome::Success(session) => session.token,
+            _ => panic!("test login should succeed"),
+        };
+        let identity = auth.authenticate(&token).await.unwrap().unwrap();
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("csrf_token", &identity.csrf_token);
+        form.append_pair("episode_no", "13");
+        form.append_pair("url", "https://www.bilibili.com/video/BV1Vbao6aEHb");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/anime/{anime_id}/history/videos"))
+                    .header(header::ORIGIN, "https://anime.example.com")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form.finish()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!("/anime/{anime_id}?result=video-enqueued")
+        );
+        let jobs = repository.claim_management_jobs(1).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, "accept_bilibili_url");
+        let payload: serde_json::Value = serde_json::from_str(&jobs[0].payload_json).unwrap();
+        assert_eq!(payload["episode_id"], episode.id);
+        assert_eq!(payload["purpose"], "episode_video");
+        let current = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(current.id, episode.id);
+        assert!(current.confirmed_at.is_none());
+        assert!(current.watched_at.is_none());
     }
 
     #[tokio::test]

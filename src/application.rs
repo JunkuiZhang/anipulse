@@ -483,14 +483,42 @@ impl ApplicationService {
         replace_video_id: Option<i64>,
         input: &str,
     ) -> Result<String> {
+        let provider =
+            BilibiliProvider::new(self.config.bilibili.clone(), self.repository.clone())?;
+        self.import_episode_video_with_provider(
+            anime_id,
+            episode_id,
+            replace_video_id,
+            input,
+            &provider,
+        )
+        .await
+    }
+
+    async fn import_episode_video_with_provider(
+        &self,
+        anime_id: i64,
+        episode_id: i64,
+        replace_video_id: Option<i64>,
+        input: &str,
+        provider: &dyn VideoSearchProvider,
+    ) -> Result<String> {
         let bvid = parse_bilibili_bvid(input)?;
         let anime = self.repository.get_anime(anime_id).await?;
         let episode = self.repository.episode(episode_id).await?;
-        if episode.anime_id != anime_id
-            || !matches!(episode.state.as_str(), "confirmed" | "notified")
+        if anime.anime.lifecycle == "archived" || episode.anime_id != anime_id {
+            return Err(AppError::InvalidInput(
+                "该集数不属于此番剧，或番剧已经归档".into(),
+            ));
+        }
+        let current = !matches!(episode.state.as_str(), "confirmed" | "notified");
+        if current
+            && (replace_video_id.is_some()
+                || anime.anime.lifecycle != "tracking"
+                || self.repository.active_episode(anime_id).await?.id != episode_id)
         {
             return Err(AppError::InvalidInput(
-                "the episode is not part of this anime's completed history".into(),
+                "当前监控集已变化，请刷新详情页后重新补录".into(),
             ));
         }
         let now = Utc::now();
@@ -511,9 +539,12 @@ impl ApplicationService {
             discovered_at: now,
             enriched: false,
         };
-        let provider =
-            BilibiliProvider::new(self.config.bilibili.clone(), self.repository.clone())?;
         let candidate = provider.enrich(&seed).await?;
+        if candidate.uploader_mid <= 0 {
+            return Err(AppError::InvalidInput(
+                "视频 UP 信息读取失败，请稍后重试".into(),
+            ));
+        }
         let trust = self
             .repository
             .uploader_trust(anime_id, candidate.uploader_mid)
@@ -533,15 +564,30 @@ impl ApplicationService {
             &self.config.confirmation,
             &blocked_keywords,
         );
-        self.repository
-            .upsert_episode_video(
-                anime_id,
-                episode_id,
-                replace_video_id,
-                &candidate,
-                i64::from(evaluation.score),
-            )
-            .await?;
+        if current {
+            self.repository
+                .upsert_candidate(episode_id, &candidate, &evaluation, CandidateState::Pending)
+                .await?;
+            self.repository
+                .confirm_candidate(
+                    episode_id,
+                    &bvid,
+                    "manual_url_confirmation",
+                    &self.config.notification.channel,
+                    true,
+                )
+                .await?;
+        } else {
+            self.repository
+                .upsert_episode_video(
+                    anime_id,
+                    episode_id,
+                    replace_video_id,
+                    &candidate,
+                    i64::from(evaluation.score),
+                )
+                .await?;
+        }
         Ok(bvid)
     }
 
@@ -848,7 +894,190 @@ fn valid_bvid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::{
+        domain::Episode,
+        provider::{ProviderError, ProviderResult, SearchQuery},
+    };
+
+    struct ImportProvider {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl VideoSearchProvider for ImportProvider {
+        async fn search(&self, _: &SearchQuery) -> ProviderResult<Vec<VideoCandidate>> {
+            panic!("manual video import should not perform a search");
+        }
+
+        async fn enrich(&self, seed: &VideoCandidate) -> ProviderResult<VideoCandidate> {
+            if self.fail {
+                return Err(ProviderError::Temporary(
+                    "video metadata unavailable".into(),
+                ));
+            }
+            let mut candidate = seed.clone();
+            // Obscure titles are accepted by the user's explicit episode choice.
+            candidate.title = "终章".into();
+            candidate.uploader_mid = 100;
+            candidate.uploader_name = "test uploader".into();
+            candidate.duration_sec = 1_500;
+            candidate.page_count = Some(1);
+            candidate.uploader_follower_count = Some(1_000);
+            candidate.enriched = true;
+            Ok(candidate)
+        }
+    }
+
+    async fn video_import_fixture(
+        episode_no: i64,
+    ) -> (TempDir, Repository, ApplicationService, i64, Episode) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("video-import.db");
+        let repository = Repository::connect(path.to_str().unwrap()).await.unwrap();
+        let anime_id = repository
+            .add_anime(NewAnime {
+                title: "克雷瓦提斯 第二季".into(),
+                aliases: Vec::new(),
+                next_episode: episode_no,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1_200,
+                duration_max_sec: 2_400,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 1,
+                    anilist_media_id: None,
+                    anime_schedule_route: None,
+                    total_episodes: Some(13),
+                    broadcast_pattern: "R/2026-09-30T12:00:00Z/P7D".into(),
+                    schedule_source: "danime".into(),
+                    schedule_confidence: "estimated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        let application =
+            ApplicationService::new(repository.clone(), Arc::new(AppConfig::default()));
+        (directory, repository, application, anime_id, episode)
+    }
+
+    #[tokio::test]
+    async fn manual_finale_import_can_be_watched_and_archived_without_creating_ep14() {
+        let (_directory, repository, application, anime_id, episode) =
+            video_import_fixture(13).await;
+        let provider = ImportProvider { fail: false };
+        let url = "https://www.bilibili.com/video/BV1Vbao6aEHb";
+        for _ in 0..2 {
+            let prepared = repository.ensure_video_episode(anime_id, 13).await.unwrap();
+            assert_eq!(prepared.id, episode.id);
+            application
+                .import_episode_video_with_provider(anime_id, episode.id, None, url, &provider)
+                .await
+                .unwrap();
+        }
+        let imported = repository.episode(episode.id).await.unwrap();
+        assert_eq!(imported.state, "confirmed");
+        assert!(imported.watched_at.is_none());
+        let videos = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].episode_no, 13);
+        assert_eq!(videos[0].bvid, "BV1Vbao6aEHb");
+        assert!(videos[0].is_preferred);
+        assert_eq!(repository.pending_notifications().await.unwrap().len(), 1);
+        let queue = repository.watch_queue(50).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].episode_id, episode.id);
+        assert!(repository.active_episode(anime_id).await.is_err());
+        assert!(repository.ensure_video_episode(anime_id, 14).await.is_err());
+
+        let watched = repository.mark_episode_watched(episode.id).await.unwrap();
+        assert!(watched.auto_archive.is_some());
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .lifecycle,
+            "archived"
+        );
+        assert!(repository.watch_queue(50).await.unwrap().is_empty());
+        assert!(repository.ensure_video_episode(anime_id, 13).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_current_video_import_leaves_monitoring_and_watch_state_unchanged() {
+        let (_directory, repository, application, anime_id, episode) =
+            video_import_fixture(13).await;
+        repository.ensure_video_episode(anime_id, 13).await.unwrap();
+        assert!(
+            application
+                .import_episode_video_with_provider(
+                    anime_id,
+                    episode.id,
+                    None,
+                    "https://www.bilibili.com/video/BV1Vbao6aEHb",
+                    &ImportProvider { fail: true },
+                )
+                .await
+                .is_err()
+        );
+        let current = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(current.id, episode.id);
+        assert_eq!(current.state, episode.state);
+        assert!(current.confirmed_at.is_none());
+        assert!(current.watched_at.is_none());
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        assert!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repository.watch_queue(50).await.unwrap().is_empty());
+        assert!(repository.mark_episode_watched(episode.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retrying_previous_episode_video_import_does_not_confirm_the_next_episode() {
+        let (_directory, repository, application, anime_id, episode) =
+            video_import_fixture(12).await;
+        let provider = ImportProvider { fail: false };
+        let url = "https://www.bilibili.com/video/BV1Vbao6aEHb";
+        application
+            .import_episode_video_with_provider(anime_id, episode.id, None, url, &provider)
+            .await
+            .unwrap();
+        let notification = repository.pending_notifications().await.unwrap().remove(0);
+        repository
+            .mark_notification_sent(notification.id)
+            .await
+            .unwrap();
+        let next = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(next.episode_no, 13);
+
+        application
+            .import_episode_video_with_provider(anime_id, episode.id, None, url, &provider)
+            .await
+            .unwrap();
+        let current = repository.active_episode(anime_id).await.unwrap();
+        assert_eq!(current.id, next.id);
+        assert!(current.confirmed_at.is_none());
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        let videos = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].episode_no, 12);
+    }
 
     #[test]
     fn parses_only_canonical_bilibili_video_inputs() {
