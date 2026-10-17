@@ -268,7 +268,12 @@ async fn main() {
 
 async fn execute(cli: Cli) -> Result<()> {
     let config = Arc::new(AppConfig::load(&cli.config)?);
-    let repository = Repository::connect(&config.database.path).await?;
+    let repository = Repository::connect(&config.database.path)
+        .await?
+        .with_schedule_polling(
+            config.polling.far_interval_secs,
+            config.schedule.max_stream_offset_days,
+        );
     let application = ApplicationService::new(repository.clone(), config.clone());
     match cli.command {
         Command::Anime { command } => {

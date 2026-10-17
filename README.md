@@ -48,9 +48,13 @@ anipulse anime add \
   --duration-max 28m
 ```
 
-如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，并用 Bangumi 章节日期校准当前集；也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
+如果同名条目对应多季或重制版，命令会拒绝静默选择并列出候选 ID；重新执行时添加 `--bangumi-id 506677`。自动排期每天重新读取 `bangumi-data`，它的周时段与 Bangumi 章节日期组合只作为估算；配置 AnimeSchedule 访问后，即使目录已有 d Anime、ABEMA 或动画疯时段，也会继续核对同一集的逐集时间。原声/字幕排期中取已确认的最早时间，不采用配音排期，也不会用电视章节日期覆盖逐集网络时间。也可执行 `anipulse anime sync 1` 立即同步。手工 `--weekday/--time` 仍然可用，但与 `--auto-schedule` 互斥。
 
-未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule，并保存其 route。匹配器会分别核对“第几季”和“第几部分”，支持 `第2期/第二季/Season 2` 以及 `第2クール/第2部分/Part 2/Cour 2` 等写法，不会把 `Season 2 Part 1` 混成同一个编号。为兼容网络平台先行上线与电视首播日期不同，标题、季度和类型吻合时允许两边日期在 `max_stream_offset_days`（默认 14 天）内偏移，并把该偏移应用到后续单集日期；跨年等超过阈值的冲突仍会拒绝。已有 AniList Media ID 时可用 `--anilist-id ID` 作为 AnimeSchedule 的精确检索键，但程序不会请求 AniList API；匹配仍不唯一时，核对 AnimeSchedule 页面地址后加 `--anime-schedule-route ROUTE`。AnimeSchedule 尚未公布精确时刻、但 Bangumi 已有开播日期时，系统会保存“仅日期”排期并从当天开始检查；日期也没有时才需要暂用手工排期。作品后来进入 `bangumi-data`、但目录仍只有电视默认时段而没有可用的受信网络时段时，已绑定的 AnimeSchedule route 会继续生效；等目录补齐 d Anime、ABEMA 或动画疯等平台时段后才自动切回。
+未上映作品可能已经存在于 Bangumi、但尚未进入 `bangumi-data`。此时填写 `--bangumi-id` 后，AniPulse 会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule，并保存其 route。匹配器会分别核对“第几季”和“第几部分”，支持 `第2期/第二季/Season 2` 以及 `第2クール/第2部分/Part 2/Cour 2` 等写法，不会把 `Season 2 Part 1` 混成同一个编号。为兼容网络平台先行上线与电视首播日期不同，标题、季度和类型吻合时允许两边日期在 `max_stream_offset_days`（默认 14 天）内偏移；跨年等超过阈值的冲突仍会拒绝。已有 AniList Media ID 时可用 `--anilist-id ID` 作为 AnimeSchedule 的精确检索键，但程序不会请求 AniList API；匹配仍不唯一时，核对 AnimeSchedule 页面地址后加 `--anime-schedule-route ROUTE`。AnimeSchedule 尚未公布精确时刻、但 Bangumi 已有开播日期时，系统会保存“仅日期”排期；日期也没有时才需要暂用手工排期。作品进入目录后，逐集排期仍优先于周时段估算，不再自动切回较慢的电视日期。
+
+逐集查询检查估算时间前后 `max_stream_offset_days` 覆盖的 ISO 周和当前周，并缓存全局周表（成功 15 分钟、失败 1 分钟）。连播范围内的各集共用上线时间；后续可按已确认的集数锚点推算，但仍标为“估算”，精确调档时间会覆盖推算值。延期且没有新时间时隐藏预计时刻，继续检测；上游异常或暂未重新列出本集时保留本集上次确认时间并标为“保留上次校准值”。进入下一集时重置确认状态，避免继承上一集的精确标记。
+
+自动排期临近开播时也按 `polling.far_interval_secs`（默认 6 小时）低频检测，不会因预计时间在未来就完全停止 B 站搜索；距离开播仍很远的条目等进入提前检查窗口再开始，沿用请求预算与防伪规则。同步排期不会推迟已经安排好的更早检查。
 
 如果站内使用的集数与 Bangumi 条目编号不同，可以提供一组起点映射。例如站内 EP12 对应 Bangumi EP78：
 

@@ -47,11 +47,11 @@ request_timeout_secs = 15
 review_grace_secs = 3600
 
 [schedule]
-# 自动排期使用 bangumi-data 的精确 broadcast，并用 Bangumi 章节日期校准停播/调档。
+# bangumi-data 首播/周时段 + Bangumi 章节日期仅作估算；优先核对 AnimeSchedule 同一集的逐集时间。
 # 国内服务器可按 doc/cloudflare-worker.md 改成自己的 Worker 地址。
 bangumi_data_url = "https://unpkg.com/bangumi-data@0.3/dist/data.json"
 bangumi_api_base_url = "https://api.bgm.tv"
-# 未进入 bangumi-data 的作品会查询 AnimeSchedule。直连时还需在环境文件中
+# 已收录和未收录的作品都可查询 AnimeSchedule。直连时还需在环境文件中
 # 设置 ANIME_SCHEDULE_TOKEN；经 Worker 时令牌只需保存在 Worker Secret 中。
 anime_schedule_api_url = "https://animeschedule.net/api/v3"
 # 这里只选择 bangumi-data 里的排期元数据，服务器不会访问这些平台的网站。
@@ -62,6 +62,8 @@ stream_site_priority = ["danime", "abema", "gamer", "gamer_hk"]
 # 即使旧配置仍在上面的优先列表中写了 U-NEXT，也会先被这里排除。
 excluded_stream_sites = ["unext"]
 # 网络先行/延后可能跨日或跨周；默认最多接受与 Bangumi 首集日期相差 14 天。
+# 逐集查询也检查这个窗口内的相邻周和当前周；原声/字幕时间参与比较，配音排期不参与。
+# 预计开播前此窗口内按 polling.far_interval_secs 低频检查，避免错误的未来时间挡住 B 站检测。
 max_stream_offset_days = 14
 # 默认目录时间不是明确网络来源，只允许很小的日期偏差，避免生成错误的精确时间。
 max_catalog_offset_days = 1

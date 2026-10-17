@@ -48,6 +48,12 @@ test("only exposes the exact AniPulse upstream routes", () => {
     "https://animeschedule.net/api/v3/timetables/raw?year=2026&week=43&tz=UTC",
   );
   assert.equal(resolveRoute(new URL(
+    "https://proxy.example.com/anime-schedule/timetables/all?year=2026&week=41&tz=UTC",
+  )).upstreamUrl, "https://animeschedule.net/api/v3/timetables/all?year=2026&week=41&tz=UTC");
+  for (const path of ["all?year=2026&week=41&tz=UTC&url=https://evil.test", "dub?year=2026&week=41&tz=UTC", "all?year=2026&week=0&tz=UTC"]) {
+    assert.equal(resolveRoute(new URL(`https://proxy.example.com/anime-schedule/timetables/${path}`)), null);
+  }
+  assert.equal(resolveRoute(new URL(
     "https://proxy.example.com/anime-schedule/anime?q=test&evil=https://example.com",
   )), null);
 });

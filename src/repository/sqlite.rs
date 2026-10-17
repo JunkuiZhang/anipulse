@@ -21,6 +21,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
+    schedule_probe_interval_secs: i64,
+    schedule_probe_lead_days: i64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -312,7 +314,36 @@ impl Repository {
             .run(&pool)
             .await
             .map_err(|error| sqlx::Error::Migrate(Box::new(error)))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            schedule_probe_interval_secs: 21_600,
+            schedule_probe_lead_days: 14,
+        })
+    }
+
+    pub fn with_schedule_polling(mut self, far_interval_secs: u64, lead_days: i64) -> Self {
+        self.schedule_probe_interval_secs = far_interval_secs.clamp(60, 86_400) as i64;
+        self.schedule_probe_lead_days = lead_days.clamp(0, 31);
+        self
+    }
+
+    fn schedule_check_at(
+        &self,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        automatic: bool,
+    ) -> DateTime<Utc> {
+        let Some(expected) = expected.filter(|time| *time > now) else {
+            return now;
+        };
+        if !automatic {
+            return expected;
+        }
+        let probe_start = expected - chrono::Duration::days(self.schedule_probe_lead_days);
+        if probe_start > now {
+            return probe_start;
+        }
+        expected.min(now + chrono::Duration::seconds(self.schedule_probe_interval_secs))
     }
 
     pub async fn migrate(path: &str) -> Result<()> {
@@ -433,10 +464,7 @@ impl Repository {
             .await?;
         }
 
-        let initial_check_at = new
-            .expected_at
-            .filter(|expected_at| *expected_at > now)
-            .unwrap_or(now);
+        let initial_check_at = self.schedule_check_at(new.expected_at, now, auto_schedule);
         sqlx::query(
             r#"INSERT INTO episode(
                 anime_id, episode_no, expected_at, state, next_check_at
@@ -1804,12 +1832,9 @@ impl Repository {
             }
         }
 
-        let next_check_at = update
-            .expected_at
-            .filter(|expected_at| *expected_at > now)
-            .unwrap_or(now);
+        let next_check_at = self.schedule_check_at(update.expected_at, now, true);
         sqlx::query(
-            r#"UPDATE episode SET expected_at = ?, next_check_at = ?
+            r#"UPDATE episode SET expected_at = ?, next_check_at = MIN(next_check_at, ?)
                WHERE anime_id = ? AND state IN
                    ('waiting','watching','candidate_found','needs_manual_review')"#,
         )
@@ -3036,7 +3061,7 @@ impl Repository {
                 .expected_at
                 .and_then(|at| at.checked_add_days(Days::new(7)));
             let next_check = now + chrono::Duration::hours(6);
-            sqlx::query(
+            let inserted = sqlx::query(
                 r#"INSERT OR IGNORE INTO episode(
                        anime_id, episode_no, expected_at, state, next_check_at
                    ) SELECT ?, ?, ?, 'waiting', ?
@@ -3061,6 +3086,17 @@ impl Repository {
             .bind(episode.episode_no)
             .execute(&mut *tx)
             .await?;
+            if inserted.rows_affected() > 0 {
+                // The previous episode's verified timestamp is not proof about
+                // the new episode. A +7d placeholder must not be kept as exact
+                // when the following synchronization has an upstream outage.
+                sqlx::query(
+                    "UPDATE anime SET schedule_confidence = 'estimated', schedule_warning = '新一集暂按上一集加一周估算，等待逐集同步。' WHERE id = ? AND auto_schedule = 1",
+                )
+                .bind(episode.anime_id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         sqlx::query(
             "UPDATE candidate SET state = 'expired' WHERE episode_id = ? AND state = 'pending'",
@@ -4217,6 +4253,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_schedule_probes_early_without_searching_months_before_premiere() {
+        let repository = Repository::connect(":memory:")
+            .await
+            .unwrap()
+            .with_schedule_polling(5_400, 14);
+        let now = Utc::now();
+        let next_week = now + chrono::Duration::days(7);
+        assert_eq!(
+            repository.schedule_check_at(Some(next_week), now, true),
+            now + chrono::Duration::minutes(90)
+        );
+        assert_eq!(
+            repository.schedule_check_at(Some(next_week), now, false),
+            next_week
+        );
+        let distant = now + chrono::Duration::days(60);
+        assert_eq!(
+            repository.schedule_check_at(Some(distant), now, true),
+            distant - chrono::Duration::days(14)
+        );
+        assert_eq!(repository.schedule_check_at(None, now, true), now);
+    }
+
+    #[tokio::test]
+    async fn advancing_an_episode_does_not_inherit_previous_episodes_exact_confidence() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        sqlx::query("UPDATE anime SET auto_schedule = 1, schedule_confidence = 'calibrated', schedule_source = 'anime_schedule' WHERE id = ?")
+            .bind(anime_id).execute(&repository.pool).await.unwrap();
+        let (video, evaluation) = candidate();
+        repository
+            .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+            .await
+            .unwrap();
+        repository
+            .confirm_candidate(episode.id, &video.bvid, "manual", "default", true)
+            .await
+            .unwrap();
+        let notification = repository.pending_notifications().await.unwrap()[0].id;
+        repository
+            .mark_notification_sent(notification)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .active_episode(anime_id)
+                .await
+                .unwrap()
+                .episode_no,
+            episode.episode_no + 1
+        );
+        assert_eq!(
+            repository
+                .get_anime(anime_id)
+                .await
+                .unwrap()
+                .anime
+                .schedule_confidence
+                .as_deref(),
+            Some("estimated")
+        );
+    }
+
+    #[tokio::test]
     async fn date_only_schedule_confidence_is_persisted() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("date-only-schedule.db");
@@ -5232,6 +5331,12 @@ mod tests {
             .await
             .unwrap();
         let updated_expected = Utc::now() + chrono::Duration::days(2);
+        let earlier_check = Utc::now() + chrono::Duration::minutes(20);
+        let active_id = repository.active_episode(anime_id).await.unwrap().id;
+        repository
+            .reschedule_episode(active_id, earlier_check)
+            .await
+            .unwrap();
         repository
             .apply_schedule_update(
                 anime_id,
@@ -5274,7 +5379,12 @@ mod tests {
         assert!(anime.aliases.iter().any(|alias| alias == "沉默魔女"));
         let episode = repository.active_episode(anime_id).await.unwrap();
         assert_eq!(episode.expected_at, Some(updated_expected));
-        assert_eq!(episode.next_check_at, updated_expected);
+        assert!(episode.next_check_at <= Utc::now() + chrono::Duration::hours(6));
+        assert!(episode.next_check_at < updated_expected);
+        assert_eq!(
+            episode.next_check_at, earlier_check,
+            "sync must not postpone an earlier check"
+        );
 
         repository
             .apply_schedule_update(

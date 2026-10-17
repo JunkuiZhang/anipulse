@@ -3792,7 +3792,7 @@ fn schedule_source_label(source: &str) -> String {
 
 fn schedule_confidence_label(confidence: &str) -> String {
     match confidence {
-        "calibrated" => "章节日期 + 网络时段校准".into(),
+        "calibrated" => "逐集时间已确认".into(),
         "stale" => "保留上次校准值".into(),
         "estimated" => "估算".into(),
         "date_only" => "仅开播日期，时间待公布".into(),

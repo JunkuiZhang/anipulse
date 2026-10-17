@@ -1,6 +1,6 @@
 # 使用 Cloudflare Worker 转发排期元数据
 
-这个方案不替换 AniPulse 的排期来源：常规排期仍然来自 `bangumi-data`，章节日期、条目元数据和封面来自 Bangumi。尚未进入 `bangumi-data` 的未上映作品，会用 Bangumi 的多语言标题、首播日期和类型匹配 AnimeSchedule 的首播及周排期；上游只有开播日期时则保存为“时间待公布”的日期级排期。变化只是让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
+`bangumi-data` 提供首播/周时段估算，章节日期、条目元数据和封面来自 Bangumi。已收录和未上映作品都可用 Bangumi 的多语言标题、季度、首播日期和类型匹配 AnimeSchedule 的逐集排期；精确逐集时间优先于目录估算，上游只有开播日期时保存为“时间待公布”的日期级排期。Worker 让阿里云服务器访问你自己的 Cloudflare 子域名，再由 Worker 请求境外上游。
 
 新版 AniPulse 还会从 `bangumi-data` 的 `sites[].begin/broadcast` 选择 d Anime、ABEMA 或动画疯等网络时段，并默认排除不可靠的 U-NEXT 排期。这些内容已经包含在 `/data.json` 里；ECS 和 Worker 都**不会访问这些平台的网站**，也不需要为它们新增代理路由。
 
@@ -304,7 +304,7 @@ Worker 使用以下边缘缓存时间：
 
 ### 更新 Worker
 
-本次升级移除了 AniList GraphQL 转发，新增 AnimeSchedule 的三个固定只读路由。升级 AniPulse 二进制前，必须先添加 `ANIME_SCHEDULE_TOKEN` Secret，再把新版 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 完整粘贴到网页编辑器并 Deploy；旧 Worker 会令新功能返回 404。
+本次逐集排期修复新增 `/anime-schedule/timetables/all?year=2026&week=41&tz=UTC` 固定只读路由，同时保留旧版 `/timetables/raw`。`all` 用于比较同一集的原声和字幕上线时间，程序忽略配音条目；相邻周查询仍只允许 `year/week/tz` 参数，不开放任意转发地址。升级 AniPulse 二进制前，先保留/添加现有 `ANIME_SCHEDULE_TOKEN` Secret，再把新版 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 完整粘贴到网页编辑器并 Deploy；只支持 `raw` 的旧 Worker 会让逐集核对失败并回退估算。
 
 以后仓库中的 [`deploy/cloudflare-worker/src/index.js`](../deploy/cloudflare-worker/src/index.js) 有更新时，可完全通过网页升级：
 

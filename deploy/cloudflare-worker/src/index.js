@@ -225,9 +225,9 @@ export function resolveRoute(url) {
     };
   }
 
-  if (url.pathname === "/anime-schedule/timetables/raw"
+  if (["/anime-schedule/timetables/raw", "/anime-schedule/timetables/all"].includes(url.pathname)
     && validAnimeScheduleTimetable(url.searchParams)) {
-    const upstream = new URL("/api/v3/timetables/raw", ANIME_SCHEDULE_API_ORIGIN);
+    const upstream = new URL(`/api/v3/timetables/${url.pathname.endsWith("/all") ? "all" : "raw"}`, ANIME_SCHEDULE_API_ORIGIN);
     upstream.search = url.search;
     return {
       ...ROUTES.animeScheduleTimetable,

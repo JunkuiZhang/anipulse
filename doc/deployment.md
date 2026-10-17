@@ -438,6 +438,10 @@ SQLite migration 会在启动时自动执行。本次升级会保留追番、候
 
 如需立即核对单个条目，可执行：
 
+逐集排期修复需要先更新 Worker，使其支持 `/anime-schedule/timetables/all`（见 `cloudflare-worker.md`），再按上面的停止双服务、备份、替换 musl 二进制流程升级。已有 token 和代理 URL 无需更换。网页点击该番的“同步排期”即可重算当前集；不需要删除重加，也不会改动已观看进度。远程上传时先比较本地和服务器暂存文件的 `sha256sum`，一致后再安装，避免传输不完整导致段错误。
+
+Bangumi 章节接口超时或返回错误时，不再阻断 AnimeSchedule 的独立逐集查询；作品、季度及集数映射仍须通过原有校验。若 AnimeSchedule 已确认该集时刻，就继续采用这个精确时间，并单独记录 Bangumi 告警。降级期间使用 `failure_retry_secs` 较短间隔重试，不会把接口失败误标为 AnimeSchedule 故障或等待一整天才再次同步。
+
 ```bash
 sudo -u anipulse /usr/local/bin/anipulse \
   --config /etc/anipulse/config.toml anime sync ANIME_ID
