@@ -8,7 +8,9 @@ use crate::domain::AnimeMatch;
 static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid regex"));
 
 pub fn normalize_title(title: &str) -> String {
-    let without_tags = HTML_TAG.replace_all(title, " ");
+    // Search highlighting is inline markup, not a word boundary. Inserting
+    // spaces here splits Chinese aliases (and highlighted Latin words).
+    let without_tags = HTML_TAG.replace_all(title, "");
     let decoded = without_tags
         .replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -124,5 +126,13 @@ mod tests {
             match_anime("Silent Witcher EP08", &aliases),
             AnimeMatch::None
         );
+    }
+
+    #[test]
+    fn search_highlighting_does_not_split_contiguous_anime_aliases() {
+        let aliases = vec!["一觉醒来就坐拥有了最强神装备和太空飞船".into()];
+        let title = "『第3话 <em class=\"keyword\">一觉醒来</em>就<em class=\"keyword\">坐拥</em>有了最强神装备和太空<em class=\"keyword\">飞船</em> 我决定以买一套自家独门独栋独户房子建筑为目标当作为佣兵自由地过活下去』";
+        assert_eq!(match_anime(title, &aliases), AnimeMatch::Strong);
+        assert_eq!(normalize_title("Si<em>lent</em> Witch"), "silent witch");
     }
 }

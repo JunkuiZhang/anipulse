@@ -18,6 +18,14 @@ use crate::{
     error::{AppError, Result},
 };
 
+enum CandidateConfirmationIntent<'a> {
+    Review {
+        reason: &'a str,
+        user_confirmed: bool,
+    },
+    ExplicitUrl,
+}
+
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
@@ -2544,6 +2552,47 @@ impl Repository {
         channel: &str,
         user_confirmed: bool,
     ) -> Result<()> {
+        self.confirm_candidate_with_intent(
+            episode_id,
+            bvid,
+            channel,
+            CandidateConfirmationIntent::Review {
+                reason,
+                user_confirmed,
+            },
+        )
+        .await
+    }
+
+    pub async fn confirm_candidate_from_url(
+        &self,
+        episode_id: i64,
+        bvid: &str,
+        channel: &str,
+    ) -> Result<()> {
+        self.confirm_candidate_with_intent(
+            episode_id,
+            bvid,
+            channel,
+            CandidateConfirmationIntent::ExplicitUrl,
+        )
+        .await
+    }
+
+    async fn confirm_candidate_with_intent(
+        &self,
+        episode_id: i64,
+        bvid: &str,
+        channel: &str,
+        intent: CandidateConfirmationIntent<'_>,
+    ) -> Result<()> {
+        let (reason, user_confirmed, explicit_url) = match intent {
+            CandidateConfirmationIntent::Review {
+                reason,
+                user_confirmed,
+            } => (reason, user_confirmed, false),
+            CandidateConfirmationIntent::ExplicitUrl => ("manual_url_confirmation", true, true),
+        };
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let (candidate_id, previous_state, anime_id, episode_state) =
@@ -2562,7 +2611,11 @@ impl Repository {
         {
             return Ok(());
         }
-        if previous_state != CandidateState::Pending.to_string() {
+        // An explicit URL is a new user decision about this exact episode and
+        // video. Automatic scans and stale review forms cannot reopen a prior
+        // rejection; current-episode validation below still applies to both.
+        let can_reopen = explicit_url && matches!(previous_state.as_str(), "rejected" | "expired");
+        if previous_state != CandidateState::Pending.to_string() && !can_reopen {
             return Err(AppError::InvalidInput(
                 "candidate is no longer pending; refresh the review page".into(),
             ));
@@ -4566,6 +4619,98 @@ mod tests {
         assert_eq!(videos.len(), 1);
         assert_eq!(videos[0].bvid, candidate.bvid);
         assert!(videos[0].is_preferred);
+    }
+
+    #[tokio::test]
+    async fn only_explicit_url_confirmation_can_override_rejected_or_expired_candidates() {
+        for old_state in [CandidateState::Rejected, CandidateState::Expired] {
+            let (_directory, repository, anime_id, episode) = fixture().await;
+            let (candidate, evaluation) = candidate();
+            repository
+                .upsert_candidate(episode.id, &candidate, &evaluation, old_state)
+                .await
+                .unwrap();
+            // Even a misleading reason string cannot turn a stale review into
+            // an explicit URL submission.
+            assert!(
+                repository
+                    .confirm_candidate(
+                        episode.id,
+                        &candidate.bvid,
+                        "manual_url_confirmation",
+                        "default",
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                repository
+                    .confirm_candidate(episode.id, &candidate.bvid, "consensus", "default", false)
+                    .await
+                    .is_err()
+            );
+            for _ in 0..2 {
+                repository
+                    .confirm_candidate_from_url(episode.id, &candidate.bvid, "default")
+                    .await
+                    .unwrap();
+            }
+            let stored = repository.episode(episode.id).await.unwrap();
+            assert_eq!(stored.state, "confirmed");
+            assert!(stored.watched_at.is_none());
+            assert_eq!(repository.pending_notifications().await.unwrap().len(), 1);
+            assert_eq!(
+                repository
+                    .list_episode_videos(anime_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                repository
+                    .uploader_trust(anime_id, candidate.uploader_mid)
+                    .await
+                    .unwrap()
+                    .confirmed_count,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_url_cannot_reopen_a_completed_episode() {
+        let (_directory, repository, anime_id, episode) = fixture().await;
+        let (candidate, evaluation) = candidate();
+        repository
+            .upsert_candidate(
+                episode.id,
+                &candidate,
+                &evaluation,
+                CandidateState::Rejected,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE episode SET state = 'notified' WHERE id = ?")
+            .bind(episode.id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .confirm_candidate_from_url(episode.id, &candidate.bvid, "default")
+                .await
+                .is_err()
+        );
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        assert!(
+            repository
+                .list_episode_videos(anime_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

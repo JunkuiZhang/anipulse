@@ -396,13 +396,7 @@ impl ApplicationService {
             .import_bilibili_url_for_episode(anime_id, episode.id, input)
             .await?;
         self.repository
-            .confirm_candidate(
-                episode.id,
-                &bvid,
-                "manual_url_confirmation",
-                &self.config.notification.channel,
-                true,
-            )
+            .confirm_candidate_from_url(episode.id, &bvid, &self.config.notification.channel)
             .await?;
         Ok(bvid)
     }
@@ -569,13 +563,7 @@ impl ApplicationService {
                 .upsert_candidate(episode_id, &candidate, &evaluation, CandidateState::Pending)
                 .await?;
             self.repository
-                .confirm_candidate(
-                    episode_id,
-                    &bvid,
-                    "manual_url_confirmation",
-                    &self.config.notification.channel,
-                    true,
-                )
+                .confirm_candidate_from_url(episode_id, &bvid, &self.config.notification.channel)
                 .await?;
         } else {
             self.repository
@@ -968,6 +956,68 @@ mod tests {
         let application =
             ApplicationService::new(repository.clone(), Arc::new(AppConfig::default()));
         (directory, repository, application, anime_id, episode)
+    }
+
+    #[tokio::test]
+    async fn manual_episode_import_overrides_an_earlier_automatic_rejection() {
+        let (_directory, repository, application, anime_id, episode) =
+            video_import_fixture(3).await;
+        let seed = VideoCandidate {
+            bvid: "BV16En36HE4w".into(),
+            title: "unmatched title".into(),
+            description: None,
+            uploader_mid: 100,
+            uploader_name: "test uploader".into(),
+            duration_sec: 1500,
+            published_at: Utc::now(),
+            url: "https://www.bilibili.com/video/BV16En36HE4w".into(),
+            tags: vec![],
+            page_count: Some(1),
+            view_count: None,
+            reply_count: None,
+            uploader_follower_count: Some(1000),
+            discovered_at: Utc::now(),
+            enriched: true,
+        };
+        let anime = repository.get_anime(anime_id).await.unwrap();
+        let evaluation = evaluator::evaluate(
+            &anime,
+            &episode,
+            &seed,
+            &Default::default(),
+            &AppConfig::default().confirmation,
+            &[],
+        );
+        assert!(evaluation.hard_reject);
+        repository
+            .upsert_candidate(episode.id, &seed, &evaluation, CandidateState::Rejected)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            application
+                .import_episode_video_with_provider(
+                    anime_id,
+                    episode.id,
+                    None,
+                    &seed.url,
+                    &ImportProvider { fail: false },
+                )
+                .await
+                .unwrap();
+        }
+        let videos = repository.list_episode_videos(anime_id).await.unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].episode_no, 3);
+        assert_eq!(videos[0].bvid, seed.bvid);
+        assert!(
+            repository
+                .episode(episode.id)
+                .await
+                .unwrap()
+                .watched_at
+                .is_none()
+        );
+        assert_eq!(repository.pending_notifications().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
