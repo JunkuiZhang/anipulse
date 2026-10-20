@@ -616,6 +616,7 @@ mod tests {
         let anime = crate::domain::AnimeWithAliases {
             anime: crate::domain::Anime {
                 id: 1,
+                tracking_start_episode: 1,
                 title: "尼古喵喵".into(),
                 bangumi_subject_id: None,
                 anilist_media_id: None,

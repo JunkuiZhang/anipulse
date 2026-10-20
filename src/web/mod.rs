@@ -555,6 +555,7 @@ struct BatchProgressView {
     found: i64,
     watched: i64,
     time: String,
+    label: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -656,6 +657,7 @@ async fn dashboard(
                 || p.found > p.watched
         })
         .map(|p| BatchProgressView {
+            label: p.label(),
             anime_id: p.anime_id,
             title: p.title,
             total: p.total,
@@ -1588,8 +1590,14 @@ async fn anime_detail(
         .find(|p| p.anime_id == id)
         .map(|p| {
             format!(
-                "批量放送 · 官方已上线 {}/{} · 已找到资源 {}/{} · 已观看 {}/{}",
-                p.official, p.total, p.found, p.total, p.watched, p.total
+                "{} · 官方已上线 {}/{} · 已找到资源 {}/{} · 已观看 {}/{}",
+                p.label(),
+                p.official,
+                p.total,
+                p.found,
+                p.total,
+                p.watched,
+                p.total
             )
         })
         .unwrap_or_default();

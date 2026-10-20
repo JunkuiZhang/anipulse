@@ -307,6 +307,7 @@ mod tests {
             AnimeWithAliases {
                 anime: Anime {
                     id: 1,
+                    tracking_start_episode: 1,
                     title: "Silent Witch".into(),
                     bangumi_subject_id: None,
                     anilist_media_id: None,

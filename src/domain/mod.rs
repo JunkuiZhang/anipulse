@@ -30,6 +30,7 @@ macro_rules! string_enum {
 #[derive(Debug, Clone, FromRow)]
 pub struct Anime {
     pub id: i64,
+    pub tracking_start_episode: i64,
     pub title: String,
     pub bangumi_subject_id: Option<i64>,
     pub anilist_media_id: Option<i64>,

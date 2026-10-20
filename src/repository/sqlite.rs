@@ -429,8 +429,8 @@ impl Repository {
                 duration_min_sec, duration_max_sec, enabled, created_at, updated_at,
                 auto_schedule, broadcast_pattern, schedule_sync_at, schedule_next_sync_at,
                 schedule_source, schedule_confidence, schedule_warning,
-                local_episode_origin, bangumi_episode_origin, total_episodes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                local_episode_origin, bangumi_episode_origin, total_episodes, tracking_start_episode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new.title.trim())
         .bind(bangumi_subject_id)
@@ -453,6 +453,7 @@ impl Repository {
         .bind(local_episode_origin)
         .bind(bangumi_episode_origin)
         .bind(total_episodes)
+        .bind(new.next_episode)
         .execute(&mut *tx)
         .await?;
         let anime_id = result.last_insert_rowid();
@@ -522,7 +523,7 @@ impl Repository {
                       a.total_episodes, a.schedule_confidence, a.enabled,
                       e.episode_no, e.expected_at
                FROM anime a
-               JOIN episode e ON e.anime_id = a.id
+               JOIN monitorable_episode e ON e.anime_id = a.id
                WHERE a.lifecycle = 'tracking'
                  AND e.state NOT IN ('notified', 'confirmed')
                  AND NOT EXISTS(SELECT 1 FROM release_batch b WHERE b.anime_id=a.id
@@ -1327,6 +1328,7 @@ impl Repository {
         sqlx::query_as::<_, Episode>(
             r#"SELECT * FROM episode
                WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
+                 AND episode_no >= (SELECT tracking_start_episode FROM anime WHERE id=episode.anime_id)
                ORDER BY episode_no LIMIT 1"#,
         )
         .bind(anime_id)
@@ -1341,8 +1343,13 @@ impl Repository {
                 "episode must be between 1 and 10000".into(),
             ));
         }
-        let planned=sqlx::query_as::<_,Episode>("SELECT e.* FROM episode e WHERE e.anime_id=? AND e.episode_no=? AND EXISTS(SELECT 1 FROM release_batch b WHERE b.anime_id=e.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode) AND EXISTS(SELECT 1 FROM anime a WHERE a.id=e.anime_id AND a.lifecycle!='archived')")
-            .bind(anime_id).bind(episode_no).fetch_optional(&self.pool).await?;
+        let planned = sqlx::query_as::<_, Episode>(
+            "SELECT e.* FROM monitorable_episode e WHERE e.anime_id=? AND e.episode_no=?",
+        )
+        .bind(anime_id)
+        .bind(episode_no)
+        .fetch_optional(&self.pool)
+        .await?;
         if let Some(episode) = planned {
             return Ok(episode);
         }
@@ -1367,7 +1374,7 @@ impl Repository {
                 r#"SELECT COALESCE(
                        MIN(CASE WHEN state NOT IN ('notified', 'confirmed') THEN episode_no END),
                        MAX(episode_no)
-                   ) FROM episode WHERE anime_id = ?"#,
+                   ) FROM episode WHERE anime_id = ? AND episode_no >= (SELECT tracking_start_episode FROM anime WHERE id=episode.anime_id)"#,
             )
             .bind(anime_id)
             .fetch_one(&mut *tx)
@@ -1721,10 +1728,11 @@ impl Repository {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE anime SET updated_at = ?, schedule_next_sync_at = CASE WHEN auto_schedule = 1 THEN ? ELSE schedule_next_sync_at END WHERE id = ?",
+            "UPDATE anime SET updated_at = ?, schedule_next_sync_at = CASE WHEN auto_schedule = 1 THEN ? ELSE schedule_next_sync_at END, tracking_start_episode=MIN(tracking_start_episode,?) WHERE id = ?",
         )
         .bind(now)
         .bind(now)
+        .bind(target_episode_no)
         .bind(anime_id)
         .execute(&mut *tx)
         .await?;
@@ -1747,7 +1755,7 @@ impl Repository {
 
     pub async fn due_anime_ids(&self, limit: i64) -> Result<Vec<i64>> {
         Ok(sqlx::query_scalar::<_, i64>(
-            r#"SELECT e.anime_id FROM episode e
+            r#"SELECT e.anime_id FROM monitorable_episode e
                JOIN anime a ON a.id = e.anime_id
                WHERE a.enabled = 1
                  AND a.lifecycle = 'tracking'
@@ -1857,7 +1865,8 @@ impl Repository {
                WHERE anime_id = ? AND state IN
                    ('waiting','watching','candidate_found','needs_manual_review')
                  AND episode_no = (SELECT MIN(episode_no) FROM episode
-                       WHERE anime_id = ? AND state NOT IN ('confirmed','notified'))"#,
+                       WHERE anime_id = ? AND state NOT IN ('confirmed','notified')
+                         AND episode_no >= (SELECT tracking_start_episode FROM anime WHERE id=episode.anime_id))"#,
         )
         .bind(update.expected_at)
         .bind(next_check_at)
@@ -2009,6 +2018,7 @@ impl Repository {
                      ON gut.uploader_mid = c.uploader_mid
                    WHERE c.state = ?
                      AND (? != 'pending' OR e.state NOT IN ('confirmed', 'notified'))
+                     AND (c.state!='pending' OR EXISTS(SELECT 1 FROM monitorable_episode scope WHERE scope.id=e.id))
                    ORDER BY c.last_seen_at DESC"#,
             )
             .bind(state)
@@ -2029,6 +2039,7 @@ impl Repository {
                      ON ut.anime_id = e.anime_id AND ut.uploader_mid = c.uploader_mid
                    LEFT JOIN global_uploader_trust gut
                      ON gut.uploader_mid = c.uploader_mid
+                   WHERE c.state!='pending' OR EXISTS(SELECT 1 FROM monitorable_episode scope WHERE scope.id=e.id)
                    ORDER BY c.last_seen_at DESC"#,
             )
             .fetch_all(&self.pool)
@@ -2639,17 +2650,14 @@ impl Repository {
                 "candidate belongs to an episode that is already complete".into(),
             ));
         }
-        let current_episode_id = sqlx::query_scalar::<_, i64>(
-            r#"SELECT id FROM episode
-               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
-               ORDER BY episode_no LIMIT 1"#,
+        let monitorable: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM monitorable_episode WHERE anime_id=? AND id=?)",
         )
         .bind(anime_id)
-        .fetch_optional(&mut *tx)
+        .bind(episode_id)
+        .fetch_one(&mut *tx)
         .await?;
-        let batch_target: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch b JOIN episode e ON e.anime_id=b.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode WHERE e.id=?)")
-            .bind(episode_id).fetch_one(&mut *tx).await?;
-        if current_episode_id != Some(episode_id) && !batch_target {
+        if !monitorable {
             return Err(AppError::InvalidInput(
                 "candidate no longer belongs to the current episode; refresh the review page"
                     .into(),
@@ -2761,17 +2769,14 @@ impl Repository {
                 "candidate belongs to an episode that is already complete".into(),
             ));
         }
-        let current_episode_id = sqlx::query_scalar::<_, i64>(
-            r#"SELECT id FROM episode
-               WHERE anime_id = ? AND state NOT IN ('notified', 'confirmed')
-               ORDER BY episode_no LIMIT 1"#,
+        let monitorable: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM monitorable_episode WHERE anime_id=? AND id=?)",
         )
         .bind(anime_id)
-        .fetch_optional(&mut *tx)
+        .bind(episode_id)
+        .fetch_one(&mut *tx)
         .await?;
-        let batch_target: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch b JOIN episode e ON e.anime_id=b.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode WHERE e.id=?)")
-            .bind(episode_id).fetch_one(&mut *tx).await?;
-        if current_episode_id != Some(episode_id) && !batch_target {
+        if !monitorable {
             return Err(AppError::InvalidInput(
                 "candidate no longer belongs to the current episode; refresh the review page"
                     .into(),
@@ -2801,6 +2806,16 @@ impl Repository {
 
     pub async fn reject_all_candidates(&self, episode_id: i64, user_rejected: bool) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
+        let monitorable: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM monitorable_episode WHERE id=?)")
+                .bind(episode_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !monitorable {
+            return Err(AppError::InvalidInput(
+                "episode is outside the current monitoring scope".into(),
+            ));
+        }
         let candidate_ids = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY id",
         )
@@ -2845,6 +2860,16 @@ impl Repository {
         expected_fingerprint: &str,
     ) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
+        let monitorable: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM monitorable_episode WHERE id=?)")
+                .bind(episode_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !monitorable {
+            return Err(AppError::InvalidInput(
+                "episode is outside the current monitoring scope".into(),
+            ));
+        }
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT id, bvid FROM candidate WHERE episode_id = ? AND state = 'pending' ORDER BY bvid",
         )
@@ -2992,6 +3017,7 @@ impl Repository {
                JOIN anime a ON a.id = e.anime_id
                WHERE r.status = 'pending'
                  AND e.state NOT IN ('confirmed', 'notified')
+                 AND EXISTS(SELECT 1 FROM monitorable_episode scope WHERE scope.id=e.id)
                  AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= ?)
                ORDER BY r.created_at, r.id"#,
         )
@@ -3134,14 +3160,16 @@ impl Repository {
         let released_complete =
             transition_released_complete_if_final_released(&mut tx, episode.anime_id, now).await?;
         if !released_complete {
-            let batch: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch WHERE anime_id=? AND ? BETWEEN first_episode AND last_episode)")
+            let next_plan: Option<Option<DateTime<Utc>>>=sqlx::query_scalar("SELECT expected_at FROM release_batch WHERE anime_id=? AND ? BETWEEN first_episode AND last_episode ORDER BY last_episode-first_episode,verified_at DESC LIMIT 1")
+                .bind(episode.anime_id).bind(episode.episode_no+1).fetch_optional(&mut *tx).await?;
+            let batch: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch WHERE anime_id=? AND last_episode>first_episode AND ? BETWEEN first_episode AND last_episode)")
                 .bind(episode.anime_id).bind(episode.episode_no).fetch_one(&mut *tx).await?;
-            let next_expected = if batch {
-                None
-            } else {
-                episode
+            let next_expected = match next_plan {
+                Some(expected) => expected,
+                None if batch => None,
+                None => episode
                     .expected_at
-                    .and_then(|at| at.checked_add_days(Days::new(7)))
+                    .and_then(|at| at.checked_add_days(Days::new(7))),
             };
             let next_check = now + chrono::Duration::hours(6);
             let inserted = sqlx::query(
@@ -3169,7 +3197,12 @@ impl Repository {
             .bind(episode.episode_no)
             .execute(&mut *tx)
             .await?;
-            if inserted.rows_affected() > 0 {
+            if inserted.rows_affected() > 0 && next_plan.is_some() {
+                sqlx::query("UPDATE anime SET schedule_source='anime_schedule',schedule_confidence=?,schedule_warning=? WHERE id=? AND auto_schedule=1")
+                    .bind(if next_expected.is_some() { "calibrated" } else { "unavailable" })
+                    .bind(if next_expected.is_some() { "已使用本集已有的逐集排期。" } else { "本集已标记延期，等待新的上线时间。" })
+                    .bind(episode.anime_id).execute(&mut *tx).await?;
+            } else if inserted.rows_affected() > 0 {
                 // The previous episode's verified timestamp is not proof about
                 // the new episode. A +7d placeholder must not be kept as exact
                 // when the following synchronization has an upstream outage.
@@ -4069,7 +4102,7 @@ impl Repository {
         .fetch_one(&self.pool)
         .await?;
         let pending_candidate_count =
-            sqlx::query_scalar("SELECT COUNT(*) FROM candidate WHERE state = 'pending'")
+            sqlx::query_scalar("SELECT COUNT(*) FROM candidate WHERE state = 'pending' AND episode_id IN (SELECT id FROM monitorable_episode)")
                 .fetch_one(&self.pool)
                 .await?;
         let pending_notification_count =
@@ -4253,16 +4286,8 @@ pub(super) async fn transition_released_complete_if_final_released(
     };
     sqlx::query("DELETE FROM episode WHERE anime_id=? AND episode_no>? AND state NOT IN ('confirmed','notified')")
         .bind(anime_id).bind(final_episode_no).execute(&mut **tx).await?;
-    let final_known:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM episode WHERE anime_id=? AND episode_no=? AND state IN ('confirmed','notified'))")
-        .bind(anime_id).bind(final_episode_no).fetch_one(&mut **tx).await?;
-    if final_known {
-        // Missing history is unknown, not implicitly watched. Make gaps visible
-        // when an old entry learns its final episode count late.
-        for number in anime.local_episode_origin.unwrap_or(1)..=final_episode_no {
-            sqlx::query("INSERT OR IGNORE INTO episode(anime_id,episode_no,state,next_check_at) VALUES(?,?,'waiting',?)")
-                .bind(anime_id).bind(number).bind(now).execute(&mut **tx).await?;
-        }
-    }
+    // Missing history remains unknown. Completion must never manufacture old
+    // pending episodes or infer watched flags outside the monitoring scope.
     let final_released = sqlx::query_scalar::<_, bool>(
         r#"SELECT EXISTS(
                SELECT 1 FROM episode

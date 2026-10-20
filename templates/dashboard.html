@@ -26,8 +26,8 @@
 {% endif %}
 
 {% if !batches.is_empty() %}
-<div class="section-title"><div><p class="eyebrow">BATCH RELEASES</p><h2>批量更新</h2><p class="section-description">官方放送、B站资源与观看进度分别统计；官方已上线不代表已找到视频。</p></div></div>
-<section class="upcoming-grid">{% for batch in batches %}<article class="panel"><h3><a href="/anime/{{ batch.anime_id }}">{{ batch.title }}</a></h3><p>批量排期 {{ batch.time }} · 全 {{ batch.total }} 集</p><p class="episode-progress">官方已上线 {{ batch.official }}/{{ batch.total }} · 已找到 {{ batch.found }}/{{ batch.total }} · 已观看 {{ batch.watched }}/{{ batch.total }}</p><a class="button" href="/anime/{{ batch.anime_id }}">查看集数与导入合集</a></article>{% endfor %}</section>
+<div class="section-title"><div><p class="eyebrow">BATCH RELEASES</p><h2>连播与整季更新</h2><p class="section-description">按实际放送批次统计，不把首播连播当成整季放出；官方上线、B站资源与观看状态互相独立。</p></div></div>
+<section class="upcoming-grid">{% for batch in batches %}<article class="panel"><h3><a href="/anime/{{ batch.anime_id }}">{{ batch.title }}</a></h3><p>{{ batch.label }}</p><p>上线时间 {{ batch.time }}</p><p class="episode-progress">官方已上线 {{ batch.official }}/{{ batch.total }} · 已找到 {{ batch.found }}/{{ batch.total }} · 已观看 {{ batch.watched }}/{{ batch.total }}</p><a class="button" href="/anime/{{ batch.anime_id }}">查看集数与导入合集</a></article>{% endfor %}</section>
 {% endif %}
 <div class="section-title watch-queue-title" id="watch-queue">
   <div><p class="eyebrow">READY TO WATCH</p><h2>等待观看</h2><p class="section-description">已经确认更新、但还没有标记为看过的剧集；看完本季全部待看内容后，最后一集会触发自动归档。</p></div>
