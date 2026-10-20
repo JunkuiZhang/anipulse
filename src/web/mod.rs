@@ -2927,10 +2927,13 @@ async fn candidate_accept_intent(
     if candidate.state != "pending" {
         return Err(WebError::bad_request("该候选已经处理，不能再次确认"));
     }
-    let active = state.repository.active_episode(episode.anime_id).await?;
-    if active.id != episode.id {
+    if !state
+        .repository
+        .independently_monitorable(episode.anime_id, episode.id)
+        .await?
+    {
         return Err(WebError::bad_request(
-            "该候选不属于当前待更新集，已拒绝操作",
+            "该候选已不在当前监控范围内，请刷新审核页",
         ));
     }
     let entity = format!("{episode_id}:{bvid}");
@@ -4996,6 +4999,212 @@ mod tests {
             repository.list_episode_videos(id).await.unwrap().is_empty(),
             "web confirmation only queues a job"
         );
+    }
+
+    #[tokio::test]
+    async fn non_first_batch_candidate_can_complete_web_confirmation_without_advancing_other_episodes()
+     {
+        use crate::domain::{CandidateState, ReleaseBatch, UploaderTrust, VideoCandidate};
+
+        async fn post(
+            app: &Router,
+            token: &str,
+            path: &str,
+            csrf: &str,
+            nonce: Option<&str>,
+        ) -> Response {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("csrf_token", csrf);
+            if let Some(nonce) = nonce {
+                form.append_pair("nonce", nonce);
+            }
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::ORIGIN, "https://anime.example.com")
+                        .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(form.finish()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        async fn nonce(response: Response) -> String {
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), 128 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains("确认这个视频"));
+            html.split("name=\"nonce\" value=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+
+        let (_directory, repository, config, auth, app) = test_app().await;
+        let id = repository
+            .add_anime(NewAnime {
+                title: "边缘行者2".into(),
+                aliases: vec![],
+                next_episode: 5,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1200,
+                duration_max_sec: 2400,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 513878,
+                    anilist_media_id: None,
+                    anime_schedule_route: None,
+                    total_episodes: Some(10),
+                    broadcast_pattern: "R/2026-10-20T07:00:00Z/P7D".into(),
+                    schedule_source: "anime_schedule".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        repository
+            .apply_release_batches(
+                id,
+                &[ReleaseBatch {
+                    first_episode: 1,
+                    last_episode: 10,
+                    expected_at: Some(Utc::now() - chrono::Duration::hours(1)),
+                    aired: true,
+                    source: "anime_schedule".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let mut targets = Vec::new();
+        for number in [6, 10, 4] {
+            let episode = repository.ensure_video_episode(id, number).await.unwrap();
+            let now = Utc::now();
+            let video = VideoCandidate {
+                bvid: format!("BV1ALnw6Y{number:03}"),
+                title: format!("边缘行者2 EP{number}"),
+                description: None,
+                uploader_mid: 100,
+                uploader_name: "test".into(),
+                duration_sec: 1800,
+                published_at: now,
+                url: format!("https://www.bilibili.com/video/BV1ALnw6Y{number:03}"),
+                tags: vec![],
+                page_count: Some(1),
+                view_count: Some(10000),
+                reply_count: Some(100),
+                uploader_follower_count: Some(1000),
+                discovered_at: now,
+                enriched: true,
+            };
+            let evaluation = crate::detector::evaluator::evaluate(
+                &repository.get_anime(id).await.unwrap(),
+                &episode,
+                &video,
+                &UploaderTrust::default(),
+                &config.confirmation,
+                &[],
+            );
+            repository
+                .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
+                .await
+                .unwrap();
+            targets.push((episode.id, video.bvid));
+        }
+        create_admin(&repository, "owner", "correct-password-1234".into())
+            .await
+            .unwrap();
+        let LoginOutcome::Success(session) = auth
+            .login(
+                "owner",
+                "correct-password-1234".into(),
+                "127.0.0.1",
+                Some("test"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("login failed")
+        };
+        let identity = auth.authenticate(&session.token).await.unwrap().unwrap();
+        let csrf = &identity.csrf_token;
+        let token = &session.token;
+        let (sixth, bvid) = &targets[0];
+        let intent = format!("/episodes/{sixth}/candidates/{bvid}/accept-intent");
+        let accept = format!("/episodes/{sixth}/candidates/{bvid}/accept");
+        assert_eq!(repository.active_episode(id).await.unwrap().episode_no, 5);
+        assert_eq!(
+            post(&app, token, &intent, "bad", None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let confirmation = nonce(post(&app, token, &intent, csrf, None).await).await;
+        assert_eq!(
+            post(&app, token, &accept, csrf, Some("bad")).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(&app, token, &accept, csrf, Some(&confirmation))
+                .await
+                .status(),
+            StatusCode::SEE_OTHER
+        );
+        let episode = repository.episode(*sixth).await.unwrap();
+        assert_eq!(episode.state, "confirmed");
+        assert!(episode.watched_at.is_none());
+        assert_eq!(repository.active_episode(id).await.unwrap().episode_no, 5);
+        assert_eq!(repository.pending_notifications().await.unwrap().len(), 1);
+        assert_eq!(
+            post(&app, token, &intent, csrf, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(&app, token, &accept, csrf, Some(&confirmation))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // A change after the intent page opens must still be rejected by the
+        // transactional write guard, even with a valid, unused nonce.
+        let (tenth, bvid) = &targets[1];
+        let intent = format!("/episodes/{tenth}/candidates/{bvid}/accept-intent");
+        let confirmation = nonce(post(&app, token, &intent, csrf, None).await).await;
+        repository
+            .reject_candidate_for_episode(*tenth, bvid, true)
+            .await
+            .unwrap();
+        let accept = format!("/episodes/{tenth}/candidates/{bvid}/accept");
+        assert_eq!(
+            post(&app, token, &accept, csrf, Some(&confirmation))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let (historical, bvid) = &targets[2];
+        let intent = format!("/episodes/{historical}/candidates/{bvid}/accept-intent");
+        assert_eq!(
+            post(&app, token, &intent, csrf, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let videos = repository.list_episode_videos(id).await.unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].episode_no, 6);
+        assert_eq!(repository.pending_notifications().await.unwrap().len(), 1);
     }
 
     async fn test_app() -> (TempDir, Repository, Arc<AppConfig>, AuthService, Router) {
