@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from repair_release_backfill import protected_digest, repair
+from repair_release_backfill import protected_digest, repair, timestamp
 
 
 SINCE = "2026-10-20T11:11:47Z"
@@ -12,6 +12,10 @@ EXPECTED = "2026-10-03T13:00:00Z"
 
 
 class RepairTests(unittest.TestCase):
+    def test_rust_nanoseconds_are_normalized_for_python_310(self):
+        self.assertEqual(timestamp("2026-10-20T11:12:50.216505206+00:00"),timestamp("2026-10-20T11:12:50.216505Z"))
+        self.assertEqual(timestamp("2026-10-20T11:12:50.1Z"),timestamp("2026-10-20T11:12:50.100000+00:00"))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

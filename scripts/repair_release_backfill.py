@@ -8,12 +8,15 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import re
 from pathlib import Path
 import sqlite3
 
 
 def timestamp(value):
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # Rust stores nanoseconds; Python 3.10 only accepts 3/6 fractional digits.
+    normalized = re.sub(r"\.(\d+)(?=[+-])", lambda match: "." + match[1][:6].ljust(6, "0"), value.replace("Z", "+00:00"))
+    parsed = dt.datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
         raise ValueError("timestamps must include a timezone")
     return parsed
