@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}合集预览 · AniPulse{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">COLLECTION IMPORT</p><h1>导入多 P 合集</h1></div><a class="button" href="/anime/{{ anime_id }}">返回番剧</a></div>
+{% if queued %}<section class="panel"><h2>正在后台读取分 P 信息</h2><p>只读取元数据，不下载视频。处理可能需要几十秒，请稍后刷新。</p><a class="button" href="/collections/{{ id }}">刷新状态</a></section>{% endif %}
+{% if !error.is_empty() %}<div class="alert">{{ error }}</div>{% endif %}
+{% if completed %}<div class="notice">导入已完成。观看状态保持不变。</div>{% endif %}
+{% if ready %}
+<section class="panel"><h2>{{ title }}</h2><p>请核实作品、季度和内容。分 P 标题不代表视频真伪。填写对应的站内集数，填 0 跳过广告、片花或其他内容。导入不会标记“已观看”，也不会覆盖已有的最佳来源选择。</p>
+<p class="muted">UP {{ uploader }} · 粉丝 {{ followers }} · 合集发布时间 {{ published_at }}（不是每集更新时间） · <a href="{{ source_url }}" target="_blank" rel="noopener noreferrer">打开合集核实 ↗</a></p>
+<form method="post" action="/collections/{{ id }}" class="stack">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="nonce" value="{{ nonce }}">
+{% for part in parts %}<div class="collection-part"><a href="{{ part.url }}" target="_blank" rel="noopener noreferrer">P{{ part.page }} · {{ part.title }} · {{ part.duration }} ↗</a><label>站内集数（0 跳过）<input type="number" name="episode_{{ part.page }}" value="{{ part.suggested }}" min="0" max="10000" required></label></div>{% endfor %}
+<button class="primary" type="submit">确认导入选中的集数（不标记已观看）</button>
+</form></section>
+{% endif %}
+{% endblock %}

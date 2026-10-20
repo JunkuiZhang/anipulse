@@ -183,6 +183,37 @@ pub struct ScheduleUpdate {
     pub next_sync_at: DateTime<Utc>,
 }
 
+/// A verified native airing window. Numbers are local episode numbers after
+/// applying this subject's mapping. A null time represents an unknown delay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseBatch {
+    pub first_episode: i64,
+    pub last_episode: i64,
+    pub expected_at: Option<DateTime<Utc>>,
+    pub aired: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoPart {
+    pub page: i64,
+    pub cid: i64,
+    pub title: String,
+    pub duration_sec: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoCollection {
+    pub video: VideoCandidate,
+    pub parts: Vec<VideoPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSelection {
+    pub episode_no: i64,
+    pub cid: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeState {
@@ -366,6 +397,49 @@ pub struct PendingNotification {
     pub duration_sec: Option<i64>,
     pub url: Option<String>,
     pub confirmation_reason: Option<String>,
+}
+
+impl PendingNotification {
+    pub fn episode_numbers(&self) -> Vec<i64> {
+        let mut numbers = self
+            .confirmation_reason
+            .as_deref()
+            .and_then(|r| r.strip_prefix("batch:"))
+            .map(|r| {
+                r.split(',')
+                    .filter_map(|v| v.parse::<i64>().ok())
+                    .filter(|n| *n > 0 && *n <= 10000)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if numbers.is_empty() {
+            numbers.push(self.episode_no);
+        }
+        numbers.sort();
+        numbers.dedup();
+        numbers
+    }
+    pub fn episode_label(&self) -> String {
+        let numbers = self.episode_numbers();
+        if numbers.len() > 1 {
+            if numbers.windows(2).all(|p| p[1] == p[0] + 1) {
+                format!(
+                    "EP{}～EP{}（{}集）",
+                    numbers[0],
+                    numbers[numbers.len() - 1],
+                    numbers.len()
+                )
+            } else {
+                numbers
+                    .iter()
+                    .map(|n| format!("EP{n}"))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            }
+        } else {
+            format!("EP{}", self.episode_no)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

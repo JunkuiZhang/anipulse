@@ -3,7 +3,11 @@ pub mod episode;
 pub mod evaluator;
 pub mod title;
 
-use std::{collections::HashSet, iter, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    iter,
+    sync::Arc,
+};
 
 use chrono::Utc;
 use rand::RngExt;
@@ -24,6 +28,14 @@ pub struct Detector {
     config: Arc<AppConfig>,
 }
 
+#[derive(Default)]
+struct CheckCache {
+    search: HashMap<String, Vec<crate::domain::VideoCandidate>>,
+    detail: HashMap<String, crate::domain::VideoCandidate>,
+    detail_requests: usize,
+    search_requests: usize,
+}
+
 impl Detector {
     pub fn new(
         repository: Repository,
@@ -38,8 +50,38 @@ impl Detector {
     }
 
     pub async fn check_anime(&self, anime_id: i64) -> Result<()> {
+        let targets = self.repository.detection_targets(anime_id).await?;
+        let batch = self.repository.has_release_batch(anime_id).await?;
+        let mut cache = CheckCache::default();
+        let mut first_error = None;
+        for episode in targets {
+            let id = episode.id;
+            if let Err(error) = self
+                .check_episode(anime_id, episode, batch, &mut cache)
+                .await
+            {
+                self.repository
+                    .reschedule_episode(id, Utc::now() + chrono::Duration::minutes(15))
+                    .await?;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn check_episode(
+        &self,
+        anime_id: i64,
+        episode: crate::domain::Episode,
+        batch: bool,
+        cache: &mut CheckCache,
+    ) -> Result<()> {
         let anime = self.repository.get_anime(anime_id).await?;
-        let episode = self.repository.active_episode(anime_id).await?;
         let blocked_keywords = self
             .repository
             .list_blocked_keywords()
@@ -53,21 +95,44 @@ impl Detector {
             "checking episode"
         );
 
-        let queries = build_search_queries(
-            &anime,
-            episode.episode_no,
-            self.config.bilibili.max_search_requests_per_check,
-        );
+        let queries = if batch {
+            anime
+                .aliases
+                .iter()
+                .take(self.config.bilibili.max_search_requests_per_check)
+                .cloned()
+                .collect()
+        } else {
+            build_search_queries(
+                &anime,
+                episode.episode_no,
+                self.config.bilibili.max_search_requests_per_check,
+            )
+        };
 
         let mut seen_bvids = HashSet::new();
-        let mut detail_requests = 0usize;
         let mut useful_results = 0usize;
         for (query_index, keyword) in queries.into_iter().enumerate() {
             if query_index > 0 && useful_results > 0 {
                 break;
             }
             info!(query = %keyword, "searching Bilibili");
-            let results = self.provider.search(&SearchQuery { keyword }).await?;
+            let results = if let Some(cached) = cache.search.get(&keyword) {
+                cached.clone()
+            } else {
+                if cache.search_requests >= self.config.bilibili.max_search_requests_per_check {
+                    break;
+                }
+                cache.search_requests += 1;
+                let results = self
+                    .provider
+                    .search(&SearchQuery {
+                        keyword: keyword.clone(),
+                    })
+                    .await?;
+                cache.search.insert(keyword, results.clone());
+                results
+            };
             info!(results = results.len(), "search completed");
             for candidate in results {
                 if !seen_bvids.insert(candidate.bvid.clone()) {
@@ -97,13 +162,19 @@ impl Detector {
                     continue;
                 }
 
-                let detailed = if preliminary.score
-                    >= self.config.confirmation.detail_threshold_score
-                    && detail_requests < self.config.bilibili.max_detail_requests_per_check
+                let detailed = if let Some(detailed) = cache.detail.get(&candidate.bvid) {
+                    detailed.clone()
+                } else if preliminary.score >= self.config.confirmation.detail_threshold_score
+                    && cache.detail_requests < self.config.bilibili.max_detail_requests_per_check
                 {
-                    detail_requests += 1;
+                    cache.detail_requests += 1;
                     match self.provider.enrich(&candidate).await {
-                        Ok(detailed) => detailed,
+                        Ok(detailed) => {
+                            cache
+                                .detail
+                                .insert(candidate.bvid.clone(), detailed.clone());
+                            detailed
+                        }
                         Err(error) => {
                             warn!(bvid = %candidate.bvid, %error, "metadata enrichment failed; keeping search metadata pending");
                             candidate
@@ -409,6 +480,110 @@ mod tests {
             "confirmed"
         );
         assert!(repository.pending_notifications().await.unwrap().is_empty());
+    }
+
+    struct CountingProvider {
+        searches: Arc<std::sync::atomic::AtomicUsize>,
+        details: Arc<std::sync::atomic::AtomicUsize>,
+        candidates: Vec<VideoCandidate>,
+    }
+    #[async_trait]
+    impl VideoSearchProvider for CountingProvider {
+        async fn search(&self, _: &SearchQuery) -> ProviderResult<Vec<VideoCandidate>> {
+            self.searches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.candidates.clone())
+        }
+        async fn enrich(&self, candidate: &VideoCandidate) -> ProviderResult<VideoCandidate> {
+            self.details
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut result = candidate.clone();
+            result.enriched = true;
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_checks_later_episodes_without_multiplying_request_budgets() {
+        use crate::domain::{AutoScheduleMetadata, ReleaseBatch};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_directory, repository, original, old_id) = fixture(&[100, 200]).await;
+        let id = repository
+            .add_anime(NewAnime {
+                title: "Silent Witch".into(),
+                aliases: vec![],
+                next_episode: 1,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1200,
+                duration_max_sec: 1680,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 513878,
+                    anilist_media_id: None,
+                    anime_schedule_route: None,
+                    total_episodes: Some(10),
+                    broadcast_pattern: "R/2026-10-20T07:00:00Z/P7D".into(),
+                    schedule_source: "anime_schedule".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        repository.set_anime_enabled(old_id, false).await.unwrap();
+        repository
+            .apply_release_batches(
+                id,
+                &[ReleaseBatch {
+                    first_episode: 1,
+                    last_episode: 10,
+                    expected_at: Some(Utc::now() - chrono::Duration::hours(1)),
+                    aired: true,
+                    source: "anime_schedule".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let searches = Arc::new(AtomicUsize::new(0));
+        let details = Arc::new(AtomicUsize::new(0));
+        let candidates = original
+            .provider
+            .search(&SearchQuery {
+                keyword: "test".into(),
+            })
+            .await
+            .unwrap();
+        let mut config = AppConfig::default();
+        config.bilibili.max_search_requests_per_check = 1;
+        let detector = Detector::new(
+            repository.clone(),
+            Arc::new(CountingProvider {
+                searches: searches.clone(),
+                details: details.clone(),
+                candidates,
+            }),
+            Arc::new(config.clone()),
+        );
+        detector.check_anime(id).await.unwrap();
+        let videos = repository.list_episode_videos(id).await.unwrap();
+        assert!(
+            videos.iter().any(|v| v.episode_no == 8),
+            "EP1's missing resource must not block EP8"
+        );
+        assert_eq!(searches.load(Ordering::Relaxed), 1);
+        assert!(details.load(Ordering::Relaxed) <= config.bilibili.max_detail_requests_per_check);
+        assert!(
+            repository
+                .pending_notifications()
+                .await
+                .unwrap()
+                .iter()
+                .all(|n| n.episode_no == 8)
+        );
     }
 
     #[tokio::test]

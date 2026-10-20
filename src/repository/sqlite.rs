@@ -28,7 +28,7 @@ enum CandidateConfirmationIntent<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Repository {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
     schedule_probe_interval_secs: i64,
     schedule_probe_lead_days: i64,
 }
@@ -56,6 +56,7 @@ pub struct CandidateListRow {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct EpisodeVideoRow {
+    pub page_no: Option<i64>,
     pub id: i64,
     pub episode_id: i64,
     pub episode_no: i64,
@@ -177,6 +178,7 @@ pub struct UpcomingReleaseRow {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct WatchQueueRow {
+    pub page_no: Option<i64>,
     pub episode_id: i64,
     pub anime_id: i64,
     pub anime_title: String,
@@ -335,7 +337,7 @@ impl Repository {
         self
     }
 
-    fn schedule_check_at(
+    pub(super) fn schedule_check_at(
         &self,
         expected: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
@@ -523,6 +525,8 @@ impl Repository {
                JOIN episode e ON e.anime_id = a.id
                WHERE a.lifecycle = 'tracking'
                  AND e.state NOT IN ('notified', 'confirmed')
+                 AND NOT EXISTS(SELECT 1 FROM release_batch b WHERE b.anime_id=a.id
+                     AND b.last_episode>b.first_episode AND e.episode_no BETWEEN b.first_episode AND b.last_episode)
                  AND e.expected_at < ?
                ORDER BY e.expected_at, a.id"#,
         )
@@ -535,7 +539,7 @@ impl Repository {
         let limit = limit.clamp(1, 100);
         Ok(sqlx::query_as::<_, WatchQueueRow>(
             r#"WITH ranked_videos AS (
-                   SELECT ev.episode_id, ev.bvid, ev.title, ev.published_at,
+                   SELECT ev.episode_id, ev.bvid, ev.title, ev.published_at, ev.page_no,
                           ROW_NUMBER() OVER (
                               PARTITION BY ev.episode_id
                               ORDER BY ev.is_preferred DESC, ev.score DESC,
@@ -549,7 +553,7 @@ impl Repository {
                )
                SELECT e.id AS episode_id, a.id AS anime_id,
                       a.title AS anime_title, a.bangumi_subject_id,
-                      e.episode_no, rv.bvid, rv.title AS video_title,
+                      e.episode_no, rv.bvid, rv.page_no, rv.title AS video_title,
                       COALESCE(rv.published_at, e.confirmed_at, e.notified_at, e.next_check_at)
                           AS released_at
                FROM episode e
@@ -595,15 +599,16 @@ impl Repository {
                            WHERE anime_id = ? AND episode_no = ?
                              AND state IN ('confirmed','notified') AND watched_at IS NOT NULL
                        )
-                       AND NOT EXISTS(
-                           SELECT 1 FROM episode
-                           WHERE anime_id = ? AND state IN ('confirmed','notified')
-                             AND watched_at IS NULL
-                       )"#,
+                       AND (SELECT COUNT(*) FROM episode
+                            WHERE anime_id = ? AND watched_at IS NOT NULL
+                              AND episode_no BETWEEN ? AND ?) = ?"#,
             )
             .bind(episode.anime_id)
             .bind(final_episode_no)
             .bind(episode.anime_id)
+            .bind(anime.local_episode_origin.unwrap_or(1))
+            .bind(final_episode_no)
+            .bind(anime.total_episodes.unwrap_or(0))
             .fetch_one(&self.pool)
             .await?;
             if ready {
@@ -1336,6 +1341,11 @@ impl Repository {
                 "episode must be between 1 and 10000".into(),
             ));
         }
+        let planned=sqlx::query_as::<_,Episode>("SELECT e.* FROM episode e WHERE e.anime_id=? AND e.episode_no=? AND EXISTS(SELECT 1 FROM release_batch b WHERE b.anime_id=e.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode) AND EXISTS(SELECT 1 FROM anime a WHERE a.id=e.anime_id AND a.lifecycle!='archived')")
+            .bind(anime_id).bind(episode_no).fetch_optional(&self.pool).await?;
+        if let Some(episode) = planned {
+            return Ok(episode);
+        }
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let anime = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")
@@ -1414,7 +1424,7 @@ impl Repository {
 
     pub async fn list_episode_videos(&self, anime_id: i64) -> Result<Vec<EpisodeVideoRow>> {
         Ok(sqlx::query_as::<_, EpisodeVideoRow>(
-            r#"SELECT ev.id, ev.episode_id, e.episode_no, ev.bvid, ev.title,
+            r#"SELECT ev.id, ev.episode_id, e.episode_no, ev.bvid, ev.title, ev.page_no,
                       ev.uploader_mid, ev.uploader_name, ev.duration_sec, ev.score,
                       ev.is_preferred, ev.updated_at,
                       COALESCE(ut.confirmed_count, 0) AS confirmed_count,
@@ -1494,7 +1504,7 @@ impl Repository {
             sqlx::query(
                 r#"UPDATE episode_video SET bvid = ?, title = ?, uploader_mid = ?,
                        uploader_name = ?, duration_sec = ?, score = ?,
-                       published_at = ?, updated_at = ?
+                       published_at = ?, updated_at = ?, page_no = NULL, cid = NULL
                    WHERE id = ?"#,
             )
             .bind(&candidate.bvid)
@@ -1522,7 +1532,8 @@ impl Repository {
                        duration_sec = excluded.duration_sec,
                        score = excluded.score,
                        published_at = excluded.published_at,
-                       updated_at = excluded.updated_at"#,
+                       updated_at = excluded.updated_at,
+                       page_no = NULL, cid = NULL"#,
             )
             .bind(episode_id)
             .bind(&candidate.bvid)
@@ -1742,7 +1753,7 @@ impl Repository {
                  AND a.lifecycle = 'tracking'
                  AND e.state IN ('waiting','watching','candidate_found','needs_manual_review')
                  AND e.next_check_at <= ?
-               ORDER BY e.next_check_at LIMIT ?"#,
+               GROUP BY e.anime_id ORDER BY MIN(e.next_check_at) LIMIT ?"#,
         )
         .bind(Utc::now())
         .bind(limit)
@@ -1844,10 +1855,13 @@ impl Repository {
         sqlx::query(
             r#"UPDATE episode SET expected_at = ?, next_check_at = MIN(next_check_at, ?)
                WHERE anime_id = ? AND state IN
-                   ('waiting','watching','candidate_found','needs_manual_review')"#,
+                   ('waiting','watching','candidate_found','needs_manual_review')
+                 AND episode_no = (SELECT MIN(episode_no) FROM episode
+                       WHERE anime_id = ? AND state NOT IN ('confirmed','notified'))"#,
         )
         .bind(update.expected_at)
         .bind(next_check_at)
+        .bind(anime_id)
         .bind(anime_id)
         .execute(&mut *tx)
         .await?;
@@ -2633,7 +2647,9 @@ impl Repository {
         .bind(anime_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if current_episode_id != Some(episode_id) {
+        let batch_target: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch b JOIN episode e ON e.anime_id=b.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode WHERE e.id=?)")
+            .bind(episode_id).fetch_one(&mut *tx).await?;
+        if current_episode_id != Some(episode_id) && !batch_target {
             return Err(AppError::InvalidInput(
                 "candidate no longer belongs to the current episode; refresh the review page"
                     .into(),
@@ -2674,6 +2690,7 @@ impl Repository {
                    duration_sec = excluded.duration_sec,
                    score = excluded.score,
                    is_preferred = 1,
+                   page_no = NULL, cid = NULL,
                    published_at = excluded.published_at,
                    updated_at = excluded.updated_at"#,
         )
@@ -2702,6 +2719,7 @@ impl Repository {
         if user_confirmed && previous_state != CandidateState::Confirmed.to_string() {
             Self::increment_trust_tx(&mut tx, candidate_id, true).await?;
         }
+        transition_released_complete_if_final_released(&mut tx, anime_id, now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2751,7 +2769,9 @@ impl Repository {
         .bind(anime_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if current_episode_id != Some(episode_id) {
+        let batch_target: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch b JOIN episode e ON e.anime_id=b.anime_id AND e.episode_no BETWEEN b.first_episode AND b.last_episode WHERE e.id=?)")
+            .bind(episode_id).fetch_one(&mut *tx).await?;
+        if current_episode_id != Some(episode_id) && !batch_target {
             return Err(AppError::InvalidInput(
                 "candidate no longer belongs to the current episode; refresh the review page"
                     .into(),
@@ -2909,12 +2929,16 @@ impl Repository {
         Ok(sqlx::query_as::<_, PendingNotification>(
             r#"SELECT n.id, n.episode_id, n.channel, n.attempts,
                       a.title AS anime_title, e.episode_no,
-                      c.bvid, c.uploader_name, c.duration_sec, c.url,
+                      COALESCE(c.bvid,ev.bvid) AS bvid,
+                      COALESCE(c.uploader_name,ev.uploader_name) AS uploader_name,
+                      COALESCE(c.duration_sec,ev.duration_sec) AS duration_sec,
+                      COALESCE(c.url,'https://www.bilibili.com/video/'||ev.bvid||CASE WHEN ev.page_no IS NULL THEN '' ELSE '?p='||ev.page_no END) AS url,
                       n.confirmation_reason
                FROM notification n
                JOIN episode e ON e.id = n.episode_id
                JOIN anime a ON a.id = e.anime_id
                LEFT JOIN candidate c ON c.id = n.candidate_id
+               LEFT JOIN episode_video ev ON ev.id=(SELECT id FROM episode_video WHERE episode_id=e.id ORDER BY is_preferred DESC,score DESC,id LIMIT 1)
                WHERE n.status = 'pending'
                  AND (n.next_attempt_at IS NULL OR n.next_attempt_at <= ?)
                ORDER BY n.created_at"#,
@@ -3110,9 +3134,15 @@ impl Repository {
         let released_complete =
             transition_released_complete_if_final_released(&mut tx, episode.anime_id, now).await?;
         if !released_complete {
-            let next_expected = episode
-                .expected_at
-                .and_then(|at| at.checked_add_days(Days::new(7)));
+            let batch: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM release_batch WHERE anime_id=? AND ? BETWEEN first_episode AND last_episode)")
+                .bind(episode.anime_id).bind(episode.episode_no).fetch_one(&mut *tx).await?;
+            let next_expected = if batch {
+                None
+            } else {
+                episode
+                    .expected_at
+                    .and_then(|at| at.checked_add_days(Days::new(7)))
+            };
             let next_check = now + chrono::Duration::hours(6);
             let inserted = sqlx::query(
                 r#"INSERT OR IGNORE INTO episode(
@@ -3996,6 +4026,10 @@ impl Repository {
         let now = Utc::now();
         let retained_since = now - chrono::Duration::days(30);
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM collection_draft WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             r#"DELETE FROM web_session
                WHERE idle_expires_at <= ? OR absolute_expires_at <= ?
@@ -4201,7 +4235,7 @@ fn validate_archive_memory(
     Ok((summary, short_review, tags_json))
 }
 
-async fn transition_released_complete_if_final_released(
+pub(super) async fn transition_released_complete_if_final_released(
     tx: &mut Transaction<'_, Sqlite>,
     anime_id: i64,
     now: DateTime<Utc>,
@@ -4217,15 +4251,32 @@ async fn transition_released_complete_if_final_released(
     let Some(final_episode_no) = anime.final_episode_no()? else {
         return Ok(false);
     };
+    sqlx::query("DELETE FROM episode WHERE anime_id=? AND episode_no>? AND state NOT IN ('confirmed','notified')")
+        .bind(anime_id).bind(final_episode_no).execute(&mut **tx).await?;
+    let final_known:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM episode WHERE anime_id=? AND episode_no=? AND state IN ('confirmed','notified'))")
+        .bind(anime_id).bind(final_episode_no).fetch_one(&mut **tx).await?;
+    if final_known {
+        // Missing history is unknown, not implicitly watched. Make gaps visible
+        // when an old entry learns its final episode count late.
+        for number in anime.local_episode_origin.unwrap_or(1)..=final_episode_no {
+            sqlx::query("INSERT OR IGNORE INTO episode(anime_id,episode_no,state,next_check_at) VALUES(?,?,'waiting',?)")
+                .bind(anime_id).bind(number).bind(now).execute(&mut **tx).await?;
+        }
+    }
     let final_released = sqlx::query_scalar::<_, bool>(
         r#"SELECT EXISTS(
                SELECT 1 FROM episode
                WHERE anime_id = ? AND episode_no = ?
                  AND state IN ('confirmed','notified')
-           )"#,
+           ) AND (SELECT COUNT(*) FROM episode WHERE anime_id=?
+                  AND episode_no BETWEEN ? AND ? AND state IN ('confirmed','notified'))=?"#,
     )
     .bind(anime_id)
     .bind(final_episode_no)
+    .bind(anime_id)
+    .bind(anime.local_episode_origin.unwrap_or(1))
+    .bind(final_episode_no)
+    .bind(anime.total_episodes.unwrap_or(0))
     .fetch_one(&mut **tx)
     .await?;
     if !final_released {
@@ -5108,6 +5159,12 @@ mod tests {
     #[tokio::test]
     async fn known_final_episode_completes_then_archives_when_watched() {
         let (_directory, repository, anime_id, episode) = fixture().await;
+        for number in 1..episode.episode_no {
+            repository
+                .ensure_video_episode(anime_id, number)
+                .await
+                .unwrap();
+        }
         sqlx::query("UPDATE anime SET total_episodes = ? WHERE id = ?")
             .bind(episode.episode_no)
             .bind(anime_id)
@@ -5139,8 +5196,8 @@ mod tests {
         let archived = watched.auto_archive.expect("final episode auto archives");
         assert_eq!(archived.total_episodes, episode.episode_no);
         let memory = repository.get_anime_archive_memory(anime_id).await.unwrap();
-        assert_eq!(memory.watched_episodes, Some(1));
-        assert_eq!(memory.completed_at, memory.first_watched_at.unwrap());
+        assert_eq!(memory.watched_episodes, Some(episode.episode_no));
+        assert!(memory.completed_at >= memory.first_watched_at.unwrap());
         assert!(memory.history_available);
         assert_eq!(
             repository
@@ -5187,6 +5244,12 @@ mod tests {
             .await
             .unwrap();
         let episode = repository.active_episode(anime_id).await.unwrap();
+        for number in 1..8 {
+            repository
+                .ensure_video_episode(anime_id, number)
+                .await
+                .unwrap();
+        }
         let (video, evaluation) = candidate();
         repository
             .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
@@ -5286,6 +5349,12 @@ mod tests {
         );
         let (mut video, evaluation) = candidate();
         video.title = "Re:Zero EP19".into();
+        for number in 12..19 {
+            repository
+                .ensure_video_episode(anime_id, number)
+                .await
+                .unwrap();
+        }
         repository
             .upsert_candidate(episode.id, &video, &evaluation, CandidateState::Pending)
             .await

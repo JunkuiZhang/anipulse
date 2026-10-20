@@ -1,4 +1,10 @@
+#[cfg(test)]
+mod batch_tests;
+mod collections;
+mod releases;
 mod sqlite;
+pub use collections::CollectionDraft;
+pub use releases::ReleaseProgress;
 
 pub use sqlite::{
     AnimeArchiveMemory, AnimeArchiveSummary, AnimeDraftRow, AuditEventRow, AuthenticatedSession,

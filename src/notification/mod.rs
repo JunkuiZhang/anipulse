@@ -135,7 +135,7 @@ impl ServerChanNotifier {
 #[async_trait]
 impl Notifier for ServerChanNotifier {
     async fn notify_release(&self, event: &PendingNotification) -> Result<()> {
-        let full_title = format!("📺 {} EP{} 已更新", event.anime_title, event.episode_no);
+        let full_title = format!("📺 {} {} 已更新", event.anime_title, event.episode_label());
         let title: String = full_title.chars().take(32).collect();
         let mut body = format!(
             "确认依据：{}\n\n",
@@ -246,16 +246,60 @@ impl NotificationDispatcher {
     }
 
     pub async fn dispatch_pending(&self) -> Result<()> {
+        let mut groups: Vec<(Option<i64>, Vec<PendingNotification>)> = vec![];
         for event in self.repository.pending_notifications().await? {
+            let key = self
+                .repository
+                .notification_batch_key(event.episode_id)
+                .await?;
+            if let Some((_, group)) = groups
+                .iter_mut()
+                .find(|(k, g)| key.is_some() && *k == key && g[0].channel == event.channel)
+            {
+                group.push(event);
+            } else {
+                groups.push((key, vec![event]));
+            }
+        }
+        for (_, events) in groups {
+            let mut event = events[0].clone();
+            if events.len() > 1 {
+                let mut numbers = events
+                    .iter()
+                    .flat_map(PendingNotification::episode_numbers)
+                    .collect::<Vec<_>>();
+                numbers.sort();
+                numbers.dedup();
+                event.confirmation_reason = Some(format!(
+                    "batch:{}",
+                    numbers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+                let anime_id = self.repository.episode(event.episode_id).await?.anime_id;
+                event.url = Some(format!(
+                    "{}/anime/{anime_id}",
+                    self.review_public_url.trim_end_matches('/')
+                ));
+                event.bvid = None;
+                event.duration_sec = None;
+                event.uploader_name = None;
+            }
             match self.notifier.notify_release(&event).await {
                 Ok(()) => {
-                    self.repository.mark_notification_sent(event.id).await?;
+                    for row in &events {
+                        self.repository.mark_notification_sent(row.id).await?;
+                    }
                     info!(notification_id = event.id, "notification sent");
                 }
                 Err(error) => {
-                    self.repository
-                        .mark_notification_failed(event.id, &error.to_string())
-                        .await?;
+                    for row in &events {
+                        self.repository
+                            .mark_notification_failed(row.id, &error.to_string())
+                            .await?;
+                    }
                     warn!(notification_id = event.id, %error, "notification remains pending");
                 }
             }

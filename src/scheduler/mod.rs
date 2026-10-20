@@ -116,6 +116,30 @@ async fn execute_management_job(
                 .get("url")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| AppError::InvalidInput("job payload has no URL".into()))?;
+            if matches!(
+                payload.get("purpose").and_then(serde_json::Value::as_str),
+                Some("collection_preview" | "collection_import")
+            ) {
+                let id = payload
+                    .get("draft_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| AppError::InvalidInput("missing collection draft".into()))?;
+                let result = if payload["purpose"] == "collection_preview" {
+                    application.resolve_collection_preview(id).await
+                } else {
+                    let selections: Vec<crate::domain::CollectionSelection> =
+                        serde_json::from_value(payload["selections"].clone()).map_err(|_| {
+                            AppError::InvalidInput("invalid collection selections".into())
+                        })?;
+                    application.import_collection_preview(id, &selections).await
+                };
+                if let Err(error) = &result {
+                    repository
+                        .fail_collection_draft(id, &error.to_string())
+                        .await?;
+                }
+                return result;
+            }
             let episode_id = payload
                 .get("episode_id")
                 .and_then(serde_json::Value::as_i64)

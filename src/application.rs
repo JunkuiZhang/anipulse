@@ -1,4 +1,5 @@
 use std::sync::Arc;
+mod collections;
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -56,6 +57,8 @@ pub struct AnimeDraftRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnimeDraftResolution {
+    #[serde(default)]
+    pub release_batches: Vec<crate::domain::ReleaseBatch>,
     pub title: String,
     pub matched_title: Option<String>,
     pub aliases: Vec<String>,
@@ -509,7 +512,10 @@ impl ApplicationService {
         if current
             && (replace_video_id.is_some()
                 || anime.anime.lifecycle != "tracking"
-                || self.repository.active_episode(anime_id).await?.id != episode_id)
+                || !self
+                    .repository
+                    .independently_monitorable(anime_id, episode_id)
+                    .await?)
         {
             return Err(AppError::InvalidInput(
                 "当前监控集已变化，请刷新详情页后重新补录".into(),
@@ -611,6 +617,7 @@ impl ApplicationService {
             .await?;
         } else {
             let resolved = AnimeDraftResolution {
+                release_batches: vec![],
                 title: request.title.clone(),
                 matched_title: None,
                 aliases: Vec::new(),
@@ -687,6 +694,7 @@ impl ApplicationService {
             .collect::<Vec<_>>()
             .join(" ");
         let resolution = AnimeDraftResolution {
+            release_batches: resolved.release_batches,
             title: request.title,
             matched_title: Some(resolved.matched_title),
             aliases: resolved.aliases,
@@ -740,6 +748,7 @@ impl ApplicationService {
                 "the Bangumi mismatch warning must be explicitly confirmed".into(),
             ));
         }
+        let batches = resolution.release_batches.clone();
         let result = self
             .repository
             .add_anime(resolution.into_new_anime(self.config.schedule.sync_interval_secs))
@@ -747,7 +756,9 @@ impl ApplicationService {
         if result.is_err() {
             self.repository.release_anime_draft(draft_id).await?;
         }
-        result
+        let id = result?;
+        self.repository.apply_release_batches(id, &batches).await?;
+        Ok(id)
     }
 }
 
@@ -1025,6 +1036,14 @@ mod tests {
         let (_directory, repository, application, anime_id, episode) =
             video_import_fixture(13).await;
         let provider = ImportProvider { fail: false };
+        // Earlier episodes were explicitly recorded as watched; absence is
+        // no longer interpreted as completion by the auto-archive check.
+        for number in 1..13 {
+            repository
+                .ensure_video_episode(anime_id, number)
+                .await
+                .unwrap();
+        }
         let url = "https://www.bilibili.com/video/BV1Vbao6aEHb";
         for _ in 0..2 {
             let prepared = repository.ensure_video_episode(anime_id, 13).await.unwrap();

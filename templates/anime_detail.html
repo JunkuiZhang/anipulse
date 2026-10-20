@@ -16,8 +16,10 @@
   </div>
 </section>
 {% if has_schedule_warning %}<div class="alert">排期提示：{{ schedule_warning }}</div>{% endif %}
+{% if !batch_summary.is_empty() %}<p class="notice" role="status">{{ batch_summary }}</p>{% endif %}
 {% if !notice.is_empty() %}<p class="notice">{{ notice }}</p>{% endif %}
 <section class="history-section">
+  <section class="panel"><h3>导入多 P 合集</h3><p class="muted">先预览分 P 与集数对应关系，确认后批量添加；广告、片花可以跳过，不会自动标记已观看。</p><form method="post" action="/anime/{{ id }}/collections" class="history-add-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>合集地址<input type="url" name="url" placeholder="https://www.bilibili.com/video/BV..." required></label><button type="submit">读取并预览合集</button></form></section>
   <div class="section-heading">
     <div><p class="eyebrow">EPISODE LIBRARY</p><h2>集数视频</h2><p class="muted">每集默认展示未屏蔽来源中评分最高的视频；手动选择后将固定展示你的选择。</p></div>
   </div>

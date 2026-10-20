@@ -128,7 +128,7 @@ impl FeishuWebhookNotifier {
 
 pub(super) fn release_card(event: &PendingNotification) -> Value {
     let title = truncate_chars(
-        &format!("📺 {} EP{} 已更新", event.anime_title, event.episode_no),
+        &format!("📺 {} {} 已更新", event.anime_title, event.episode_label()),
         80,
     );
     let reason = readable_confirmation_reason(event.confirmation_reason.as_deref());
@@ -417,6 +417,7 @@ fn readable_confirmation_reason(reason: Option<&str>) -> String {
         "trusted_uploader" => "可信 UP 主".into(),
         "manual_confirmation" => "人工确认".into(),
         "manual_url_confirmation" => "人工提供 B 站链接".into(),
+        value if value.starts_with("batch:") => "批量确认的集数（观看状态独立记录）".into(),
         value if value.starts_with("consensus:") => {
             let votes = value
                 .trim_start_matches("consensus:")

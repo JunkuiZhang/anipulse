@@ -408,6 +408,73 @@ impl VideoSearchProvider for BilibiliProvider {
     }
 }
 
+impl BilibiliProvider {
+    /// Read a multipart video's metadata once for the entire import, not once
+    /// per episode. No video or audio media is downloaded.
+    pub async fn collection(&self, bvid: &str) -> ProviderResult<crate::domain::VideoCollection> {
+        let value = self
+            .request_value("/x/web-interface/view", &[("bvid".into(), bvid.into())])
+            .await?;
+        Self::ensure_success(&value, "view")?;
+        let data = value
+            .get("data")
+            .ok_or_else(|| ProviderError::InvalidResponse("view missing data".into()))?;
+        let now = Utc::now();
+        let mid = data
+            .pointer("/owner/mid")
+            .and_then(value_as_i64)
+            .unwrap_or(0);
+        let parts = data
+            .get("pages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::InvalidResponse("video has no pages".into()))?
+            .iter()
+            .map(|p| crate::domain::VideoPart {
+                page: int_field(p, "page").unwrap_or(0),
+                cid: int_field(p, "cid").unwrap_or(0),
+                title: string_field(p, "part").unwrap_or_default(),
+                duration_sec: int_field(p, "duration").unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        if parts.is_empty()
+            || parts.len() > 1000
+            || parts
+                .iter()
+                .any(|p| p.page <= 0 || p.cid <= 0 || p.duration_sec <= 0)
+        {
+            return Err(ProviderError::InvalidResponse(
+                "invalid multipart metadata".into(),
+            ));
+        }
+        Ok(crate::domain::VideoCollection {
+            video: VideoCandidate {
+                bvid: bvid.into(),
+                title: string_field(data, "title").unwrap_or_default(),
+                description: string_field(data, "desc"),
+                uploader_mid: mid,
+                uploader_name: data
+                    .pointer("/owner/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .into(),
+                duration_sec: int_field(data, "duration").unwrap_or(0),
+                published_at: timestamp_field(data, &["pubdate", "ctime"])
+                    .and_then(|t| Utc.timestamp_opt(t, 0).single())
+                    .unwrap_or(now),
+                url: format!("https://www.bilibili.com/video/{bvid}"),
+                tags: vec![],
+                page_count: Some(parts.len() as i64),
+                view_count: data.pointer("/stat/view").and_then(value_as_i64),
+                reply_count: data.pointer("/stat/reply").and_then(value_as_i64),
+                uploader_follower_count: self.uploader_follower_count(mid).await,
+                discovered_at: now,
+                enriched: true,
+            },
+            parts,
+        })
+    }
+}
+
 fn search_result_items(value: &Value) -> ProviderResult<Vec<Value>> {
     if value
         .pointer("/data/v_voucher")

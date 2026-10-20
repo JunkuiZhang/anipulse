@@ -489,6 +489,7 @@ async fn handle_anime(
                 mapping.mapped_numbers(args.next_episode)?;
             }
             let mut aliases = args.aliases;
+            let mut release_batches = Vec::new();
             let (expected_weekday, expected_time, expected_at, auto_schedule) = if args
                 .auto_schedule
             {
@@ -509,6 +510,7 @@ async fn handle_anime(
                     )
                     .await?;
                 aliases.extend(resolved.aliases.iter().cloned());
+                release_batches = resolved.release_batches.clone();
                 let mapped_episode = episode_mapping
                     .and_then(|mapping| mapping.mapped_numbers(args.next_episode).ok())
                     .map(|(_, bangumi_episode)| format!(" / Bangumi EP{bangumi_episode}"))
@@ -609,6 +611,9 @@ async fn handle_anime(
                 })
                 .await?;
             println!("added anime id={id}");
+            repository
+                .apply_release_batches(id, &release_batches)
+                .await?;
             Ok(())
         }
         AnimeCommand::List => {

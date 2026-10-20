@@ -414,15 +414,23 @@ async fn timetable_failures_are_cached_across_provider_clones() {
     assert!(
         fixture
             .provider
-            .anime_schedule_timetable(expected, ROUTE, 3)
+            .anime_schedule_timetable(expected, ROUTE, 3, None)
             .await
             .is_err()
     );
+    let count = fixture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|u| u.path().contains("timetables"))
+        .count();
+    assert!(count > 0);
     assert!(
         fixture
             .provider
             .clone()
-            .anime_schedule_timetable(expected, ROUTE, 3)
+            .anime_schedule_timetable(expected, ROUTE, 3, None)
             .await
             .is_err()
     );
@@ -434,7 +442,7 @@ async fn timetable_failures_are_cached_across_provider_clones() {
             .iter()
             .filter(|url| url.path().contains("timetables"))
             .count(),
-        1
+        count
     );
 }
 
@@ -467,6 +475,70 @@ async fn timetable_batch_range_applies_to_both_episodes() {
         assert_eq!(resolved.expected_at, Some(time("2026-10-03T13:00:00Z")));
         assert_eq!(resolved.schedule_confidence, "calibrated");
     }
+}
+
+#[tokio::test]
+async fn explicit_whole_season_timetable_materializes_a_verified_range() {
+    let fixture = Fixture::new(vec![json!({"route":ROUTE,"episodeNumber":13,"subtractedEpisodeNumber":1,"episodeDate":"2026-10-03T13:00:00Z","airingStatus":"aired","airType":"raw"}),
+        json!({"route":ROUTE,"episodeNumber":13,"subtractedEpisodeNumber":1,"episodeDate":"2026-10-03T12:00:00Z","airingStatus":"aired","airType":"dub"})], None, false).await;
+    let resolved = fixture.resolve(4, None).await;
+    assert_eq!(resolved.expected_at, Some(time("2026-10-03T13:00:00Z")));
+    assert_eq!(resolved.release_batches.len(), 1);
+    let batch = &resolved.release_batches[0];
+    assert_eq!((batch.first_episode, batch.last_episode), (1, 13));
+    assert!(batch.aired);
+}
+
+#[tokio::test]
+async fn partial_premiere_keeps_its_range_during_timetable_outage_and_maps_local_numbers() {
+    let fixture = Fixture::new(
+        vec![],
+        Some(json!({"overrideEpisode":2,"episodesAired":1,"overrideDate":"2026-10-03T13:00:00Z"})),
+        true,
+    )
+    .await;
+    let resolved = fixture
+        .resolve(
+            12,
+            Some(EpisodeNumberMapping {
+                local_origin: 12,
+                bangumi_origin: 78,
+            }),
+        )
+        .await;
+    assert_eq!(resolved.release_batches.len(), 1);
+    assert_eq!(
+        (
+            resolved.release_batches[0].first_episode,
+            resolved.release_batches[0].last_episode
+        ),
+        (12, 13)
+    );
+    assert!(
+        !resolved.release_batches[0].aired,
+        "a past clock alone is not evidence of actual airing"
+    );
+}
+
+#[test]
+fn ona_and_finished_are_not_evidence_for_a_whole_season_drop() {
+    let media: AnimeScheduleAnime = serde_json::from_value(json!({"route":ROUTE,"title":TITLE,"episodes":13,"premier":"2026-10-03T13:00:00Z","status":"Finished","mediaTypes":[{"route":"ona"}]})).unwrap();
+    assert!(!anime_schedule_full_batch(&media));
+}
+
+#[tokio::test]
+async fn single_episode_delay_overrides_a_broader_release_range() {
+    let fixture = Fixture::new(vec![json!({"route":ROUTE,"episodeNumber":13,"subtractedEpisodeNumber":1,"episodeDate":"2026-10-03T13:00:00Z","airType":"raw"}),
+        json!({"route":ROUTE,"episodeNumber":4,"episodeDate":"2026-10-03T13:00:00Z","airType":"raw","airingStatus":"delayed-air","delayedUntil":"0001-01-01T00:00:00Z"})],None,false).await;
+    let resolved = fixture.resolve(4, None).await;
+    assert_eq!(resolved.expected_at, None);
+    assert_eq!(resolved.release_batches.len(), 2);
+    assert!(
+        resolved
+            .release_batches
+            .iter()
+            .any(|b| b.first_episode == 4 && b.last_episode == 4 && b.expected_at.is_none())
+    );
 }
 
 #[tokio::test]

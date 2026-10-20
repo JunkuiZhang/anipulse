@@ -71,6 +71,7 @@ struct CachedTimetable {
 struct TimetableLookup {
     entry: Option<AnimeScheduleTimetableEntry>,
     health_error: Option<String>,
+    batches: Vec<crate::domain::ReleaseBatch>,
 }
 
 pub struct ScheduleCatalog {
@@ -89,6 +90,7 @@ pub struct AutoScheduleRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSchedule {
+    pub release_batches: Vec<crate::domain::ReleaseBatch>,
     pub bangumi_subject_id: i64,
     pub anilist_media_id: Option<i64>,
     pub anime_schedule_route: Option<String>,
@@ -513,6 +515,7 @@ impl ScheduleProvider {
                 catalog_schedule.anilist_media_id = anime_schedule.anilist_media_id;
                 catalog_schedule.source_health_error = anime_schedule.source_health_error;
                 catalog_schedule.bangumi_health_error = anime_schedule.bangumi_health_error;
+                catalog_schedule.release_batches = anime_schedule.release_batches;
                 catalog_schedule.schedule_warning = merge_warnings(
                     catalog_schedule.schedule_warning,
                     anime_schedule.schedule_warning,
@@ -666,6 +669,7 @@ impl ScheduleProvider {
         let source_health_error = expected.health_error.or(source_health_error);
 
         Ok(ResolvedSchedule {
+            release_batches: vec![],
             bangumi_subject_id,
             anilist_media_id: None,
             anime_schedule_route: None,
@@ -818,14 +822,47 @@ impl ScheduleProvider {
                 timezone,
             )?;
         let mut source_health_error = None;
+        let mut release_batches = Vec::new();
+        let origin = episode_target.mapping.map(|m| m.local_origin).unwrap_or(1);
+        if let Some(entry) = media.episode_override {
+            let first = entry
+                .override_episode
+                .saturating_sub(entry.episodes_aired.max(0));
+            if first > 0
+                && entry.override_episode >= first
+                && entry.override_episode <= 10000
+                && media
+                    .episodes
+                    .is_none_or(|total| entry.override_episode <= total)
+                && let Some(at) = valid_anime_schedule_time(Some(entry.override_date))
+            {
+                release_batches.push(crate::domain::ReleaseBatch {
+                    first_episode: first + origin - 1,
+                    last_episode: entry.override_episode + origin - 1,
+                    expected_at: Some(at),
+                    aired: false,
+                    source: "anime_schedule".into(),
+                });
+            }
+        }
         let mut unavailable = false;
         if query_timetable {
             match self
-                .anime_schedule_timetable(expected_at, &media.route, subject_episode_index)
+                .anime_schedule_timetable(
+                    expected_at,
+                    &media.route,
+                    subject_episode_index,
+                    valid_anime_schedule_time(media.premier),
+                )
                 .await
             {
                 Ok(lookup) => {
                     source_health_error = lookup.health_error;
+                    release_batches.extend(lookup.batches.into_iter().map(|mut batch| {
+                        batch.first_episode += origin - 1;
+                        batch.last_episode += origin - 1;
+                        batch
+                    }));
                     if let Some(exact) = lookup.entry {
                         if let Some(time) = timetable_release_time(&exact) {
                             expected_at = time;
@@ -867,7 +904,7 @@ impl ScheduleProvider {
                 format!("Bangumi 章节日期请求失败，已独立查询 AnimeSchedule 逐集排期：{error}")
             }),
         );
-        let batch_release = anime_schedule_is_ona(&media);
+        let batch_release = anime_schedule_full_batch(&media);
         let anchor = if batch_release {
             expected_at
         } else {
@@ -907,6 +944,7 @@ impl ScheduleProvider {
                 && subject_episode_index > entry.override_episode
         });
         Ok(ResolvedSchedule {
+            release_batches,
             bangumi_subject_id: subject.id,
             anilist_media_id: resolved_anilist_id,
             anime_schedule_route: Some(media.route),
@@ -1030,22 +1068,33 @@ impl ScheduleProvider {
         expected_at: DateTime<Utc>,
         route: &str,
         target_episode: i64,
+        premiere: Option<DateTime<Utc>>,
     ) -> Result<TimetableLookup> {
         // Search earlier weeks as well: a double premiere can leave TV and web
         // episode progress one week apart even though their first dates agree.
         // Both raw and sub are native releases; dubbed timetables are excluded.
-        let weeks = timetable_weeks(expected_at, Utc::now(), self.config.max_stream_offset_days);
+        let mut weeks =
+            timetable_weeks(expected_at, Utc::now(), self.config.max_stream_offset_days);
+        // A whole-season release can precede a falsely extrapolated EP10 by
+        // nine weeks. Always inspect the verified premiere week as well;
+        // widening a weekly-offset tolerance would hide the modeling error.
+        if let Some(premiere) = premiere {
+            let week = premiere.iso_week();
+            weeks.push((week.year(), week.week()));
+            weeks.sort_unstable();
+            weeks.dedup();
+        }
         let mut unknown_delay = None;
         let mut earliest: Option<AnimeScheduleTimetableEntry> = None;
         let mut health_error = None;
         let mut succeeded = false;
+        let mut plans: HashMap<(i64, i64), crate::domain::ReleaseBatch> = HashMap::new();
         for week in weeks {
             let entries = match self.anime_schedule_week(week).await {
                 Ok(entries) => {
                     succeeded = true;
                     entries
                 }
-                Err(error) if !succeeded => return Err(error),
                 Err(error) => {
                     health_error.get_or_insert_with(|| error.to_string());
                     continue;
@@ -1067,22 +1116,94 @@ impl ScheduleProvider {
                             .is_none_or(|kind| matches!(kind, "raw" | "sub"))
                 })
                 .collect::<Vec<_>>();
+            for entry in entries.iter().filter(|e| {
+                e.route == route
+                    && e.air_type
+                        .as_deref()
+                        .is_none_or(|k| matches!(k, "raw" | "sub"))
+            }) {
+                let first = entry
+                    .subtracted_episode_number
+                    .unwrap_or(entry.episode_number);
+                let last = entry.episode_number;
+                if first <= 0 || last < first || last > 10000 {
+                    continue;
+                }
+                let at = timetable_release_time(entry);
+                let batch = crate::domain::ReleaseBatch {
+                    first_episode: first,
+                    last_episode: last,
+                    expected_at: at,
+                    aired: entry.airing_status.as_deref() == Some("aired")
+                        && at.is_some_and(|t| t <= Utc::now()),
+                    source: "anime_schedule".into(),
+                };
+                let key = (first, last);
+                if plans.get(&key).is_none_or(|old| {
+                    batch.expected_at.is_some()
+                        && (old.expected_at.is_none() || batch.expected_at < old.expected_at)
+                }) {
+                    plans.insert(key, batch);
+                }
+            }
             matches.sort_by_key(|entry| timetable_release_time(entry));
             for entry in matches {
                 if timetable_release_time(entry).is_some() {
                     if earliest.as_ref().is_none_or(|previous| {
-                        timetable_release_time(entry) < timetable_release_time(previous)
+                        let span = |e: &AnimeScheduleTimetableEntry| {
+                            e.episode_number
+                                - e.subtracted_episode_number.unwrap_or(e.episode_number)
+                        };
+                        span(entry) < span(previous)
+                            || (span(entry) == span(previous)
+                                && timetable_release_time(entry) < timetable_release_time(previous))
                     }) {
                         earliest = Some(entry.clone());
                     }
                     continue;
                 }
-                unknown_delay = Some(entry.clone());
+                if unknown_delay
+                    .as_ref()
+                    .is_none_or(|previous: &AnimeScheduleTimetableEntry| {
+                        entry.episode_number
+                            - entry
+                                .subtracted_episode_number
+                                .unwrap_or(entry.episode_number)
+                            < previous.episode_number
+                                - previous
+                                    .subtracted_episode_number
+                                    .unwrap_or(previous.episode_number)
+                    })
+                {
+                    unknown_delay = Some(entry.clone());
+                }
             }
         }
+        if !succeeded {
+            return Err(AppError::Schedule(
+                health_error.unwrap_or_else(|| "AnimeSchedule timetable unavailable".into()),
+            ));
+        }
+        let delayed_override = unknown_delay.as_ref().is_some_and(|delayed| {
+            earliest.as_ref().is_none_or(|known| {
+                delayed.episode_number
+                    - delayed
+                        .subtracted_episode_number
+                        .unwrap_or(delayed.episode_number)
+                    < known.episode_number
+                        - known
+                            .subtracted_episode_number
+                            .unwrap_or(known.episode_number)
+            })
+        });
         Ok(TimetableLookup {
-            entry: earliest.or(unknown_delay),
+            entry: if delayed_override {
+                unknown_delay
+            } else {
+                earliest.or(unknown_delay)
+            },
             health_error,
+            batches: plans.into_values().collect(),
         })
     }
 
@@ -1267,7 +1388,7 @@ fn anime_schedule_estimate(
     }
 
     if let Some(premier) = premier {
-        let mut expected_at = if anime_schedule_is_ona(media) {
+        let mut expected_at = if anime_schedule_full_batch(media) {
             premier
         } else if let Some(airdate) = episode_airdate {
             let tokyo_premier = premier.with_timezone(&Tokyo);
@@ -1299,7 +1420,7 @@ fn anime_schedule_estimate(
                 .ok_or_else(|| AppError::Schedule("episode date offset overflowed".into()))?;
             premier + Duration::days(offset)
         };
-        let mut warning = if subject_episode_index == 1 || anime_schedule_is_ona(media) {
+        let mut warning = if subject_episode_index == 1 || anime_schedule_full_batch(media) {
             None
         } else if episode_airdate.is_some() {
             Some("已用 Bangumi 章节日期和 AnimeSchedule 日本首播时刻组合，等待周排期确认。".into())
@@ -1322,7 +1443,7 @@ fn anime_schedule_estimate(
         }
         return Ok((
             expected_at,
-            if subject_episode_index == 1 || anime_schedule_is_ona(media) {
+            if subject_episode_index == 1 || anime_schedule_full_batch(media) {
                 "calibrated"
             } else {
                 "estimated"
@@ -1348,7 +1469,7 @@ fn anime_schedule_estimate(
     };
     let date = if episode_airdate.is_some()
         || subject_episode_index == 1
-        || anime_schedule_is_ona(media)
+        || anime_schedule_full_batch(media)
     {
         start_date
     } else {
@@ -1437,11 +1558,15 @@ fn anime_schedule_premier_date(media: &AnimeScheduleAnime) -> Option<NaiveDate> 
     anime_schedule_premier(media).map(|time| time.with_timezone(&Tokyo).date_naive())
 }
 
-fn anime_schedule_is_ona(media: &AnimeScheduleAnime) -> bool {
-    media
-        .media_types
-        .iter()
-        .any(|kind| kind.route.eq_ignore_ascii_case("ona"))
+fn anime_schedule_full_batch(media: &AnimeScheduleAnime) -> bool {
+    media.episodes.is_some_and(|total| {
+        total > 1
+            && media.episode_override.is_some_and(|batch| {
+                batch.override_episode == total
+                    && batch.override_episode - batch.episodes_aired == 1
+                    && valid_anime_schedule_time(Some(batch.override_date)).is_some()
+            })
+    })
 }
 
 fn anime_schedule_primary_titles(media: &AnimeScheduleAnime) -> Vec<&str> {
@@ -2135,6 +2260,9 @@ impl ScheduleSynchronizer {
         }
         self.repository
             .apply_schedule_update(anime_id, &update)
+            .await?;
+        self.repository
+            .apply_release_batches(anime_id, &resolved.release_batches)
             .await?;
         info!(
             anime_id,

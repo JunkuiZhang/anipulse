@@ -1100,6 +1100,19 @@ button:active,
 
 .danger-ghost { color: var(--danger); }
 
+.collection-part {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 190px);
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line-strong);
+}
+.collection-part a { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .collection-part { grid-template-columns: 1fr; gap: 6px; }
+}
+
 .link-button {
   min-height: auto;
   padding: 0;

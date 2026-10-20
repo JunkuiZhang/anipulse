@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+mod collections;
 mod cover_cache;
 
 use askama::Template;
@@ -138,6 +139,11 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
         .route("/anime/{id}/archive", post(anime_archive))
         .route("/anime/{id}/archive-memory", post(anime_archive_memory))
         .route("/anime/{id}/history/videos", post(history_video_add))
+        .route("/anime/{id}/collections", post(collections::start))
+        .route(
+            "/collections/{id}",
+            get(collections::preview).post(collections::confirm),
+        )
         .route(
             "/anime/{id}/history/videos/{video_id}/update",
             post(history_video_update),
@@ -503,7 +509,8 @@ struct DashboardTemplate {
     scheduler_status: String,
     provider_status: String,
     upcoming: Vec<UpcomingReleaseView>,
-    watch_queue: Vec<WatchQueueView>,
+    watch_groups: Vec<WatchGroup>,
+    batches: Vec<BatchProgressView>,
     notice: String,
 }
 
@@ -533,6 +540,21 @@ struct WatchQueueView {
     cover_url: String,
     has_cover: bool,
     cover_initial: String,
+}
+
+struct WatchGroup {
+    anime_id: i64,
+    title: String,
+    items: Vec<WatchQueueView>,
+}
+struct BatchProgressView {
+    anime_id: i64,
+    title: String,
+    total: i64,
+    official: i64,
+    found: i64,
+    watched: i64,
+    time: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -582,13 +604,13 @@ async fn dashboard(
             }
         })
         .collect();
-    let watch_queue = state
+    let watch_queue: Vec<WatchQueueView> = state
         .repository
         .watch_queue(50)
         .await?
         .into_iter()
         .filter_map(|episode| {
-            let url = canonical_bilibili_url(&episode.bvid)?;
+            let url = canonical_bilibili_part_url(&episode.bvid, episode.page_no)?;
             let cover_url = episode.bangumi_subject_id.and_then(bangumi_cover_url);
             Some(WatchQueueView {
                 episode_id: episode.episode_id,
@@ -606,6 +628,41 @@ async fn dashboard(
                 has_cover: cover_url.is_some(),
                 cover_url: cover_url.unwrap_or_default(),
             })
+        })
+        .collect();
+    let mut watch_groups: Vec<WatchGroup> = vec![];
+    for item in watch_queue {
+        if let Some(group) = watch_groups
+            .iter_mut()
+            .find(|g| g.anime_id == item.anime_id)
+        {
+            group.items.push(item);
+        } else {
+            watch_groups.push(WatchGroup {
+                anime_id: item.anime_id,
+                title: item.title.clone(),
+                items: vec![item],
+            });
+        }
+    }
+    let batches = state
+        .repository
+        .release_progress()
+        .await?
+        .into_iter()
+        .filter(|p| {
+            p.expected_at
+                .is_none_or(|at| at <= now + chrono::Duration::days(7))
+                || p.found > p.watched
+        })
+        .map(|p| BatchProgressView {
+            anime_id: p.anime_id,
+            title: p.title,
+            total: p.total,
+            official: p.official,
+            found: p.found,
+            watched: p.watched,
+            time: format_time(p.expected_at, state.display_timezone),
         })
         .collect();
     let notice = match query.result.as_deref() {
@@ -627,7 +684,8 @@ async fn dashboard(
         scheduler_status: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
         provider_status: provider_status(stats.provider_backoff_until, state.display_timezone),
         upcoming,
-        watch_queue,
+        watch_groups,
+        batches,
         notice,
     })
 }
@@ -1265,6 +1323,7 @@ struct AnimeDetailTemplate {
     lifecycle_label: String,
     suggested_total: i64,
     resume_episode: i64,
+    batch_summary: String,
 }
 
 #[derive(Template)]
@@ -1521,7 +1580,21 @@ async fn anime_detail(
         })
         .unwrap_or(1);
     let resume_episode = anime.anime.final_episode_no()?.unwrap_or(suggested_total) + 1;
+    let batch_summary = state
+        .repository
+        .release_progress()
+        .await?
+        .into_iter()
+        .find(|p| p.anime_id == id)
+        .map(|p| {
+            format!(
+                "批量放送 · 官方已上线 {}/{} · 已找到资源 {}/{} · 已观看 {}/{}",
+                p.official, p.total, p.found, p.total, p.watched, p.total
+            )
+        })
+        .unwrap_or_default();
     render(AnimeDetailTemplate {
+        batch_summary,
         username: identity.username,
         csrf_token: identity.csrf_token,
         id,
@@ -1674,7 +1747,7 @@ fn episode_history_views(
             uploader_name: row.uploader_name,
             duration: format_duration(row.duration_sec),
             score: row.score,
-            url: canonical_bilibili_url(&row.bvid).unwrap_or_default(),
+            url: canonical_bilibili_part_url(&row.bvid, row.page_no).unwrap_or_default(),
             preferred: row.is_preferred,
             blocked: row.manually_blocked,
             manually_trusted: row.manually_trusted,
@@ -3619,6 +3692,15 @@ fn provider_status(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     }
 }
 
+fn canonical_bilibili_part_url(bvid: &str, page: Option<i64>) -> Option<String> {
+    let url = canonical_bilibili_url(bvid)?;
+    match page {
+        Some(page) if (1..=1000).contains(&page) => Some(format!("{url}?p={page}")),
+        None => Some(url),
+        _ => None,
+    }
+}
+
 fn canonical_bilibili_url(bvid: &str) -> Option<String> {
     parse_bilibili_bvid(bvid)
         .ok()
@@ -4637,6 +4719,7 @@ mod tests {
     #[test]
     fn episode_history_uses_explicit_choice_then_highest_unblocked_score() {
         let row = |id: i64, score: i64, preferred: bool, blocked: bool| EpisodeVideoRow {
+            page_no: None,
             id,
             episode_id: 70,
             episode_no: 7,
@@ -4735,6 +4818,176 @@ mod tests {
         );
         assert!(parse_episode_mapping(Some("12"), None).is_err());
         assert!(parse_episode_mapping(Some("0"), Some("78")).is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_pages_render_and_collection_import_requires_login_csrf_and_nonce() {
+        let (_directory, repository, _config, auth, app) = test_app().await;
+        let id = repository
+            .add_anime(NewAnime {
+                title: "边缘行者2".into(),
+                aliases: vec![],
+                next_episode: 1,
+                expected_at: Some(Utc::now()),
+                expected_weekday: None,
+                expected_time: None,
+                timezone: "Asia/Shanghai".into(),
+                duration_min_sec: 1200,
+                duration_max_sec: 2400,
+                auto_schedule: Some(AutoScheduleMetadata {
+                    bangumi_subject_id: 513878,
+                    anilist_media_id: None,
+                    anime_schedule_route: None,
+                    total_episodes: Some(10),
+                    broadcast_pattern: "R/2026-10-20T07:00:00Z/P7D".into(),
+                    schedule_source: "anime_schedule".into(),
+                    schedule_confidence: "calibrated".into(),
+                    schedule_warning: None,
+                    next_sync_at: Utc::now(),
+                    episode_mapping: None,
+                }),
+            })
+            .await
+            .unwrap();
+        repository
+            .apply_release_batches(
+                id,
+                &[crate::domain::ReleaseBatch {
+                    first_episode: 1,
+                    last_episode: 10,
+                    expected_at: Some(Utc::now() - chrono::Duration::hours(1)),
+                    aired: true,
+                    source: "anime_schedule".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        create_admin(&repository, "owner", "correct-password-1234".into())
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for username in ["owner"] {
+            let LoginOutcome::Success(session) = auth
+                .login(
+                    username,
+                    "correct-password-1234".into(),
+                    "127.0.0.1",
+                    Some("test"),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("login failed")
+            };
+            let identity = auth.authenticate(&session.token).await.unwrap().unwrap();
+            sessions.push((session.token, identity));
+        }
+        let (token, identity) = &sessions[0];
+        for path in ["/".to_string(), format!("/anime/{id}")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), 512 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains("官方已上线 10/10"));
+            assert!(html.contains("已观看 0/10"));
+        }
+        let metadata:crate::domain::VideoCollection=serde_json::from_value(serde_json::json!({
+            "video":{"bvid":"BV1nwnc6WEc9","title":"全10集","description":null,"uploader_mid":100,"uploader_name":"test","duration_sec":15000,"published_at":Utc::now(),"url":"https://www.bilibili.com/video/BV1nwnc6WEc9","tags":[],"page_count":10,"view_count":10000,"reply_count":100,"uploader_follower_count":1000,"discovered_at":Utc::now(),"enriched":true},
+            "parts":[{"page":1,"cid":101,"title":"第二季1","duration_sec":1500}]
+        })).unwrap();
+        repository
+            .create_collection_draft("preview", id, identity.admin_id, &metadata.video.url)
+            .await
+            .unwrap();
+        repository
+            .ready_collection_draft("preview", &metadata)
+            .await
+            .unwrap();
+        let foreign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/preview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::SEE_OTHER);
+        assert_eq!(foreign.headers()[header::LOCATION], "/login");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/preview")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("?p=1"));
+        let nonce = html
+            .split("name=\"nonce\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        for (csrf, confirmation, expected) in [
+            ("bad", nonce, StatusCode::FORBIDDEN),
+            (identity.csrf_token.as_str(), "bad", StatusCode::FORBIDDEN),
+            (identity.csrf_token.as_str(), nonce, StatusCode::SEE_OTHER),
+            (identity.csrf_token.as_str(), nonce, StatusCode::FORBIDDEN),
+        ] {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("csrf_token", csrf)
+                .append_pair("nonce", confirmation)
+                .append_pair("episode_1", "1")
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/collections/preview")
+                        .header(header::ORIGIN, "https://anime.example.com")
+                        .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(
+            repository.list_episode_videos(id).await.unwrap().is_empty(),
+            "web confirmation only queues a job"
+        );
     }
 
     async fn test_app() -> (TempDir, Repository, Arc<AppConfig>, AuthService, Router) {
