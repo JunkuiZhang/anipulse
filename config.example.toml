@@ -5,6 +5,9 @@ path = "/var/lib/anipulse/anipulse.db"
 # 这是项目自身的克制预算，不代表 Bilibili 官方安全线。
 base_url = "https://api.bilibili.com"
 min_request_interval_secs = 5
+# 上述间隔和每日预算通过 SQLite 在后台、手动导入及多个进程间共享。
+# 详情使用公开设备 Cookie + WBI 签名，不需要登录 Cookie；缓存有效期为
+# 视频详情 30 分钟、粉丝数 6 小时、WBI 公钥 1 小时。
 max_requests_per_day = 500
 max_search_requests_per_check = 2
 max_detail_requests_per_check = 3

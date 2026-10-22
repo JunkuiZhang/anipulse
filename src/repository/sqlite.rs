@@ -1,7 +1,7 @@
 use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, Utc};
 use serde_json::to_string;
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -162,6 +162,7 @@ pub struct DashboardStats {
     pub failed_job_count: i64,
     pub scheduler_heartbeat: Option<DateTime<Utc>>,
     pub provider_backoff_until: Option<DateTime<Utc>>,
+    pub provider_scope_backoffs: Vec<super::ProviderBackoff>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -279,13 +280,6 @@ pub struct AnimeDraftRow {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub consumed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, FromRow)]
-struct ProviderState {
-    backoff_until: Option<DateTime<Utc>>,
-    daily_date: Option<NaiveDate>,
-    daily_count: i64,
 }
 
 impl Repository {
@@ -4139,83 +4133,8 @@ impl Repository {
             failed_job_count,
             scheduler_heartbeat,
             provider_backoff_until,
+            provider_scope_backoffs: self.provider_backoffs().await?,
         })
-    }
-
-    pub async fn reserve_provider_request(&self, max_per_day: u32) -> Result<()> {
-        let now = Utc::now();
-        let today = now.date_naive();
-        let mut tx = self.pool.begin().await?;
-        let state = sqlx::query_as::<_, ProviderState>(
-            "SELECT backoff_until, daily_date, daily_count FROM provider_state WHERE provider = 'bilibili'",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if let Some(until) = state.backoff_until.filter(|until| *until > now) {
-            return Err(AppError::InvalidInput(format!(
-                "Bilibili global backoff active until {until}"
-            )));
-        }
-        let count = if state.daily_date == Some(today) {
-            state.daily_count
-        } else {
-            0
-        };
-        if count >= i64::from(max_per_day) {
-            return Err(AppError::InvalidInput(format!(
-                "Bilibili daily safety budget exhausted ({max_per_day})"
-            )));
-        }
-        sqlx::query(
-            "UPDATE provider_state SET daily_date = ?, daily_count = ?, updated_at = ? WHERE provider = 'bilibili'",
-        )
-        .bind(today)
-        .bind(count + 1)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn record_provider_failure(
-        &self,
-        base_seconds: i64,
-        max_seconds: i64,
-    ) -> Result<DateTime<Utc>> {
-        let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
-        let failures = sqlx::query_scalar::<_, i64>(
-            "SELECT consecutive_failures FROM provider_state WHERE provider = 'bilibili'",
-        )
-        .fetch_one(&mut *tx)
-        .await?
-            + 1;
-        let exponent = (failures - 1).clamp(0, 8) as u32;
-        let delay = base_seconds
-            .saturating_mul(2_i64.pow(exponent))
-            .min(max_seconds);
-        let until = now + chrono::Duration::seconds(delay);
-        sqlx::query(
-            "UPDATE provider_state SET backoff_until = ?, consecutive_failures = ?, updated_at = ? WHERE provider = 'bilibili'",
-        )
-        .bind(until)
-        .bind(failures)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(until)
-    }
-
-    pub async fn clear_provider_failures(&self) -> Result<()> {
-        sqlx::query(
-            "UPDATE provider_state SET backoff_until = NULL, consecutive_failures = 0, updated_at = ? WHERE provider = 'bilibili'",
-        )
-        .bind(Utc::now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 }
 
@@ -5446,17 +5365,6 @@ mod tests {
                 .rejected_count,
             1
         );
-    }
-
-    #[tokio::test]
-    async fn provider_budget_and_backoff_are_global() {
-        let (_directory, repository, _anime_id, _episode) = fixture().await;
-        repository.reserve_provider_request(1).await.unwrap();
-        assert!(repository.reserve_provider_request(1).await.is_err());
-
-        repository.clear_provider_failures().await.unwrap();
-        repository.record_provider_failure(60, 60).await.unwrap();
-        assert!(repository.reserve_provider_request(500).await.is_err());
     }
 
     #[tokio::test]

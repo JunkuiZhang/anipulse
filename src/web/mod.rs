@@ -684,7 +684,11 @@ async fn dashboard(
         queued_job_count: stats.queued_job_count,
         failed_job_count: stats.failed_job_count,
         scheduler_status: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
-        provider_status: provider_status(stats.provider_backoff_until, state.display_timezone),
+        provider_status: provider_status(
+            stats.provider_backoff_until,
+            &stats.provider_scope_backoffs,
+            state.display_timezone,
+        ),
         upcoming,
         watch_groups,
         batches,
@@ -3485,7 +3489,11 @@ async fn settings_status(
         username: identity.username,
         csrf_token: identity.csrf_token,
         scheduler: heartbeat_status(stats.scheduler_heartbeat, state.display_timezone),
-        provider: provider_status(stats.provider_backoff_until, state.display_timezone),
+        provider: provider_status(
+            stats.provider_backoff_until,
+            &stats.provider_scope_backoffs,
+            state.display_timezone,
+        ),
         notification_provider: state.config.notification.provider.clone(),
         schedule_source: state.config.schedule.bangumi_data_url.clone(),
         public_url: state.config.web.public_url.clone(),
@@ -3694,13 +3702,42 @@ fn heartbeat_status(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
     }
 }
 
-fn provider_status(value: Option<DateTime<Utc>>, timezone: Tz) -> String {
-    match value {
-        Some(value) if value > Utc::now() => {
-            format!("退避至 {}", format_time(Some(value), timezone))
-        }
-        _ => "可用".into(),
+fn provider_status(
+    value: Option<DateTime<Utc>>,
+    scopes: &[crate::repository::ProviderBackoff],
+    timezone: Tz,
+) -> String {
+    if let Some(value) = value.filter(|value| *value > Utc::now()) {
+        return format!(
+            "全局保护暂停至 {}（保留既有冷却）",
+            format_time(Some(value), timezone)
+        );
     }
+    use crate::repository::ProviderScope;
+    [
+        ProviderScope::Search,
+        ProviderScope::Detail,
+        ProviderScope::Device,
+        ProviderScope::Session,
+        ProviderScope::Followers,
+    ]
+    .into_iter()
+    .map(|scope| {
+        if let Some(state) = scopes
+            .iter()
+            .find(|state| state.provider == scope.key() && state.backoff_until > Utc::now())
+        {
+            format!(
+                "{}：暂停至 {}",
+                scope.label(),
+                format_time(Some(state.backoff_until), timezone)
+            )
+        } else {
+            format!("{}：未在冷却", scope.label())
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("；")
 }
 
 fn canonical_bilibili_part_url(bvid: &str, page: Option<i64>) -> Option<String> {
@@ -4703,6 +4740,23 @@ mod tests {
         assert_eq!(
             format_schedule_time(Some(value), Some("date_only"), chrono_tz::Asia::Shanghai),
             "2026-08-21（时间待公布）"
+        );
+    }
+
+    #[test]
+    fn provider_status_distinguishes_partial_cooldown_from_legacy_global_protection() {
+        let until = Utc::now() + chrono::Duration::hours(6);
+        let scopes = vec![crate::repository::ProviderBackoff {
+            provider: "bilibili:detail".into(),
+            backoff_until: until,
+        }];
+        let text = provider_status(None, &scopes, chrono_tz::Asia::Shanghai);
+        assert!(text.contains("搜索：未在冷却"));
+        assert!(text.contains("视频详情：暂停至"));
+        assert!(!text.contains("全局保护"));
+        assert!(
+            provider_status(Some(until), &scopes, chrono_tz::Asia::Shanghai)
+                .contains("保留既有冷却")
         );
     }
 

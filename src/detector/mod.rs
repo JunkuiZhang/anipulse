@@ -11,7 +11,7 @@ use std::{
 
 use chrono::Utc;
 use rand::RngExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::AppConfig,
@@ -34,6 +34,7 @@ struct CheckCache {
     detail: HashMap<String, crate::domain::VideoCandidate>,
     detail_requests: usize,
     search_requests: usize,
+    detail_unavailable: bool,
 }
 
 impl Detector {
@@ -60,9 +61,13 @@ impl Detector {
                 .check_episode(anime_id, episode, batch, &mut cache)
                 .await
             {
-                self.repository
-                    .reschedule_episode(id, Utc::now() + chrono::Duration::minutes(15))
-                    .await?;
+                let retry_at = match &error {
+                    crate::error::AppError::Provider(
+                        crate::provider::ProviderError::ScopedBackoff { until, .. },
+                    ) => until.with_timezone(&Utc) + chrono::Duration::seconds(30),
+                    _ => Utc::now() + chrono::Duration::minutes(15),
+                };
+                self.repository.reschedule_episode(id, retry_at).await?;
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
@@ -166,6 +171,7 @@ impl Detector {
                     detailed.clone()
                 } else if preliminary.score >= self.config.confirmation.detail_threshold_score
                     && cache.detail_requests < self.config.bilibili.max_detail_requests_per_check
+                    && !cache.detail_unavailable
                 {
                     cache.detail_requests += 1;
                     match self.provider.enrich(&candidate).await {
@@ -176,7 +182,14 @@ impl Detector {
                             detailed
                         }
                         Err(error) => {
-                            warn!(bvid = %candidate.bvid, %error, "metadata enrichment failed; keeping search metadata pending");
+                            cache.detail_unavailable =
+                                !matches!(error, crate::provider::ProviderError::Permanent(_));
+                            if matches!(error, crate::provider::ProviderError::ScopedBackoff { .. })
+                            {
+                                debug!(%error, "metadata enrichment paused; keeping search metadata pending");
+                            } else {
+                                warn!(bvid = %candidate.bvid, %error, "metadata enrichment failed; keeping search metadata pending");
+                            }
                             candidate
                         }
                     }
@@ -486,6 +499,64 @@ mod tests {
         searches: Arc<std::sync::atomic::AtomicUsize>,
         details: Arc<std::sync::atomic::AtomicUsize>,
         candidates: Vec<VideoCandidate>,
+    }
+
+    struct PausedDetailsProvider {
+        candidates: Vec<VideoCandidate>,
+        details: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl VideoSearchProvider for PausedDetailsProvider {
+        async fn search(&self, _: &SearchQuery) -> ProviderResult<Vec<VideoCandidate>> {
+            Ok(self.candidates.clone())
+        }
+
+        async fn enrich(&self, _: &VideoCandidate) -> ProviderResult<VideoCandidate> {
+            self.details
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::provider::ProviderError::ScopedBackoff {
+                scope: "视频详情",
+                until: (Utc::now() + chrono::Duration::hours(6))
+                    .with_timezone(&chrono_tz::Asia::Shanghai),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_pause_keeps_search_candidates_without_retries_or_auto_confirmation() {
+        let (_directory, repository, original, anime_id) = fixture(&[100, 200]).await;
+        let episode = repository.active_episode(anime_id).await.unwrap();
+        let candidates = original
+            .provider
+            .search(&SearchQuery {
+                keyword: "test".into(),
+            })
+            .await
+            .unwrap();
+        let provider = Arc::new(PausedDetailsProvider {
+            candidates,
+            details: Default::default(),
+        });
+        let detector = Detector::new(repository.clone(), provider.clone(), original.config);
+        detector.check_anime(anime_id).await.unwrap();
+        assert_eq!(
+            provider.details.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            repository
+                .active_candidates(episode.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(repository.pending_notifications().await.unwrap().is_empty());
+        assert_ne!(
+            repository.episode(episode.id).await.unwrap().state,
+            "confirmed"
+        );
     }
     #[async_trait]
     impl VideoSearchProvider for CountingProvider {

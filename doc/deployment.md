@@ -189,7 +189,7 @@ user_agent = "你的-Bangumi-用户名/AniPulse/0.1 (personal self-hosted)"
 
 `provider = "feishu"` 和 `provider = "feishu_app"` 都代表应用机器人私聊。`channel` 是 AniPulse 用于通知幂等的稳定标识，部署后不要随意修改，否则同一 Episode 可能因新 channel 名称产生另一条通知记录。
 
-候选详情会从 Bilibili 读取播放量、评论数，并通过公开的 UP 关系统计接口读取粉丝数（相同 UP 在进程内缓存 6 小时）。UP 低于 `minimum_uploader_followers` 时直接拒绝，手工信任也不能绕过；视频低于 `minimum_auto_confirm_video_views` 时只进入人工审核。设为 `0` 可以关闭对应门槛。旧版短暂使用过的配置名 `minimum_auto_confirm_uploader_followers` 仍兼容，但建议改成新名称。`泄露`、`泄漏`、`偷跑`、`流出`、`枪版`、`盗录` 等标题信号始终硬拒绝。
+候选详情会从 Bilibili 读取播放量、评论数，并通过公开的 UP 关系统计接口读取粉丝数（相同 UP 在 SQLite 中缓存 6 小时，跨进程、跨检查及重启复用）。UP 低于 `minimum_uploader_followers` 时直接拒绝，手工信任也不能绕过；粉丝数缺失时不猜测为 0，也不自动确认，即使该 UP 已受信任。视频低于 `minimum_auto_confirm_video_views` 时只进入人工审核。设为 `0` 可以关闭对应门槛。旧版短暂使用过的配置名 `minimum_auto_confirm_uploader_followers` 仍兼容，但建议改成新名称。`泄露`、`泄漏`、`偷跑`、`流出`、`枪版`、`盗录` 等标题信号始终硬拒绝。
 
 安装鉴权网页后可以把 `notify_pending` 改为 `true`：无法自动确认时，飞书会发送指向登录审核页的橙色卡片。网页、Caddy、Secret、管理员和 systemd 的完整步骤见 [`web-deployment.md`](web-deployment.md)。在 `web.public_url` 尚未能通过 HTTPS 访问前保持 `false`。
 
@@ -505,7 +505,13 @@ sudo systemctl start anipulse
 
 ### Bilibili 返回 412/429 或 `v_voucher`
 
-这是 Provider 风控或限流。新版 AniPulse 会识别 `code=0` 但仅含 `v_voucher` 的软风控响应，不会再把它记录成正常的 `results=0`；公开聚合搜索响应结构异常时会尝试 WBI 回退，任一路径明确返回风控时都会进入持久化全局 backoff。期间不会持续高频请求。不要通过代理池、Cookie 池或高频重启绕过。
+这是 Provider 风控或限流，不足以断定账号封禁或固定的 IP 解封期限。HTTP 412 HTML、JSON `-412`/`-352`、`code=0` 但仅含 `v_voucher` 都会被识别；不会把软风控记成正常的 `results=0`。搜索、视频详情、设备初始化、WBI 公钥与粉丝数分别持久化冷却，详情失败不会再连带停掉可用的搜索，搜索成功也不会清零详情的失败计数。首次 412 冷却 6 小时，连续失败增至 12、24 小时；同一冷却期间的本地跳过和已发出的并发失败不会反复延长期限。恢复时同类接口只允许一个试探请求；成功后才重新开放。搜索暂停时调度器直接安排到冷却结束后，不再每 15 分钟反复记作番剧检查失败。
+
+详情读取统一使用 `/x/web-interface/wbi/view/detail`，先取得公开设备 Cookie 和 WBI 公钥，再对参数签名；自动检测、手动链接与多 P 合集共用这个入口，不在 412 后轮换旧接口重试。不需要提供 `SESSDATA` 或个人登录 Cookie。视频详情缓存 30 分钟，粉丝数和公开设备信息缓存 6 小时，WBI 公钥缓存 1 小时；只缓存验证成功的元数据，不缓存风控结果。缺少详情的搜索候选仍保留为待审核，不能因此降低确认门槛。
+
+请求间隔与每日预算由 SQLite 原子预留，所有 Provider 实例和使用同一数据库的进程共用；等待和网络请求不持有数据库事务。首页和设置页分别显示各接口的暂停期限。升级会保留旧版本已有的全局冷却，不清零每日预算、不删除观看记录；原冷却结束后自动走新请求流程，不需要手工修改数据库或清空退避。此修复不涉及 Cloudflare Worker，无需更新 Worker。
+
+带签名的请求仍可能被服务端拒绝。遇到这种情况保留冷却并检查日志中的具体接口，不要通过代理池、Cookie 池或高频重启绕过。
 
 如果旧日志连续显示 `search completed results=0`，但浏览器能够搜到目标视频，先升级到包含软风控识别和聚合搜索支持的版本，再手工执行一次 `check ID`。升级不会要求重新添加追番，也不会清空现有 SQLite 数据。
 

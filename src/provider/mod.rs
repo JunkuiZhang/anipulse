@@ -28,6 +28,11 @@ pub enum ProviderError {
     Permanent(String),
     #[error("provider is in backoff: {0}")]
     Backoff(String),
+    #[error("Bilibili {scope}暂停检查至 {until}（北京时间）；冷却期间不发送请求")]
+    ScopedBackoff {
+        scope: &'static str,
+        until: chrono::DateTime<chrono_tz::Tz>,
+    },
 }
 
 pub type ProviderResult<T> = std::result::Result<T, ProviderError>;

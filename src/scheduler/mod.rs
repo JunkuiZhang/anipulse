@@ -62,14 +62,23 @@ pub async fn run(
             .await?;
         for anime_id in due {
             if let Err(error) = detector.check_anime(anime_id).await {
-                warn!(anime_id, %error, "episode check failed");
-                if let Ok(episode) = repository.active_episode(anime_id).await {
-                    let retry_at = Utc::now() + chrono::Duration::minutes(15);
-                    if let Err(reschedule_error) =
-                        repository.reschedule_episode(episode.id, retry_at).await
+                let retry_at =
+                    if let AppError::Provider(crate::provider::ProviderError::ScopedBackoff {
+                        until,
+                        ..
+                    }) = &error
                     {
-                        error!(anime_id, %reschedule_error, "failed to reschedule episode");
-                    }
+                        info!(anime_id, %error, "episode check paused by provider cooldown");
+                        until.with_timezone(&Utc) + chrono::Duration::seconds(30)
+                    } else {
+                        warn!(anime_id, %error, "episode check failed");
+                        Utc::now() + chrono::Duration::minutes(15)
+                    };
+                if let Ok(episode) = repository.active_episode(anime_id).await
+                    && let Err(reschedule_error) =
+                        repository.reschedule_episode(episode.id, retry_at).await
+                {
+                    error!(anime_id, %reschedule_error, "failed to reschedule episode");
                 }
             }
         }

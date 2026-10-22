@@ -192,7 +192,7 @@ pub fn evaluate(
                         confirmation.minimum_uploader_followers
                     ));
                 }
-                None if !trust.manually_trusted => {
+                None => {
                     reputation_requires_review = true;
                     reasons.push(
                         "uploader follower count is unavailable; automatic confirmation is disabled"
@@ -571,6 +571,34 @@ mod tests {
             );
             assert!(evaluation.hard_reject);
             assert!(!evaluation.manual_review);
+        }
+    }
+
+    #[test]
+    fn missing_followers_require_review_even_for_explicitly_trusted_uploaders() {
+        let (anime, episode, mut candidate) = fixtures(1_420, "Silent Witch EP08");
+        candidate.uploader_follower_count = None;
+        for trust in [
+            UploaderTrust::default(),
+            UploaderTrust {
+                manually_trusted: true,
+                ..Default::default()
+            },
+            UploaderTrust {
+                globally_trusted: true,
+                ..Default::default()
+            },
+        ] {
+            let evaluation = evaluate(
+                &anime,
+                &episode,
+                &candidate,
+                &trust,
+                &ConfirmationConfig::default(),
+                &[],
+            );
+            assert!(evaluation.manual_review);
+            assert!(!evaluation.hard_reject);
         }
     }
 
