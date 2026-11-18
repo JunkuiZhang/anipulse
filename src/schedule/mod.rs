@@ -468,6 +468,9 @@ impl ScheduleProvider {
                 Utc::now(),
             )
             .await?;
+        // Retain the user-supplied lookup key even when only the catalog can
+        // resolve the schedule. The route is populated after verifying a match.
+        catalog_schedule.anilist_media_id = request.anilist_media_id;
         let has_bound_anime_schedule =
             request.anime_schedule_route.is_some() || request.anilist_media_id.is_some();
         // Unauthenticated direct access cannot work. A configured proxy owns its
@@ -1615,16 +1618,18 @@ fn anime_schedule_identity_title(media: &AnimeScheduleAnime) -> String {
 }
 
 fn anime_schedule_anilist_id(media: &AnimeScheduleAnime) -> Option<i64> {
-    media
-        .websites
-        .as_ref()?
-        .ani_list
-        .as_deref()?
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()?
-        .parse()
-        .ok()
+    let link = media.websites.as_ref()?.ani_list.as_deref()?.trim();
+    let url = url::Url::parse(link)
+        .or_else(|_| url::Url::parse(&format!("https://{link}")))
+        .ok()?;
+    if !matches!(url.host_str(), Some("anilist.co" | "www.anilist.co")) {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "anime" {
+        return None;
+    }
+    segments.next()?.parse().ok().filter(|id| *id > 0)
 }
 
 fn parse_chinese_number(value: &str) -> Option<i64> {
@@ -1834,6 +1839,24 @@ fn anime_schedule_matches_subject(
     if equivalent_title && exact_date_matches {
         return true;
     }
+    // A confirmed cross-site ID and matching TV premiere can corroborate a
+    // truncated native title. Installment markers must still agree.
+    if anilist_id_matches
+        && exact_date_matches
+        && !only_one_side_declares_installment
+        && platform.eq_ignore_ascii_case("TV")
+        && media
+            .media_types
+            .iter()
+            .any(|kind| kind.route.eq_ignore_ascii_case("tv"))
+        && media
+            .names
+            .as_ref()
+            .and_then(|names| names.native.as_deref())
+            .is_some_and(|native| is_truncated_native_title(&subject.name, native))
+    {
+        return true;
+    }
 
     let matching_installment = matching_single_ordinal(&subject_seasons, &media_seasons)
         || matching_single_ordinal(&subject_parts, &media_parts);
@@ -1856,6 +1879,21 @@ fn anime_schedule_matches_subject(
             .iter()
             .any(|media| subject == media || equivalent_title_spelling(subject, media))
     })
+}
+
+fn is_truncated_native_title(full: &str, shortened: &str) -> bool {
+    let compact = |title: &str| {
+        normalize_title(title)
+            .split_whitespace()
+            .collect::<String>()
+    };
+    let full = compact(full);
+    let shortened = compact(shortened);
+    contains_east_asian_text(&shortened)
+        && shortened.chars().count() >= 7
+        && full
+            .strip_prefix(&shortened)
+            .is_some_and(|suffix| (1..=4).contains(&suffix.chars().count()))
 }
 
 fn equivalent_title_spelling(left: &str, right: &str) -> bool {
@@ -2830,6 +2868,82 @@ mod tests {
     }
 
     #[test]
+    fn matching_anilist_id_and_tv_premiere_corroborate_a_truncated_title() {
+        let subject = BangumiSubject {
+            id: 456_078,
+            name: "マジカル★エクスプローラー".into(),
+            name_cn: "魔法★探险家".into(),
+            date: Some("2026-10-03".into()),
+            platform: Some("TV".into()),
+            total_episodes: Some(13),
+            rating: None,
+        };
+        let media: AnimeScheduleAnime = serde_json::from_value(serde_json::json!({
+            "route": "magical-explorer",
+            "title": "Magical★Explorer: Eroge no Yuujin Chara ni Tensei Shitakedo, Game Chishiki Tsukatte Jiyuu ni Ikiru",
+            "premier": "2026-10-03T00:00:00Z",
+            "websites": {"aniList": "anilist.co/anime/169581/MagicalExplorer-Eroge-no-Yuujin-Chara-ni-Tensei-Shitakedo-Game-Chishiki-Tsukatte-Jiyuu-ni-Ikiru/"},
+            "names": {"native": "マジカル★エクスプロ"},
+            "mediaTypes": [{"route": "tv"}]
+        }))
+        .unwrap();
+        let same_date = NaiveDate::from_ymd_opt(2026, 10, 3);
+        assert_eq!(anime_schedule_anilist_id(&media), Some(169_581));
+        assert!(anime_schedule_matches_subject(
+            &subject,
+            same_date,
+            &media,
+            Some(169_581),
+            14
+        ));
+
+        for id in [None, Some(169_582)] {
+            assert!(!anime_schedule_matches_subject(
+                &subject, same_date, &media, id, 14
+            ));
+        }
+        for date in [None, NaiveDate::from_ymd_opt(2026, 10, 4)] {
+            assert!(!anime_schedule_matches_subject(
+                &subject,
+                date,
+                &media,
+                Some(169_581),
+                14
+            ));
+        }
+
+        let mut wrong_type = media.clone();
+        wrong_type.media_types = vec![AnimeScheduleCategory {
+            route: "ona".into(),
+        }];
+        let mut wrong_season = media.clone();
+        wrong_season.title = "Magical Explorer Season 2".into();
+        let mut wrong_part = media.clone();
+        wrong_part.title = "Magical Explorer Part 2".into();
+        let mut unrelated = media.clone();
+        unrelated.names.as_mut().unwrap().native = Some("別のアニメタイトル".into());
+        let mut non_anilist_link = media.clone();
+        non_anilist_link.websites.as_mut().unwrap().ani_list =
+            Some("https://example.com/anime/169581".into());
+
+        for candidate in [
+            wrong_type,
+            wrong_season,
+            wrong_part,
+            unrelated,
+            non_anilist_link,
+        ] {
+            assert!(!anime_schedule_matches_subject(
+                &subject,
+                same_date,
+                &candidate,
+                Some(169_581),
+                14
+            ));
+        }
+    }
+
+    #[test]
     fn anime_schedule_mapping_uses_multilingual_core_title_and_explicit_season() {
         let subject = BangumiSubject {
             id: 616_808,
@@ -3205,7 +3319,7 @@ mod tests {
                     subject_id: Some(616_808),
                     next_episode: 1,
                     episode_mapping: None,
-                    anilist_media_id: None,
+                    anilist_media_id: Some(200_001),
                     anime_schedule_route: Some("yasei-no-last-boss-ga-arawareta-2nd-season"),
                     timezone: "Asia/Shanghai",
                 },
@@ -3215,6 +3329,8 @@ mod tests {
 
         assert_eq!(resolved.schedule_source, CATALOG_SOURCE);
         assert_eq!(resolved.schedule_confidence, "estimated");
+        assert_eq!(resolved.anilist_media_id, Some(200_001));
+        assert!(resolved.anime_schedule_route.is_none());
         assert_eq!(
             resolved.expected_at.unwrap().to_rfc3339(),
             "2026-10-03T13:30:00+00:00"
