@@ -233,6 +233,10 @@ fn build_router(state: WebState, config: &AppConfig) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/static/app.css", get(stylesheet))
+        .route(
+            "/static/tmdb-logo.svg",
+            get(async || svg_response(include_str!("../../static/tmdb-logo.svg"))),
+        )
         .route("/static/favicon.svg", get(favicon))
         .route("/favicon.ico", get(favicon))
         .route("/login", get(login_page).post(login_submit))
@@ -324,7 +328,11 @@ async fn stylesheet() -> Response {
 }
 
 async fn favicon() -> Response {
-    let mut response = APP_FAVICON.into_response();
+    svg_response(APP_FAVICON)
+}
+
+fn svg_response(svg: &'static str) -> Response {
+    let mut response = svg.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("image/svg+xml; charset=utf-8"),

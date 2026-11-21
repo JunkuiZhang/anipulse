@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
 use super::Repository;
@@ -11,25 +11,67 @@ pub(crate) struct ChapterKey {
     pub bangumi_number: i64,
 }
 
+#[derive(FromRow)]
+pub(crate) struct TmdbChapter {
+    #[sqlx(flatten)]
+    pub key: ChapterKey,
+    pub name: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct ChapterTranslations {
+    pub simplified: Option<String>,
+    pub traditional: Option<String>,
+    pub original: Option<String>,
+}
+
 impl Repository {
     pub(crate) async fn next_missing_chapter(&self) -> Result<Option<ChapterKey>> {
-        let now = Utc::now();
         Ok(sqlx::query_as(
-            r#"SELECT c.subject_id, c.subject_index, c.bangumi_number
-               FROM episode_chapter c
-               JOIN episode e ON e.id = c.episode_id
-               JOIN anime a ON a.id = e.anime_id
-               WHERE c.name_cn IS NULL AND (c.retry_at IS NULL OR c.retry_at <= ?)
-                 AND a.lifecycle != 'archived' AND e.watched_at IS NULL
-                 AND (EXISTS (SELECT 1 FROM monitorable_episode m WHERE m.id = e.id AND m.expected_at < ?)
-                      OR (e.state IN ('confirmed', 'notified')
-                          AND EXISTS (SELECT 1 FROM episode_video v WHERE v.episode_id = e.id)))
-               ORDER BY c.retry_at NULLS FIRST, e.expected_at, e.id LIMIT 1"#,
+            r#"SELECT subject_id, subject_index, bangumi_number FROM missing_chapter_translation
+               WHERE retry_at IS NULL OR retry_at <= ?
+               ORDER BY retry_at NULLS FIRST, expected_at, episode_id LIMIT 1"#,
         )
-        .bind(now)
-        .bind(now + Duration::days(7))
+        .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    pub(crate) async fn next_tmdb_chapter(&self) -> Result<Option<TmdbChapter>> {
+        Ok(sqlx::query_as(
+            r#"SELECT subject_id, subject_index, bangumi_number, name FROM missing_chapter_translation
+               WHERE retry_at IS NOT NULL AND tmdb_simplified IS NULL
+                 AND (tmdb_retry_at IS NULL OR tmdb_retry_at <= ?)
+               ORDER BY tmdb_retry_at NULLS FIRST, name IS NULL, expected_at, episode_id LIMIT 1"#,
+        )
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub(crate) async fn remember_tmdb_titles(
+        &self,
+        chapter: &TmdbChapter,
+        titles: &ChapterTranslations,
+        retry_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE bangumi_chapter_title SET
+                   tmdb_simplified = COALESCE(?, tmdb_simplified),
+                   tmdb_traditional = COALESCE(?, tmdb_traditional),
+                   tmdb_original = COALESCE(?, tmdb_original), tmdb_retry_at = ?
+               WHERE subject_id = ? AND subject_index = ? AND bangumi_number = ? AND name_cn IS NULL AND name IS ?"#,
+        )
+        .bind(&titles.simplified)
+        .bind(&titles.traditional)
+        .bind(&titles.original)
+        .bind(retry_at)
+        .bind(chapter.key.subject_id)
+        .bind(chapter.key.subject_index)
+        .bind(chapter.key.bangumi_number)
+        .bind(&chapter.name)
+        .execute(&self.pool).await?;
+        Ok(())
     }
 
     pub(crate) async fn remember_chapter_title(

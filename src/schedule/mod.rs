@@ -33,6 +33,8 @@ const TIMETABLE_CACHE_SECS: u64 = 900;
 const TIMETABLE_FAILURE_CACHE_SECS: u64 = 60;
 const MAX_CACHED_TIMETABLES: usize = 16;
 
+mod tmdb;
+
 #[cfg(test)]
 mod episode_tests;
 

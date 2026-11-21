@@ -22,6 +22,10 @@ pub async fn run(
 ) -> Result<()> {
     let schedule = ScheduleSynchronizer::new(repository.clone(), config.schedule.clone())?;
     let application = ApplicationService::new(repository.clone(), config.clone());
+    let mut background = tokio::task::JoinSet::new();
+    let title_sync = schedule.clone();
+    let tick = Duration::from_secs(config.scheduler.tick_secs);
+    background.spawn(async move { title_sync.run_tmdb_title_updates(tick).await });
     info!(tick_secs = config.scheduler.tick_secs, "scheduler started");
     loop {
         repository.update_scheduler_heartbeat().await?;

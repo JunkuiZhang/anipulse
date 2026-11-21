@@ -4,4 +4,8 @@
 <div class="page-heading"><div><p class="eyebrow">STATUS</p><h1>服务状态</h1></div></div>
 <section class="panel details"><dl><dt>Scheduler</dt><dd>{{ scheduler }}</dd><dt>Bilibili</dt><dd>{{ provider }}</dd><dt>显示时区</dt><dd>{{ timezone }}</dd><dt>通知 Provider</dt><dd>{{ notification_provider }}</dd><dt>自动排期</dt><dd>{{ schedule_source }}</dd><dt>公开地址</dt><dd>{{ public_url }}</dd></dl></section>
 <form method="post" action="/notification/test"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">发送测试通知</button></form>
+<section class="panel"><h2>数据来源与致谢</h2>
+  <a href="https://www.themoviedb.org/"><img src="/static/tmdb-logo.svg" width="92" height="12" alt="TMDB"></a>
+  <p>TMDB 提供补充分集译名。<span lang="en">This product uses the TMDB API but is not endorsed or certified by TMDB.</span></p>
+</section>
 {% endblock %}
