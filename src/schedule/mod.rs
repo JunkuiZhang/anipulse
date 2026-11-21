@@ -18,7 +18,7 @@ use crate::{
     detector::title::normalize_title,
     domain::{EpisodeNumberMapping, ScheduleUpdate},
     error::{AppError, Result},
-    repository::{ChapterKey, Repository},
+    repository::{ChapterKey, ChapterRequest, Repository},
 };
 
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
@@ -182,6 +182,20 @@ struct BangumiEpisode {
     ep: f64,
 }
 
+impl BangumiEpisode {
+    /// Only a numbered regular chapter whose season number also matches its list position
+    /// can establish an origin. Fractional chapters and missing numbers cannot.
+    fn first_number(&self, position: i64) -> Option<i64> {
+        if self.ep != position as f64
+            || self.sort.fract() != 0.0
+            || !(position as f64..=10_000.0).contains(&self.sort)
+        {
+            return None;
+        }
+        Some(self.sort as i64 - position + 1)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BangumiSubject {
     id: i64,
@@ -330,6 +344,17 @@ struct ExpectedSchedule {
 struct EpisodeScheduleTarget {
     local_episode: i64,
     mapping: Option<EpisodeNumberMapping>,
+}
+
+impl EpisodeScheduleTarget {
+    fn chapter_numbers(self) -> Result<(i64, Option<i64>)> {
+        if let Some(mapping) = self.mapping {
+            let (index, number) = mapping.mapped_numbers(self.local_episode)?;
+            Ok((index, Some(number)))
+        } else {
+            Ok((self.local_episode, None))
+        }
+    }
 }
 
 impl ScheduleProvider {
@@ -602,27 +627,16 @@ impl ScheduleProvider {
                 item.title
             ))
         })?;
-        let (subject_episode_index, bangumi_episode_no) = episode_target
-            .mapping
-            .map(|mapping| mapping.mapped_numbers(next_episode))
-            .transpose()?
-            .unwrap_or((next_episode, next_episode));
-        let bangumi_origin_episode = episode_target
-            .mapping
-            .map(|mapping| mapping.bangumi_origin)
-            .unwrap_or(1);
+        let (subject_episode_index, manual_number) = episode_target.chapter_numbers()?;
+        let bangumi_origin_episode = episode_target.mapping.map(|mapping| mapping.bangumi_origin);
         let mut source_health_error = None;
         let (target_airdate, subject_episode_count) = match self
-            .episode_airdate(
-                bangumi_subject_id,
-                subject_episode_index,
-                bangumi_episode_no,
-            )
+            .episode_airdate(bangumi_subject_id, subject_episode_index, manual_number)
             .await
         {
             Ok(value) => (value.airdate, value.total_episodes),
             Err(error) => {
-                warn!(bangumi_subject_id, next_episode, bangumi_episode_no, %error, "Bangumi episode date unavailable; using a lower-confidence schedule");
+                warn!(bangumi_subject_id, next_episode, manual_number, %error, "Bangumi episode date unavailable; using a lower-confidence schedule");
                 source_health_error = Some(error.to_string());
                 (None, None)
             }
@@ -710,13 +724,13 @@ impl ScheduleProvider {
         &self,
         subject_id: i64,
         subject_episode_index: i64,
-        bangumi_episode_no: i64,
+        manual_number: Option<i64>,
     ) -> Result<EpisodeLookup> {
         let (episode, total_episodes) = self
-            .lookup_chapter(ChapterKey {
+            .lookup_chapter(ChapterRequest {
                 subject_id,
                 subject_index: subject_episode_index,
-                bangumi_number: bangumi_episode_no,
+                manual_number,
             })
             .await?;
         let airdate = parse_metadata_date(
@@ -731,9 +745,32 @@ impl ScheduleProvider {
 
     async fn lookup_chapter(
         &self,
-        key: ChapterKey,
+        request: ChapterRequest,
     ) -> Result<(Option<BangumiEpisode>, Option<i64>)> {
-        let result = self.fetch_chapter(key).await;
+        let bangumi_number = match (request.manual_number, &self.chapter_cache) {
+            (Some(number), _) => number,
+            (None, Some(cache)) => {
+                let first = cache
+                    .detected_first_number(request.subject_id)
+                    .await?
+                    .unwrap_or(1);
+                EpisodeNumberMapping {
+                    local_origin: 1,
+                    bangumi_origin: first,
+                }
+                .mapped_numbers(request.subject_index)?
+                .1
+            }
+            (None, None) => request.subject_index,
+        };
+        let mut key = ChapterKey {
+            subject_id: request.subject_id,
+            subject_index: request.subject_index,
+            bangumi_number,
+        };
+        let result = self
+            .fetch_chapter(&mut key, request.manual_number.is_none())
+            .await;
         if let Some(cache) = &self.chapter_cache {
             let episode = result.as_ref().ok().and_then(|(e, _)| e.as_ref());
             let retry_secs = if result.is_err() {
@@ -758,9 +795,40 @@ impl ScheduleProvider {
 
     async fn fetch_chapter(
         &self,
-        key: ChapterKey,
+        key: &mut ChapterKey,
+        automatic: bool,
     ) -> Result<(Option<BangumiEpisode>, Option<i64>)> {
-        let offset = key.subject_index - 1;
+        let page = self.chapter_page(key.subject_id, key.subject_index).await?;
+        let total = page.total.filter(|t| (1..=10_000).contains(t));
+        let Some(episode) = page.data.into_iter().next() else {
+            return Ok((None, total));
+        };
+        if automatic
+            && episode.sort != key.bangumi_number as f64
+            && let Some(first) = episode.first_number(key.subject_index)
+        {
+            // Verify the offset against a different regular episode of the same subject.
+            let peer_index = if key.subject_index == 1 { 2 } else { 1 };
+            let peer = self.chapter_page(key.subject_id, peer_index).await?;
+            if peer.data.first().and_then(|e| e.first_number(peer_index)) == Some(first) {
+                if let Some(cache) = &self.chapter_cache {
+                    cache.remember_first_number(key.subject_id, first).await?;
+                }
+                key.bangumi_number = episode.sort as i64;
+            }
+        }
+        let matches = if automatic && key.bangumi_number != key.subject_index {
+            episode.ep == key.subject_index as f64 && episode.sort == key.bangumi_number as f64
+        } else if episode.sort > 0.0 {
+            (episode.sort - key.bangumi_number as f64).abs() <= 0.01
+        } else {
+            (episode.ep - key.subject_index as f64).abs() <= 0.01
+        };
+        Ok((matches.then_some(episode), total))
+    }
+
+    async fn chapter_page(&self, subject_id: i64, subject_index: i64) -> Result<PagedEpisodes> {
+        let offset = subject_index - 1;
         let response = self
             .client
             .get(format!(
@@ -768,7 +836,7 @@ impl ScheduleProvider {
                 self.config.bangumi_api_base_url.trim_end_matches('/')
             ))
             .query(&[
-                ("subject_id", key.subject_id.to_string()),
+                ("subject_id", subject_id.to_string()),
                 ("type", "0".into()),
                 ("limit", "1".into()),
                 ("offset", offset.to_string()),
@@ -786,21 +854,11 @@ impl ScheduleProvider {
             .bytes()
             .await
             .map_err(|error| safe_request_error(error, "Bangumi episode API response"))?;
-        let page: PagedEpisodes = serde_json::from_slice(&body).map_err(|error| {
+        serde_json::from_slice(&body).map_err(|error| {
             AppError::Schedule(format!(
                 "Bangumi episode API returned invalid JSON: {error}"
             ))
-        })?;
-        let total_episodes = page.total.filter(|total| *total > 0 && *total <= 10_000);
-        // `ep` is local to a subject, while `sort` can be series-wide (e.g. 78..85).
-        let episode = page.data.into_iter().next().filter(|episode| {
-            if episode.sort > 0.0 {
-                (episode.sort - key.bangumi_number as f64).abs() <= 0.01
-            } else {
-                (episode.ep - key.subject_index as f64).abs() <= 0.01
-            }
-        });
-        Ok((episode, total_episodes))
+        })
     }
 
     async fn resolve_anime_schedule_fallback(
@@ -821,16 +879,12 @@ impl ScheduleProvider {
             .parse::<Tz>()
             .map_err(|_| AppError::Schedule(format!("invalid timezone: {timezone}")))?;
         let subject = self.bangumi_subject(subject_id).await?;
-        let (subject_episode_index, bangumi_episode_no) = episode_target
-            .mapping
-            .map(|mapping| mapping.mapped_numbers(episode_target.local_episode))
-            .transpose()?
-            .unwrap_or((episode_target.local_episode, episode_target.local_episode));
+        let (subject_episode_index, manual_number) = episode_target.chapter_numbers()?;
         // Chapter dates improve estimates, but are not a prerequisite for an
         // independently verified AnimeSchedule episode. In particular, a
         // Bangumi timeout must not prevent the timetable request below.
         let (episode, bangumi_health_error) = match self
-            .episode_airdate(subject_id, subject_episode_index, bangumi_episode_no)
+            .episode_airdate(subject_id, subject_episode_index, manual_number)
             .await
         {
             Ok(episode) => (episode, None),
@@ -3795,7 +3849,10 @@ mod tests {
         });
         let provider = provider(&format!("http://{address}"));
 
-        let lookup = provider.episode_airdate(633_836, 13, 90).await.unwrap();
+        let lookup = provider
+            .episode_airdate(633_836, 13, Some(90))
+            .await
+            .unwrap();
 
         assert!(lookup.airdate.is_none());
         assert_eq!(lookup.total_episodes, Some(12));

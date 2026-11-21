@@ -7,7 +7,7 @@ mod provider;
 mod provider_tests;
 mod releases;
 mod sqlite;
-pub(crate) use chapters::{ChapterKey, ChapterTranslations, TmdbChapter};
+pub(crate) use chapters::{ChapterKey, ChapterRequest, ChapterTranslations, TmdbChapter};
 pub use collections::CollectionDraft;
 pub use provider::{ProviderBackoff, ProviderPermit, ProviderScope};
 pub use releases::ReleaseProgress;

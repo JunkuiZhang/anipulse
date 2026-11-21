@@ -229,7 +229,12 @@ async fn dashboard_chapter_backfill_respects_mapping_translation_and_retries() {
     );
     assert!(repo.next_missing_chapter().await.unwrap().is_none());
     fixture.episode_outage.store(true, Ordering::Relaxed);
-    assert!(sync.provider.episode_airdate(542_007, 1, 78).await.is_err());
+    assert!(
+        sync.provider
+            .episode_airdate(542_007, 1, Some(78))
+            .await
+            .is_err()
+    );
     assert_eq!(
         repo.upcoming_releases(until).await.unwrap()[0]
             .chapter_title
@@ -252,6 +257,79 @@ async fn dashboard_chapter_backfill_respects_mapping_translation_and_retries() {
             .is_none()
     );
     assert!(repo.next_missing_chapter().await.unwrap().is_none());
+    assert_eq!(repo.detected_first_number(542_007).await.unwrap(), None);
+
+    // Clearing the manual setting restores automatic detection for this existing anime.
+    repo.set_episode_number_mapping(id, None).await.unwrap();
+    sync.refresh_missing_chapter_title().await.unwrap();
+    assert_eq!(repo.detected_first_number(542_007).await.unwrap(), Some(78));
+    assert_eq!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .as_deref(),
+        Some("归途")
+    );
+    let calls = fixture.requests.lock().await.len();
+    let date = sync
+        .provider
+        .episode_airdate(542_007, 1, None)
+        .await
+        .unwrap()
+        .airdate;
+    assert_eq!(date, NaiveDate::from_ymd_opt(2026, 10, 3));
+    assert_eq!(fixture.requests.lock().await.len(), calls + 1);
+    // Even an explicit 1 ↔ 1 overrides a learned offset, without reusing its titles.
+    repo.set_episode_number_mapping(
+        id,
+        Some(EpisodeNumberMapping {
+            local_origin: 1,
+            bangumi_origin: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    sync.refresh_missing_chapter_title().await.unwrap();
+    assert!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn automatic_numbering_requires_agreement_between_two_regular_chapters() {
+    use axum::{Json, Router, extract::Query, routing::get};
+    let app = Router::new().route(
+        "/v0/episodes",
+        get(|Query(params): Query<HashMap<String, String>>| async move {
+            let position: i64 = params["offset"].parse::<i64>().unwrap() + 1;
+            let sort = match position {
+                1 => 13.0,
+                2 => 17.0,
+                3 => 15.5,
+                _ => 16.0,
+            };
+            let ep = if position == 4 { 3 } else { position };
+            Json(json!({"total":4, "data":[{"ep":ep, "sort":sort, "airdate":"2026-10-03"}]}))
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let repo = Repository::connect(":memory:").await.unwrap();
+    let provider = ScheduleProvider::new(ScheduleConfig {
+        bangumi_api_base_url: format!("http://{addr}"),
+        ..Default::default()
+    })
+    .unwrap()
+    .with_chapter_cache(repo.clone());
+    for position in 1..=4 {
+        let result = provider.episode_airdate(100, position, None).await.unwrap();
+        assert!(result.airdate.is_none());
+        assert_eq!(result.total_episodes, Some(4));
+    }
+    assert_eq!(repo.detected_first_number(100).await.unwrap(), None);
+    task.abort();
 }
 
 #[tokio::test]

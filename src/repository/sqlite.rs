@@ -4746,7 +4746,16 @@ mod tests {
         let key = repository.next_missing_chapter().await.unwrap().unwrap();
         assert_eq!(key.subject_index, episode.episode_no);
         repository
-            .remember_chapter_title(key, Some("重逢"), None, until)
+            .remember_chapter_title(
+                crate::repository::ChapterKey {
+                    subject_id: key.subject_id,
+                    subject_index: key.subject_index,
+                    bangumi_number: key.manual_number.unwrap_or(key.subject_index),
+                },
+                Some("重逢"),
+                None,
+                until,
+            )
             .await
             .unwrap();
         let queued = repository.watch_queue(50).await.unwrap();

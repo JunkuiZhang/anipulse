@@ -185,7 +185,11 @@ impl Tmdb<'_> {
         decode_metadata_response(response, "TMDB").await.map(Some)
     }
 
-    async fn resolve(&mut self, subject: &BangumiSubject) -> Result<Option<Binding>> {
+    async fn resolve(
+        &mut self,
+        subject: &BangumiSubject,
+        bangumi_first_number: i64,
+    ) -> Result<Option<Binding>> {
         let Some(premiere) = subject
             .date
             .as_deref()
@@ -241,9 +245,6 @@ impl Tmdb<'_> {
             return Ok(None);
         };
         let expected_seasons = super::season_numbers([&subject.name, &subject.name_cn]);
-        if !expected_seasons.is_empty() && !expected_seasons.contains(&season) {
-            return Ok(None);
-        }
         if seasons.get(1).is_some_and(|s| s.0 == date) {
             return Ok(None);
         }
@@ -253,14 +254,22 @@ impl Tmdb<'_> {
         else {
             return Ok(None);
         };
-        Ok(
-            first_episode(&list.episodes, premiere).map(|first_episode| Binding {
-                series_id: series.id,
-                season,
-                first_episode,
-                original_language: series.original_language,
-            }),
-        )
+        let Some(first_episode) = first_episode(&list.episodes, premiere) else {
+            return Ok(None);
+        };
+        // TMDB sometimes combines multiple broadcast seasons into season 1. The premiere
+        // date and the verified series-wide episode number must both pinpoint its start.
+        let merged_season =
+            season == 1 && first_episode > 1 && first_episode == bangumi_first_number;
+        if !expected_seasons.is_empty() && !expected_seasons.contains(&season) && !merged_season {
+            return Ok(None);
+        }
+        Ok(Some(Binding {
+            series_id: series.id,
+            season,
+            first_episode,
+            original_language: series.original_language,
+        }))
     }
 }
 
@@ -322,7 +331,8 @@ impl ScheduleSynchronizer {
         chapter: &TmdbChapter,
     ) -> Result<ChapterTranslations> {
         let subject_id = chapter.key.subject_id;
-        let cache_key = format!("tmdb:subject:{subject_id}");
+        let first_number = chapter.key.bangumi_number - chapter.key.subject_index + 1;
+        let cache_key = format!("tmdb:subject:{subject_id}:first:{first_number}");
         let binding: Option<Binding> =
             if let Some(cached) = self.repository.cached_provider_value(&cache_key).await? {
                 serde_json::from_value(cached)
@@ -332,7 +342,7 @@ impl ScheduleSynchronizer {
                 if subject.id != subject_id {
                     return Err(AppError::Schedule("unexpected Bangumi subject ID".into()));
                 }
-                let binding = tmdb.resolve(&subject).await?;
+                let binding = tmdb.resolve(&subject, first_number).await?;
                 let ttl = if binding.is_some() {
                     7 * 86400
                 } else {
@@ -426,6 +436,36 @@ mod tests {
         assert!(titles.simplified.is_none());
         assert_eq!(titles.traditional.as_deref(), Some("邁向目標"));
         assert_eq!(titles.original.as_deref(), Some("目指す先"));
+    }
+
+    #[tokio::test]
+    async fn merged_season_requires_matching_premiere_and_cumulative_number() {
+        let app = Router::new().fallback(|uri: Uri| async move {
+            Json(match uri.path() {
+                "/search/tv" => json!({"results":[{"id":12,"name":"旅路","original_name":"旅路","original_language":"ja"}]}),
+                "/tv/12" => json!({"seasons":[{"season_number":1,"air_date":"2025-10-04"}]}),
+                "/tv/12/season/1" => json!({"episodes":[{"episode_number":1,"air_date":"2025-10-04"},{"episode_number":13,"air_date":"2026-10-03"}]}),
+                path => panic!("unexpected path: {path}"),
+            })
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut tmdb = Tmdb {
+            client: &Client::new(),
+            base: &base,
+            token: "fixture".into(),
+            cooldown: Duration::ZERO,
+        };
+        let mut subject: BangumiSubject =
+            serde_json::from_value(json!({"id":100,"name":"旅路 第2期","date":"2026-10-03"}))
+                .unwrap();
+        assert!(tmdb.resolve(&subject, 1).await.unwrap().is_none());
+        let binding = tmdb.resolve(&subject, 13).await.unwrap().unwrap();
+        assert_eq!((binding.season, binding.first_episode), (1, 13));
+        subject.date = Some("2026-10-10".into());
+        assert!(tmdb.resolve(&subject, 13).await.unwrap().is_none());
+        task.abort();
     }
 
     #[tokio::test]

@@ -100,7 +100,7 @@
   {% if auto_schedule %}
   <details class="mapping-options detail-mapping-options">
     <summary>集数映射{% if has_episode_mapping %} · {{ episode_mapping }}{% endif %}</summary>
-    <p class="muted">仅在站内集数和 Bangumi 编号不同的时候填写。清空两项可恢复普通的 EP1 ↔ EP1 排期。</p>
+    <p class="muted">留空时自动识别 Bangumi 的跨季连续编号。需要指定起点时填入两项，清空可恢复自动识别。</p>
     <form method="post" action="/anime/{{ id }}/episode-mapping" class="mapping-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <label>站内起始集数<input type="number" name="search_episode_start" min="1" max="10000" value="{{ mapping_search_start }}" placeholder="例如 12"></label>

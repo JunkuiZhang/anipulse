@@ -12,6 +12,13 @@ pub(crate) struct ChapterKey {
 }
 
 #[derive(FromRow)]
+pub(crate) struct ChapterRequest {
+    pub subject_id: i64,
+    pub subject_index: i64,
+    pub manual_number: Option<i64>,
+}
+
+#[derive(FromRow)]
 pub(crate) struct TmdbChapter {
     #[sqlx(flatten)]
     pub key: ChapterKey,
@@ -26,15 +33,41 @@ pub(crate) struct ChapterTranslations {
 }
 
 impl Repository {
-    pub(crate) async fn next_missing_chapter(&self) -> Result<Option<ChapterKey>> {
+    pub(crate) async fn next_missing_chapter(&self) -> Result<Option<ChapterRequest>> {
         Ok(sqlx::query_as(
-            r#"SELECT subject_id, subject_index, bangumi_number FROM missing_chapter_translation
+            r#"SELECT subject_id, subject_index, CASE WHEN manually_mapped THEN bangumi_number END AS manual_number
+               FROM missing_chapter_translation
                WHERE retry_at IS NULL OR retry_at <= ?
                ORDER BY retry_at NULLS FIRST, expected_at, episode_id LIMIT 1"#,
         )
         .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    pub(crate) async fn detected_first_number(&self, subject_id: i64) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT first_number FROM bangumi_episode_numbering WHERE subject_id = ?",
+        )
+        .bind(subject_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub(crate) async fn remember_first_number(
+        &self,
+        subject_id: i64,
+        first_number: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bangumi_episode_numbering (subject_id, first_number) VALUES (?, ?)
+                     ON CONFLICT(subject_id) DO UPDATE SET first_number = excluded.first_number",
+        )
+        .bind(subject_id)
+        .bind(first_number)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn next_tmdb_chapter(&self) -> Result<Option<TmdbChapter>> {

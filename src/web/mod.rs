@@ -1532,10 +1532,20 @@ async fn anime_detail(
         state.config.confirmation.trusted_confirmed_count,
         state.display_timezone,
     );
-    let episode_mapping = anime
+    let manual_mapping = anime
         .anime
         .local_episode_origin
-        .zip(anime.anime.bangumi_episode_origin)
+        .zip(anime.anime.bangumi_episode_origin);
+    let detected = match (manual_mapping, anime.anime.bangumi_subject_id) {
+        (None, Some(id)) => state
+            .repository
+            .detected_first_number(id)
+            .await?
+            .filter(|&first| first > 1),
+        _ => None,
+    };
+    let episode_mapping = manual_mapping
+        .or_else(|| detected.map(|first| (1, first)))
         .map(|(local_origin, bangumi_origin)| {
             let mapping = EpisodeNumberMapping {
                 local_origin,
@@ -1552,7 +1562,12 @@ async fn anime_detail(
                         })
                 })
                 .unwrap_or_default();
-            format!("站内 EP{local_origin} ↔ Bangumi EP{bangumi_origin}{current}")
+            let source = if detected.is_some() {
+                "自动识别 · "
+            } else {
+                ""
+            };
+            format!("{source}站内 EP{local_origin} ↔ Bangumi EP{bangumi_origin}{current}")
         })
         .unwrap_or_default();
     let total_episodes = anime
