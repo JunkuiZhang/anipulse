@@ -10,7 +10,7 @@ use crate::{
 use chrono::{NaiveDate, TimeDelta, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{env, sync::LazyLock, time::Duration};
+use std::{collections::HashSet, env, sync::LazyLock, time::Duration};
 use tracing::warn;
 
 const PRIMARY: &str = "https://api.themoviedb.org/3";
@@ -199,7 +199,8 @@ impl Tmdb<'_> {
         };
         let queries = [series_query(&subject.name), series_query(&subject.name_cn)];
         let names = queries.map(compact);
-        let mut series = None;
+        let expected_seasons = super::season_numbers([&subject.name, &subject.name_cn]);
+        let mut checked = HashSet::new();
         for (idx, &query) in queries.iter().enumerate() {
             if query.is_empty() || queries[..idx].contains(&query) {
                 continue;
@@ -210,23 +211,38 @@ impl Tmdb<'_> {
             else {
                 continue;
             };
-            let mut exact = page.results.into_iter().filter(|s| {
+            let exact = page.results.into_iter().filter(|s| {
                 [&s.name, &s.original_name]
                     .iter()
                     .map(|s| compact(s))
                     .any(|n| !n.is_empty() && names.contains(&n))
             });
-            if let Some(hit) = exact.next() {
-                if exact.next().is_some() {
-                    return Ok(None);
+            let mut binding = None;
+            for series in exact.filter(|s| checked.insert(s.id)) {
+                if let Some(hit) = self
+                    .bind_series(series, premiere, &expected_seasons, bangumi_first_number)
+                    .await?
+                {
+                    if binding.is_some() {
+                        return Ok(None);
+                    }
+                    binding = Some(hit);
                 }
-                series = Some(hit);
-                break;
+            }
+            if binding.is_some() {
+                return Ok(binding);
             }
         }
-        let Some(series) = series else {
-            return Ok(None);
-        };
+        Ok(None)
+    }
+
+    async fn bind_series(
+        &mut self,
+        series: Series,
+        premiere: NaiveDate,
+        expected_seasons: &HashSet<i64>,
+        bangumi_first_number: i64,
+    ) -> Result<Option<Binding>> {
         let path = format!("/tv/{}", series.id);
         let Some(details) = self.get::<SeriesDetails>(&path, &[]).await? else {
             return Ok(None);
@@ -244,7 +260,6 @@ impl Tmdb<'_> {
         let Some(&(date, season)) = seasons.first() else {
             return Ok(None);
         };
-        let expected_seasons = super::season_numbers([&subject.name, &subject.name_cn]);
         if seasons.get(1).is_some_and(|s| s.0 == date) {
             return Ok(None);
         }
@@ -440,13 +455,18 @@ mod tests {
 
     #[tokio::test]
     async fn merged_season_requires_matching_premiere_and_cumulative_number() {
-        let app = Router::new().fallback(|uri: Uri| async move {
-            Json(match uri.path() {
-                "/search/tv" => json!({"results":[{"id":12,"name":"旅路","original_name":"旅路","original_language":"ja"}]}),
-                "/tv/12" => json!({"seasons":[{"season_number":1,"air_date":"2025-10-04"}]}),
-                "/tv/12/season/1" => json!({"episodes":[{"episode_number":1,"air_date":"2025-10-04"},{"episode_number":13,"air_date":"2026-10-03"}]}),
+        let duplicate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serve_duplicate = duplicate.clone();
+        let app = Router::new().fallback(move |uri: Uri| {
+            let duplicated = serve_duplicate.load(Ordering::Relaxed);
+            let body = match uri.path() {
+                "/search/tv" => json!({"results":[{"id":12,"name":"旅路","original_name":"旅路","original_language":"ja"},{"id":13,"name":"旅路","original_name":"旅路","original_language":"ja"}]}),
+                "/tv/13" if !duplicated => json!({"seasons":[{"season_number":1,"air_date":null}]}),
+                "/tv/12" | "/tv/13" => json!({"seasons":[{"season_number":1,"air_date":"2025-10-04"}]}),
+                "/tv/12/season/1" | "/tv/13/season/1" => json!({"episodes":[{"episode_number":1,"air_date":"2025-10-04"},{"episode_number":13,"air_date":"2026-10-03"}]}),
                 path => panic!("unexpected path: {path}"),
-            })
+            };
+            async move { Json(body) }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -463,6 +483,8 @@ mod tests {
         assert!(tmdb.resolve(&subject, 1).await.unwrap().is_none());
         let binding = tmdb.resolve(&subject, 13).await.unwrap().unwrap();
         assert_eq!((binding.season, binding.first_episode), (1, 13));
+        duplicate.store(true, Ordering::Relaxed);
+        assert!(tmdb.resolve(&subject, 13).await.unwrap().is_none());
         subject.date = Some("2026-10-10".into());
         assert!(tmdb.resolve(&subject, 13).await.unwrap().is_none());
         task.abort();
