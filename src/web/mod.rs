@@ -520,9 +520,9 @@ struct UpcomingReleaseView {
     cover_url: String,
     has_cover: bool,
     cover_initial: String,
-    episode: String,
-    episode_total: String,
-    has_episode_total: bool,
+    episode_no: i64,
+    chapter_title: Option<String>,
+    total_episodes: Option<i64>,
     day: String,
     time: String,
     awaiting_update: bool,
@@ -533,7 +533,8 @@ struct WatchQueueView {
     episode_id: i64,
     anime_id: i64,
     title: String,
-    episode: String,
+    episode_no: i64,
+    chapter_title: Option<String>,
     video_title: String,
     url: String,
     updated_at: String,
@@ -545,8 +546,15 @@ struct WatchQueueView {
 struct WatchGroup {
     anime_id: i64,
     title: String,
+    total_episodes: Option<i64>,
     items: Vec<WatchQueueView>,
 }
+impl WatchGroup {
+    fn next_to_watch(&self) -> Option<&WatchQueueView> {
+        self.items.iter().min_by_key(|item| item.episode_no)
+    }
+}
+
 struct BatchProgressView {
     anime_id: i64,
     title: String,
@@ -584,12 +592,9 @@ async fn dashboard(
                 title: release.title,
                 has_cover: cover_url.is_some(),
                 cover_url: cover_url.unwrap_or_default(),
-                episode: format!("EP{}", release.episode_no),
-                episode_total: release
-                    .total_episodes
-                    .map(|total| format!("全 {total} 集"))
-                    .unwrap_or_default(),
-                has_episode_total: release.total_episodes.is_some(),
+                episode_no: release.episode_no,
+                total_episodes: release.total_episodes,
+                chapter_title: release.chapter_title,
                 day: format!(
                     "{} · {}",
                     local.format("%m月%d日"),
@@ -605,34 +610,29 @@ async fn dashboard(
             }
         })
         .collect();
-    let watch_queue: Vec<WatchQueueView> = state
-        .repository
-        .watch_queue(50)
-        .await?
-        .into_iter()
-        .filter_map(|episode| {
-            let url = canonical_bilibili_part_url(&episode.bvid, episode.page_no)?;
-            let cover_url = episode.bangumi_subject_id.and_then(bangumi_cover_url);
-            Some(WatchQueueView {
-                episode_id: episode.episode_id,
-                anime_id: episode.anime_id,
-                cover_initial: title_initial(&episode.anime_title),
-                title: episode.anime_title,
-                episode: format!("EP{}", episode.episode_no),
-                video_title: clean_bilibili_title(&episode.video_title),
-                url,
-                updated_at: episode
-                    .released_at
-                    .with_timezone(&state.display_timezone)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string(),
-                has_cover: cover_url.is_some(),
-                cover_url: cover_url.unwrap_or_default(),
-            })
-        })
-        .collect();
     let mut watch_groups: Vec<WatchGroup> = vec![];
-    for item in watch_queue {
+    for episode in state.repository.watch_queue(50).await? {
+        let Some(url) = canonical_bilibili_part_url(&episode.bvid, episode.page_no) else {
+            continue;
+        };
+        let cover_url = episode.bangumi_subject_id.and_then(bangumi_cover_url);
+        let item = WatchQueueView {
+            episode_id: episode.episode_id,
+            anime_id: episode.anime_id,
+            cover_initial: title_initial(&episode.anime_title),
+            title: episode.anime_title,
+            episode_no: episode.episode_no,
+            chapter_title: episode.chapter_title,
+            video_title: clean_bilibili_title(&episode.video_title),
+            url,
+            updated_at: episode
+                .released_at
+                .with_timezone(&state.display_timezone)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            has_cover: cover_url.is_some(),
+            cover_url: cover_url.unwrap_or_default(),
+        };
         if let Some(group) = watch_groups
             .iter_mut()
             .find(|g| g.anime_id == item.anime_id)
@@ -642,6 +642,7 @@ async fn dashboard(
             watch_groups.push(WatchGroup {
                 anime_id: item.anime_id,
                 title: item.title.clone(),
+                total_episodes: episode.total_episodes,
                 items: vec![item],
             });
         }

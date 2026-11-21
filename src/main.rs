@@ -493,7 +493,8 @@ async fn handle_anime(
             let (expected_weekday, expected_time, expected_at, auto_schedule) = if args
                 .auto_schedule
             {
-                let provider = ScheduleProvider::new(config.schedule.clone())?;
+                let provider = ScheduleProvider::new(config.schedule.clone())?
+                    .with_chapter_cache(repository.clone());
                 let catalog = provider.load_catalog().await?;
                 let resolved = provider
                     .resolve_auto(

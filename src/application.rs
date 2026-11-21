@@ -662,7 +662,8 @@ impl ApplicationService {
             .await?;
         let request: AnimeDraftRequest = serde_json::from_str(&draft)
             .map_err(|_| AppError::InvalidInput("anime draft payload is invalid".into()))?;
-        let provider = ScheduleProvider::new(self.config.schedule.clone())?;
+        let provider = ScheduleProvider::new(self.config.schedule.clone())?
+            .with_chapter_cache(self.repository.clone());
         let catalog = provider.load_catalog().await?;
         let resolved = provider
             .resolve_auto(

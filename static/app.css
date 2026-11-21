@@ -189,7 +189,8 @@ a { color: inherit; }
 
 .upcoming-cover {
   width: 104px;
-  height: 140px;
+  height: 100%;
+  min-height: 140px;
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -232,7 +233,30 @@ a { color: inherit; }
   white-space: nowrap;
 }
 
+.chapter-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  line-height: 1.45;
+}
+
+.chapter-number {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: #935036;
+  font-size: 0.72rem;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
+.chapter-name { overflow-wrap: anywhere; font-size: 0.94rem; font-weight: 600; }
+.chapter-missing { color: var(--muted); font-size: 0.82rem; font-weight: 400; }
+
 .upcoming-meta {
+  margin-top: 7px;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -247,9 +271,6 @@ a { color: inherit; }
   gap: 6px;
 }
 
-.episode-progress strong { color: var(--muted); }
-
-.episode-progress small,
 .library-episode small {
   padding: 2px 7px;
   border: 1px solid rgba(216, 138, 104, 0.18);
@@ -262,7 +283,7 @@ a { color: inherit; }
   white-space: nowrap;
 }
 
-.upcoming-kind::before {
+.upcoming-meta > span + .upcoming-kind::before {
   margin-right: 7px;
   content: "·";
 }
@@ -330,7 +351,34 @@ a { color: inherit; }
   text-decoration: none;
 }
 
-.watch-heading > div:first-child { min-width: 0; }
+.watch-group > summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.watch-group[open] > summary { margin-bottom: 14px; }
+.watch-preview { display: block; margin: 7px 0 0 1em; }
+.watch-group[open] .watch-preview { display: none; }
+
+.watch-group-counts {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-inline-start: 10px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.watch-group-counts > span {
+  color: #376950;
+  background: var(--ok-soft);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 650;
+}
+
+.watch-group .chapter-number { color: #376950; background: var(--ok-soft); }
 
 .watch-cover span { font-size: 2rem; }
 
@@ -352,18 +400,9 @@ a { color: inherit; }
   gap: 18px;
 }
 
-.watch-heading h3 {
-  margin: 7px 0 0;
-  overflow: hidden;
-  font-size: 1.08rem;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
+.watch-heading h3 { margin: 0; min-width: 0; }
 .watch-heading h3 a { text-decoration: none; }
 .watch-heading h3 a:hover { color: var(--accent-hover); }
-.watch-heading h3 span { color: var(--muted); font-weight: 650; }
 
 .watch-time {
   flex: 0 0 auto;
@@ -1942,19 +1981,21 @@ textarea:focus {
   .page-heading > .button { width: fit-content; }
   .page-heading h1, .login-card h1 { font-size: 2rem; }
   .upcoming-card { grid-template-columns: 82px minmax(0, 1fr); }
-  .upcoming-cover { width: 82px; height: 110px; }
+  .upcoming-cover { width: 82px; min-height: 110px; }
   .upcoming-main { padding: 13px 14px; }
   .upcoming-date span { font-size: 1rem; }
   .upcoming-card h2 { margin: 6px 0; font-size: 0.95rem; }
   .watch-queue-title { margin-top: 34px; }
+  .watch-group { padding: 14px; }
   .watch-card { grid-template-columns: 74px minmax(0, 1fr); }
   .watch-cover { width: 74px; min-height: 154px; }
   .watch-main { padding: 13px 14px; }
   .watch-heading { display: grid; gap: 5px; }
   .watch-time { text-align: left; }
   .watch-time span, .watch-time time { display: inline; }
+  .watch-time span { margin-inline-end: 4px; }
   .watch-actions { display: grid; grid-template-columns: 1fr 1fr; }
-  .watch-actions .button, .watch-actions button { width: 100%; }
+  .watch-actions .button, .watch-actions button { width: 100%; padding-inline: 6px; }
   .section-title { align-items: center; }
   .dashboard-monitor-title { margin-top: 34px; }
   .stats-grid { grid-template-columns: 1fr; }

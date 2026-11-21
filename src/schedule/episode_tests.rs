@@ -97,7 +97,8 @@ impl Fixture {
                         } else {
                             let offset: i64 = parameters["offset"].parse().unwrap();
                             let date = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap() + Duration::days(offset * 7);
-                            json!({"total":13,"data":[{"airdate":date.to_string(),"sort":78+offset,"ep":1+offset}]})
+                            json!({"total":13,"data":[{"airdate":date.to_string(),"sort":78+offset,"ep":1+offset,
+                                "name":format!("原題 {}", 1+offset), "name_cn":if offset == 0 { "  " } else { " 归途 " }}]})
                         }
                     }
                     "/anime-schedule/anime" => json!({"anime":[media.clone()]}),
@@ -162,6 +163,95 @@ impl Fixture {
             .await
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn dashboard_chapter_backfill_respects_mapping_translation_and_retries() {
+    let fixture = Fixture::new(vec![], None, false).await;
+    let repo = Repository::connect(":memory:").await.unwrap();
+    let sync = ScheduleSynchronizer::new(repo.clone(), fixture.provider.config.clone()).unwrap();
+    let mapping = EpisodeNumberMapping {
+        local_origin: 12,
+        bangumi_origin: 78,
+    };
+    let id = repo
+        .add_anime(NewAnime {
+            title: TITLE.into(),
+            aliases: vec![],
+            next_episode: 13,
+            expected_at: Some(Utc::now()),
+            expected_weekday: None,
+            expected_time: None,
+            timezone: "Asia/Shanghai".into(),
+            duration_min_sec: 1200,
+            duration_max_sec: 2400,
+            auto_schedule: Some(AutoScheduleMetadata {
+                bangumi_subject_id: 542_007,
+                anilist_media_id: None,
+                anime_schedule_route: None,
+                total_episodes: Some(13),
+                broadcast_pattern: "R/2026-10-03T13:00:00Z/P7D".into(),
+                schedule_source: "danime".into(),
+                schedule_confidence: "estimated".into(),
+                schedule_warning: None,
+                next_sync_at: Utc::now(),
+                episode_mapping: Some(mapping),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let until = Utc::now() + Duration::days(7);
+    sync.refresh_missing_chapter_title().await.unwrap();
+    let rows = repo.upcoming_releases(until).await.unwrap();
+    assert_eq!(rows[0].chapter_title.as_deref(), Some("归途"));
+    assert!(repo.next_missing_chapter().await.unwrap().is_none());
+
+    // Changing the origin must immediately hide the other chapter's cached title.
+    let at_start = EpisodeNumberMapping {
+        local_origin: 13,
+        ..mapping
+    };
+    repo.set_episode_number_mapping(id, Some(at_start))
+        .await
+        .unwrap();
+    assert!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .is_none()
+    );
+    sync.refresh_missing_chapter_title().await.unwrap();
+    assert_eq!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .as_deref(),
+        Some("原題 1")
+    );
+    assert!(repo.next_missing_chapter().await.unwrap().is_none());
+    fixture.episode_outage.store(true, Ordering::Relaxed);
+    assert!(sync.provider.episode_airdate(542_007, 1, 78).await.is_err());
+    assert_eq!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .as_deref(),
+        Some("原題 1")
+    );
+
+    fixture.episode_outage.store(false, Ordering::Relaxed);
+    let wrong_sort = EpisodeNumberMapping {
+        bangumi_origin: 88,
+        ..at_start
+    };
+    repo.set_episode_number_mapping(id, Some(wrong_sort))
+        .await
+        .unwrap();
+    sync.refresh_missing_chapter_title().await.unwrap();
+    assert!(
+        repo.upcoming_releases(until).await.unwrap()[0]
+            .chapter_title
+            .is_none()
+    );
+    assert!(repo.next_missing_chapter().await.unwrap().is_none());
 }
 
 #[tokio::test]

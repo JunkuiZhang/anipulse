@@ -83,6 +83,9 @@ pub async fn run(
             }
         }
         dispatcher.dispatch_pending().await?;
+        if let Err(error) = schedule.refresh_missing_chapter_title().await {
+            warn!(%error, "dashboard chapter title refresh failed");
+        }
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {

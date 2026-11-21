@@ -18,7 +18,7 @@ use crate::{
     detector::title::normalize_title,
     domain::{EpisodeNumberMapping, ScheduleUpdate},
     error::{AppError, Result},
-    repository::Repository,
+    repository::{ChapterKey, Repository},
 };
 
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
@@ -57,6 +57,7 @@ static LATIN_PART: LazyLock<Regex> = LazyLock::new(|| {
 
 #[derive(Clone)]
 pub struct ScheduleProvider {
+    chapter_cache: Option<Repository>,
     client: Client,
     config: ScheduleConfig,
     anime_schedule_token: Option<String>,
@@ -169,6 +170,8 @@ struct EpisodeLookup {
 
 #[derive(Debug, Deserialize)]
 struct BangumiEpisode {
+    name_cn: Option<String>,
+    name: Option<String>,
     #[serde(default)]
     airdate: Option<String>,
     #[serde(default)]
@@ -341,11 +344,17 @@ impl ScheduleProvider {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Ok(Self {
+            chapter_cache: None,
             client,
             config,
             anime_schedule_token,
             timetable_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn with_chapter_cache(mut self, repository: Repository) -> Self {
+        self.chapter_cache = Some(repository);
+        self
     }
 
     pub async fn load_catalog(&self) -> Result<ScheduleCatalog> {
@@ -701,7 +710,55 @@ impl ScheduleProvider {
         subject_episode_index: i64,
         bangumi_episode_no: i64,
     ) -> Result<EpisodeLookup> {
-        let offset = subject_episode_index - 1;
+        let (episode, total_episodes) = self
+            .lookup_chapter(ChapterKey {
+                subject_id,
+                subject_index: subject_episode_index,
+                bangumi_number: bangumi_episode_no,
+            })
+            .await?;
+        let airdate = parse_metadata_date(
+            episode.as_ref().and_then(|e| e.airdate.as_deref()),
+            "Bangumi episode API returned invalid airdate",
+        )?;
+        Ok(EpisodeLookup {
+            airdate,
+            total_episodes,
+        })
+    }
+
+    async fn lookup_chapter(
+        &self,
+        key: ChapterKey,
+    ) -> Result<(Option<BangumiEpisode>, Option<i64>)> {
+        let result = self.fetch_chapter(key).await;
+        if let Some(cache) = &self.chapter_cache {
+            let episode = result.as_ref().ok().and_then(|(e, _)| e.as_ref());
+            let retry_secs = if result.is_err() {
+                self.config.failure_retry_secs
+            } else {
+                self.config.sync_interval_secs
+            };
+            if let Err(error) = cache
+                .remember_chapter_title(
+                    key,
+                    episode.and_then(|e| e.name_cn.as_deref()),
+                    episode.and_then(|e| e.name.as_deref()),
+                    Utc::now() + Duration::seconds(retry_secs as i64),
+                )
+                .await
+            {
+                warn!(?key, %error, "could not cache Bangumi chapter title");
+            }
+        }
+        result
+    }
+
+    async fn fetch_chapter(
+        &self,
+        key: ChapterKey,
+    ) -> Result<(Option<BangumiEpisode>, Option<i64>)> {
+        let offset = key.subject_index - 1;
         let response = self
             .client
             .get(format!(
@@ -709,7 +766,7 @@ impl ScheduleProvider {
                 self.config.bangumi_api_base_url.trim_end_matches('/')
             ))
             .query(&[
-                ("subject_id", subject_id.to_string()),
+                ("subject_id", key.subject_id.to_string()),
                 ("type", "0".into()),
                 ("limit", "1".into()),
                 ("offset", offset.to_string()),
@@ -733,33 +790,15 @@ impl ScheduleProvider {
             ))
         })?;
         let total_episodes = page.total.filter(|total| *total > 0 && *total <= 10_000);
-        let Some(episode) = page.data.first() else {
-            return Ok(EpisodeLookup {
-                airdate: None,
-                total_episodes,
-            });
-        };
-        // Bangumi's `ep` is local to this subject (1..8 here), whereas `sort`
-        // can carry the series-wide number (78..85). The UI displays `sort`.
-        let matches_number = if episode.sort > 0.0 {
-            (episode.sort - bangumi_episode_no as f64).abs() <= 0.01
-        } else {
-            (episode.ep - subject_episode_index as f64).abs() <= 0.01
-        };
-        if !matches_number {
-            return Ok(EpisodeLookup {
-                airdate: None,
-                total_episodes,
-            });
-        }
-        let airdate = parse_metadata_date(
-            episode.airdate.as_deref(),
-            "Bangumi episode API returned invalid airdate",
-        )?;
-        Ok(EpisodeLookup {
-            airdate,
-            total_episodes,
-        })
+        // `ep` is local to a subject, while `sort` can be series-wide (e.g. 78..85).
+        let episode = page.data.into_iter().next().filter(|episode| {
+            if episode.sort > 0.0 {
+                (episode.sort - key.bangumi_number as f64).abs() <= 0.01
+            } else {
+                (episode.ep - key.subject_index as f64).abs() <= 0.01
+            }
+        });
+        Ok((episode, total_episodes))
     }
 
     async fn resolve_anime_schedule_fallback(
@@ -2045,12 +2084,21 @@ fn validate_anime_schedule_route(route: &str) -> Result<()> {
 
 impl ScheduleSynchronizer {
     pub fn new(repository: Repository, config: ScheduleConfig) -> Result<Self> {
-        let provider = ScheduleProvider::new(config.clone())?;
+        let provider =
+            ScheduleProvider::new(config.clone())?.with_chapter_cache(repository.clone());
         Ok(Self {
             repository,
             provider,
             config,
         })
+    }
+
+    /// Backfill one visible episode per tick, including unwatched episodes of completed seasons.
+    pub async fn refresh_missing_chapter_title(&self) -> Result<()> {
+        if let Some(key) = self.repository.next_missing_chapter().await? {
+            self.provider.lookup_chapter(key).await?;
+        }
+        Ok(())
     }
 
     pub async fn sync_due(&self) -> Result<()> {

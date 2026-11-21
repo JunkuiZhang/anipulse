@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 {% block title %}概览 · AniPulse{% endblock %}
+{% macro chapter(episode, title) %}
+<span class="chapter-line">
+  <b class="chapter-number">EP{{ episode }}</b>
+  {% if let Some(name) = title %}<span class="chapter-name">{{ name }}</span>
+  {% else %}<span class="chapter-missing">暂无分集标题</span>{% endif %}
+</span>
+{% endmacro %}
 {% block content %}
 {% if !notice.is_empty() %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
 <div class="page-heading">
@@ -16,7 +23,13 @@
     <div class="upcoming-main">
       <div class="upcoming-date" aria-label="预计更新时间"><strong>{{ item.day }}</strong><span>{{ item.time }}</span></div>
       <h2>{{ item.title }}</h2>
-      <div class="upcoming-meta"><span class="episode-progress"><strong>{{ item.episode }}</strong>{% if item.has_episode_total %}<small>{{ item.episode_total }}</small>{% endif %}</span>{% if item.awaiting_update %}<span class="awaiting-update-label" title="已到预计时间，尚未确认视频更新">等待更新</span>{% else %}<span class="upcoming-kind">预计更新</span>{% endif %}{% if !item.enabled %}<span class="paused-label">监控已暂停</span>{% endif %}</div>
+      {% call chapter(item.episode_no, item.chapter_title) %}{% endcall %}
+      <div class="upcoming-meta">
+        {% if let Some(total) = item.total_episodes %}<span>全 {{ total }} 集</span>{% endif %}
+        {% if item.awaiting_update %}<span class="awaiting-update-label" title="已到预计时间，尚未确认视频更新">等待更新</span>
+        {% else %}<span class="upcoming-kind">预计更新</span>{% endif %}
+        {% if !item.enabled %}<span class="paused-label">监控已暂停</span>{% endif %}
+      </div>
     </div>
   </a>
 {% endfor %}
@@ -34,7 +47,17 @@
 </div>
 {% if !watch_groups.is_empty() %}
 {% for group in watch_groups %}
-<details class="panel"{% if group.items.len() == 1 %} open{% endif %}><summary><strong>{{ group.title }}</strong> · {{ group.items.len() }} 集待看 · 展开观看</summary>
+<details class="panel watch-group"{% if group.items.len() == 1 %} open{% endif %}>
+  <summary>
+    <strong>{{ group.title }}</strong>
+    <span class="watch-group-counts">
+      {% if let Some(total) = group.total_episodes %}全 {{ total }} 集{% else %}总集数待定{% endif %}
+      <span>{{ group.items.len() }} 集待看</span>
+    </span>
+    {% if let Some(next) = group.next_to_watch() %}
+    <span class="watch-preview">{% call chapter(next.episode_no, next.chapter_title) %}{% endcall %}</span>
+    {% endif %}
+  </summary>
 <section class="watch-queue" aria-label="等待观看的更新">
 {% for item in group.items %}
   <article class="watch-card">
@@ -43,10 +66,10 @@
     </a>
     <div class="watch-main">
       <div class="watch-heading">
-        <div><span class="badge success"><span class="status-dot"></span>已更新</span><h3><a href="/anime/{{ item.anime_id }}">{{ item.title }}</a> <span>{{ item.episode }}</span></h3></div>
+        <h3><a href="/anime/{{ item.anime_id }}">{% call chapter(item.episode_no, item.chapter_title) %}{% endcall %}</a></h3>
         <div class="watch-time"><span>更新于</span><time>{{ item.updated_at }}</time></div>
       </div>
-      <p class="watch-video-title" title="{{ item.video_title }}">{{ item.video_title }}</p>
+      <p class="watch-video-title" title="{{ item.video_title }}">B 站投稿 · {{ item.video_title }}</p>
       <div class="watch-actions">
         <a class="button primary" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">观看 ↗</a>
         <form method="post" action="/episodes/{{ item.episode_id }}/watched">

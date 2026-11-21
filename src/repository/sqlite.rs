@@ -167,6 +167,7 @@ pub struct DashboardStats {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct UpcomingReleaseRow {
+    pub chapter_title: Option<String>,
     pub anime_id: i64,
     pub title: String,
     pub bangumi_subject_id: Option<i64>,
@@ -179,6 +180,8 @@ pub struct UpcomingReleaseRow {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct WatchQueueRow {
+    pub chapter_title: Option<String>,
+    pub total_episodes: Option<i64>,
     pub page_no: Option<i64>,
     pub episode_id: i64,
     pub anime_id: i64,
@@ -515,9 +518,10 @@ impl Repository {
         Ok(sqlx::query_as::<_, UpcomingReleaseRow>(
             r#"SELECT a.id AS anime_id, a.title, a.bangumi_subject_id,
                       a.total_episodes, a.schedule_confidence, a.enabled,
-                      e.episode_no, e.expected_at
+                      e.episode_no, e.expected_at, c.title AS chapter_title
                FROM anime a
                JOIN monitorable_episode e ON e.anime_id = a.id
+               LEFT JOIN episode_chapter c ON c.episode_id = e.id
                WHERE a.lifecycle = 'tracking'
                  AND e.state NOT IN ('notified', 'confirmed')
                  AND NOT EXISTS(SELECT 1 FROM release_batch b WHERE b.anime_id=a.id
@@ -547,13 +551,14 @@ impl Repository {
                    WHERE COALESCE(ut.manually_blocked, 0) = 0
                )
                SELECT e.id AS episode_id, a.id AS anime_id,
-                      a.title AS anime_title, a.bangumi_subject_id,
+                      a.title AS anime_title, a.bangumi_subject_id, a.total_episodes, c.title AS chapter_title,
                       e.episode_no, rv.bvid, rv.page_no, rv.title AS video_title,
                       COALESCE(rv.published_at, e.confirmed_at, e.notified_at, e.next_check_at)
                           AS released_at
                FROM episode e
                JOIN anime a ON a.id = e.anime_id
                JOIN ranked_videos rv ON rv.episode_id = e.id AND rv.rank = 1
+               LEFT JOIN episode_chapter c ON c.episode_id = e.id
                WHERE e.state IN ('confirmed', 'notified')
                  AND e.watched_at IS NULL
                  AND a.lifecycle != 'archived'
@@ -4711,6 +4716,11 @@ mod tests {
     #[tokio::test]
     async fn confirmed_episode_stays_in_watch_queue_until_marked_watched() {
         let (_directory, repository, anime_id, episode) = fixture().await;
+        sqlx::query("UPDATE anime SET bangumi_subject_id = 123, total_episodes = 12 WHERE id = ?")
+            .bind(anime_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
         let until = Utc::now() + chrono::Duration::days(7);
         assert_eq!(repository.upcoming_releases(until).await.unwrap().len(), 1);
         let (mut candidate, evaluation) = candidate();
@@ -4732,11 +4742,20 @@ mod tests {
                 .is_empty()
         );
 
+        // A pre-upgrade, already confirmed episode can acquire a title while waiting to be watched.
+        let key = repository.next_missing_chapter().await.unwrap().unwrap();
+        assert_eq!(key.subject_index, episode.episode_no);
+        repository
+            .remember_chapter_title(key, Some("重逢"), None, until)
+            .await
+            .unwrap();
         let queued = repository.watch_queue(50).await.unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].episode_id, episode.id);
         assert_eq!(queued[0].anime_id, anime_id);
         assert_eq!(queued[0].episode_no, episode.episode_no);
+        assert_eq!(queued[0].chapter_title.as_deref(), Some("重逢"));
+        assert_eq!(queued[0].total_episodes, Some(12));
         assert_eq!(queued[0].bvid, candidate.bvid);
         assert_eq!(queued[0].released_at, candidate.published_at);
 

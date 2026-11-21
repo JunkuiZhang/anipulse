@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod batch_tests;
+mod chapters;
 mod collections;
 mod provider;
 #[cfg(test)]
 mod provider_tests;
 mod releases;
 mod sqlite;
+pub(crate) use chapters::ChapterKey;
 pub use collections::CollectionDraft;
 pub use provider::{ProviderBackoff, ProviderPermit, ProviderScope};
 pub use releases::ReleaseProgress;
